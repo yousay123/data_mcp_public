@@ -351,7 +351,7 @@ def test_imported_mcp_run_refuses_without_opt_in() -> None:
 
 def _server_params() -> StdioServerParameters:
     return StdioServerParameters(
-        command=str(REPO_ROOT / ".venv" / "bin" / "python"),
+        command=sys.executable,
         args=["-m", "ksher_agent_data_mcp.server"],
         cwd=str(REPO_ROOT),
         env={
