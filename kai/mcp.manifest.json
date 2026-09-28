@@ -1,0 +1,105 @@
+{
+  "name": "ksher-agent-data-mcp",
+  "description": "让 Agent 按当前提问人权限执行受控 TChouse-C SELECT / SHOW 查询，并返回可审计的结构化数据结果。",
+  "version": "0.2.0",
+  "release_notes": "Data MCP 0.2.0：生产 agent 链路固定走 stdio + BotMux 身份注入；内部 HTTP adapter 默认使用 UDS，TCP 仅作为显式本地回退；导出改为本机 outbox 文件交付；源码 archive 不再携带预编译 wheel，部署机从 src 现场构建。",
+  "command": "/bin/bash",
+  "args": [
+    "-lc",
+    "launcher=\"${KSHER_AGENT_DATA_MCP_LAUNCHER:-$HOME/.config/ksher-agent-data-mcp/launcher.sh}\"; if [ ! -x \"$launcher\" ]; then echo \"ksher-agent-data-mcp launcher not found or not executable: $launcher\" >&2; exit 1; fi; exec \"$launcher\""
+  ],
+  "mcpServers": {
+    "ksher-agent-data-mcp": {
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "launcher=\"${KSHER_AGENT_DATA_MCP_LAUNCHER:-$HOME/.config/ksher-agent-data-mcp/launcher.sh}\"; if [ ! -x \"$launcher\" ]; then echo \"ksher-agent-data-mcp launcher not found or not executable: $launcher\" >&2; exit 1; fi; exec \"$launcher\""
+      ]
+    }
+  },
+  "usage": {
+    "recommended_prompt": "用 Data Agent MCP 按当前提问人权限执行这条已确认的 TChouse-C SELECT 或 SHOW SQL。",
+    "example_prompts": [
+      "帮我通过 data MCP 执行这条 SELECT，并返回结构化结果。",
+      "我已经确认表和字段了，请用 MCP 按当前提问人权限查询 TChouse-C。",
+      "先校验这条 SQL 是否符合 data MCP 的只读查询规则。"
+    ],
+    "use_cases": [
+      "BotMux 智能体已确认当前提问人身份后的数据查询",
+      "智能体已确认表、字段、口径和过滤条件后的受控 SELECT 执行",
+      "需要按当前账号权限执行 SHOW ACCESS、SHOW GRANTS 等只读诊断命令",
+      "需要按用户本人 TChouse-C 权限返回结构化结果的内部问数场景"
+    ],
+    "avoid_cases": [
+      "自然语言到 SQL 的表定位和口径确认",
+      "导出审批、文件生成、外部文件链接或权限申请",
+      "创建表、写入数据、授权、撤权或其它非 SELECT / SHOW 操作"
+    ],
+    "expected_output": "返回 query_id、sql、columns、rows、row_count、truncated、execution_ms 等结构化查询结果，失败时返回明确的校验或权限原因。"
+  },
+  "botmux": {
+    "requiresSandbox": true,
+    "downstream": {
+      "type": "stdio",
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "launcher=\"${KSHER_AGENT_DATA_MCP_LAUNCHER:-$HOME/.config/ksher-agent-data-mcp/launcher.sh}\"; if [ ! -x \"$launcher\" ]; then echo \"ksher-agent-data-mcp launcher not found or not executable: $launcher\" >&2; exit 1; fi; exec \"$launcher\""
+      ]
+    },
+    "injectedArguments": {
+      "unionId": "request_user_union_id",
+      "openId": "request_user_open_id",
+      "larkAppId": "request_lark_app_id"
+    },
+    "listToolsSchemaStrip": [
+      "request_user_union_id",
+      "request_user_open_id",
+      "request_lark_app_id",
+      "request_user_tchouse_account",
+      "requestUserUnionId",
+      "requestUserOpenId",
+      "requestLarkAppId",
+      "requestUserTchouseAccount",
+      "union_id",
+      "unionId",
+      "open_id",
+      "openId",
+      "lark_app_id",
+      "larkAppId",
+      "request_app_id",
+      "requestAppId",
+      "app_id",
+      "appId",
+      "tchouse_account"
+    ],
+    "agentVisibleArguments": [
+      "sql",
+      "datasource"
+    ],
+    "identitySemantics": "BotMux must inject the caller union_id snapshot captured at agent-turn start. Do not read live session identity during CallTool forwarding."
+  },
+  "metadata": {
+    "language": "python",
+    "python": ">=3.11",
+    "entrypoints": {
+      "mcp_stdio": "ksher-agent-data-mcp",
+      "kai_bootstrap": "ksher-agent-data-mcp-kai",
+      "http_api": "ksher-agent-data-api",
+      "java_gateway": "java-gateway"
+    },
+    "http_contract": {
+      "health": "/api/data-mcp/health",
+      "validate_sql": "/api/data-mcp/agent/validate-sql",
+      "run_query": "/api/data-mcp/agent/run-query"
+    },
+    "security": [
+      "只允许 SELECT / SHOW",
+      "拒绝 DDL、DML、授权和多语句 SQL",
+      "按当前提问人身份解析用户本人 TChouse-C 账号",
+      "BotMux ListTools 必须隐藏 request_user_union_id/request_user_open_id/request_lark_app_id",
+      "不在日志和响应中输出数据库密码",
+      "Kai manifest 不展开 runtime 默认参数和数据库连接细节"
+    ]
+  }
+}
