@@ -1,0 +1,12 @@
+{
+  "users": [
+    {
+      "feishu_user_id": "ou_example_user",
+      "email": "demo@example.com",
+      "display_name": "Demo User",
+      "department": "BI",
+      "create_table_datasources": ["tchouse-c", "tchouse-d", "tencent-dlc", "mysql"],
+      "create_table_databases": ["tmp", "sandbox", "agent_data"]
+    }
+  ]
+}

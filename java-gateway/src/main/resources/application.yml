@@ -1,0 +1,19 @@
+server:
+  address: ${DATA_MCP_GATEWAY_BIND_ADDRESS:127.0.0.1}
+  port: 8080
+
+spring:
+  application:
+    name: ksher-agent-data-mcp-gateway
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+
+ksher:
+  data-mcp:
+    python-base-url: ${PYTHON_DATA_MCP_BASE_URL:http://127.0.0.1:8765}
+    request-timeout-ms: ${PYTHON_DATA_MCP_TIMEOUT_MS:65000}
+    internal-auth-token: ${DATA_MCP_INTERNAL_AUTH_TOKEN:}
