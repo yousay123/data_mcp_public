@@ -9,14 +9,6 @@ const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
 const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-mcp', 'run', 'api.sock');
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
-const FROZEN_QUERY_CONTRACT_VERSION = 2;
-const FROZEN_QUERY_MAX_ROWS = 50;
-const FROZEN_QUERY_MAX_DATA_ROWS = 1000;
-const FROZEN_QUERY_MAX_COLUMNS = 20;
-const FROZEN_QUERY_MAX_CELL_CHARS = 1000;
-const FROZEN_QUERY_MAX_DATA_CELL_CHARS = 10000;
-const FROZEN_QUERY_MAX_COLUMN_KEY_CHARS = 128;
-const FROZEN_QUERY_MAX_COLUMN_LABEL_CHARS = 256;
 let hostEnvCache;
 let packageVersionCache;
 
@@ -311,32 +303,14 @@ function argsFrom(request) {
     : {};
 }
 
-const FROZEN_QUERY_PUBLIC_ERRORS = {
-  invalid_request: '固化查询定义或参数不合法。',
-  permission_denied: '当前用户无权执行该固化查询。',
-  rate_limited: '查询请求过于频繁，请稍后重试。',
-  timeout: '固化查询执行超时，请稍后重试。',
-  temporarily_unavailable: '查询服务暂时不可用，请稍后重试。',
-  execution_failed: '固化查询执行失败。',
-};
-
 function frozenQueryError(code) {
-  const safeCode = Object.hasOwn(FROZEN_QUERY_PUBLIC_ERRORS, code) ? code : 'execution_failed';
   return {
-    contractVersion: FROZEN_QUERY_CONTRACT_VERSION,
-    status: 'error',
-    errorCode: safeCode,
-    message: FROZEN_QUERY_PUBLIC_ERRORS[safeCode],
+    rows: [],
+    columns: [],
+    row_count: 0,
+    query_id: null,
+    error_code: typeof code === 'string' && code ? code : 'execution_failed',
   };
-}
-
-function frozenQueryServiceError(code) {
-  const value = String(code || '');
-  if (/permission|forbidden|unauthori[sz]ed|access_denied/i.test(value)) return 'permission_denied';
-  if (/rate.?limit|too_many_requests/i.test(value)) return 'rate_limited';
-  if (/timed?_?out|timeout/i.test(value)) return 'timeout';
-  if (/unavailable|unreachable|connection|transport|socket|overload/i.test(value)) return 'temporarily_unavailable';
-  return 'execution_failed';
 }
 
 function sqlLiteral(value, type) {
@@ -386,136 +360,26 @@ function renderFrozenQuery(args) {
   return { sql, datasource };
 }
 
-function safeDisplayText(value) {
-  return String(value ?? '—')
-    // Query values are display data, never markup. Replacing delimiters is
-    // deliberately non-recursive and therefore cannot expose a new tag after
-    // an earlier match is removed (for example nested `<a<at>t ...>` input).
-    .replace(/</g, '＜')
-    .replace(/>/g, '＞')
-    .replace(/\[/g, '［')
-    .replace(/\]/g, '］')
-    .replace(/\\/g, '＼')
-    .replace(/\*/g, '＊')
-    .replace(/_/g, '＿')
-    .replace(/`/g, '｀')
-    .replace(/~/g, '～')
-    .replace(/#/g, '＃')
-    .replace(/!/g, '！')
-    .replace(/\|/g, '｜')
-    .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
-}
-
-function frozenBusinessRows(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const raw = Array.isArray(body.rows) ? body.rows : Array.isArray(body.data) ? body.data : null;
-  if (!raw) return null;
-  const sampledRows = raw.slice(0, FROZEN_QUERY_MAX_DATA_ROWS);
-  if (sampledRows.some(row => !row || typeof row !== 'object' || Array.isArray(row))) return null;
-  const rows = sampledRows.filter(row => Object.keys(row).length > 0);
-  if (rows.some(row => Object.values(row).some(value => value !== null && !['string', 'number', 'boolean'].includes(typeof value)))) return null;
-  const labels = new Map();
-  if (Array.isArray(body.columns)) {
-    for (const column of body.columns) {
-      if (column && typeof column === 'object' && !Array.isArray(column) && typeof column.name === 'string') {
-        labels.set(column.name, safeDisplayText(column.description || column.name));
-      }
-    }
-  }
-  const columns = [...new Set([...labels.keys(), ...rows.flatMap(row => Object.keys(row))])]
-    .filter(key => key.length > 0 && key.length <= FROZEN_QUERY_MAX_COLUMN_KEY_CHARS)
-    .slice(0, FROZEN_QUERY_MAX_COLUMNS).map(key => ({
-      key,
-      label: (labels.get(key) || safeDisplayText(key)).slice(0, FROZEN_QUERY_MAX_COLUMN_LABEL_CHARS),
-    }));
-  const totalRows = Number.isSafeInteger(body.row_count) && body.row_count >= raw.length ? body.row_count : raw.length;
-  return { rows, columns, totalRows };
-}
-
-function buildFrozenQueryPresentation(body, output = {}) {
-  const maxChars = Number.isSafeInteger(output.maxChars) ? Math.max(100, Math.min(100000, output.maxChars)) : 12000;
-  const format = ['text', 'markdown', 'table', 'auto'].includes(output.format) ? output.format : 'auto';
-  const prefix = typeof output.prefix === 'string' ? output.prefix.slice(0, maxChars) : '';
-  const suffix = typeof output.suffix === 'string' ? output.suffix.slice(0, Math.max(0, maxChars - prefix.length)) : '';
-  const business = frozenBusinessRows(body);
-  let core = '查询已完成。';
-  if (business) {
-    if (business.rows.length === 0) core = '查询完成，未找到符合条件的数据。';
-    else core = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS)
-      .map((row, index) => `${business.totalRows > 1 ? `${index + 1}. ` : ''}${business.columns.map(column => `${column.label}：${safeDisplayText(row[column.key])}`).join('；')}`)
-      .join('\n');
-  }
-  const fallbackText = `${prefix}${core}${suffix}`.slice(0, maxChars);
-  const useTable = business && business.rows.length > 0 && business.columns.length > 0
-    && (format === 'table' || (format === 'auto' && (business.rows.length > 1 || business.columns.length > 1)));
-  const blocks = [];
-  if (useTable) {
-    if (prefix) blocks.push({ type: 'markdown', markdown: prefix });
-    const candidateRows = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS).map(row => Object.fromEntries(
-      business.columns.map(column => [column.key, safeDisplayText(row[column.key]).slice(0, FROZEN_QUERY_MAX_CELL_CHARS)]),
-    ));
-    const fixedChars = prefix.length + suffix.length
-      + business.columns.reduce((sum, column) => sum + column.key.length + column.label.length, 0);
-    let presentationChars = fixedChars;
-    const rows = [];
-    for (const row of candidateRows) {
-      const rowChars = business.columns.reduce((sum, column) => sum + String(row[column.key] ?? '').length, 0);
-      if (presentationChars + rowChars > maxChars) break;
-      rows.push(row);
-      presentationChars += rowChars;
-    }
-    if (rows.length > 0) {
-      blocks.push({ type: 'table', columns: business.columns, rows, totalRows: business.totalRows, truncated: business.totalRows > rows.length });
-    } else {
-      blocks.push({ type: 'markdown', markdown: fallbackText });
-    }
-    if (suffix) blocks.push({ type: 'markdown', markdown: suffix });
-  } else {
-    // The channel-neutral contract has only markdown and table carriers.
-    // BotMux chooses text message versus card from the command's output.format
-    // and uses fallbackText for the former.
-    blocks.push({ type: 'markdown', markdown: fallbackText });
-  }
-  return {
-    contractVersion: FROZEN_QUERY_CONTRACT_VERSION,
-    status: 'success',
-    fallbackText,
-    blocks,
-    meta: {
-      queryId: typeof body?.query_id === 'string' && body.query_id ? body.query_id : null,
-      totalRows: business?.totalRows ?? null,
-    },
-    ...(business ? {
-      data: {
-        rows: business.rows.slice(0, FROZEN_QUERY_MAX_DATA_ROWS).map(row => Object.fromEntries(
-          business.columns.map(column => {
-            const value = row[column.key];
-            return [column.key, typeof value === 'string'
-              ? safeDisplayText(value).slice(0, FROZEN_QUERY_MAX_DATA_CELL_CHARS)
-              : value ?? null];
-          }),
-        )),
-        columns: business.columns,
-        totalRows: business.totalRows,
-      },
-    } : {}),
-  };
-}
-
 async function executeFrozenQuery(caller, args) {
   let rendered;
   try { rendered = renderFrozenQuery(args); }
   catch { return frozenQueryError('invalid_request'); }
   const validate = await callDataMcpService('validate', caller, { sql: rendered.sql, datasource: rendered.datasource, execution_mode: 'single' });
   if (!validate || validate.status !== 'success' || typeof validate.query_plan_id !== 'string') {
-    return frozenQueryError(frozenQueryServiceError(validate?.error_code));
+    return frozenQueryError(validate?.error_code);
   }
   const run = await callDataMcpService('run', caller, { sql: rendered.sql, datasource: rendered.datasource, query_plan_id: validate.query_plan_id });
   if (!run || run.status === 'error' || run.status === 'validation_error') {
-    return frozenQueryError(frozenQueryServiceError(run?.error_code));
+    return frozenQueryError(run?.error_code);
   }
-  return buildFrozenQueryPresentation(run, args.output);
+  const rows = Array.isArray(run.rows) ? run.rows : Array.isArray(run.data) ? run.data : [];
+  return {
+    rows,
+    columns: Array.isArray(run.columns) ? run.columns : [],
+    row_count: Number.isSafeInteger(run.row_count) ? run.row_count : rows.length,
+    query_id: typeof run.query_id === 'string' ? run.query_id : null,
+    error_code: typeof run.error_code === 'string' && run.error_code ? run.error_code : null,
+  };
 }
 
 function serviceBaseUrl() {
@@ -1104,23 +968,13 @@ function toolSchemas() {
     },
     {
       name: 'execute_frozen_query',
-      description: 'Render, validate and run an approved frozen read-only query, returning a channel-neutral presentation without SQL.',
+      description: 'Render, validate and run an approved frozen read-only query, returning the raw data result without SQL.',
       inputSchema: {
         type: 'object',
         properties: {
           payload: { type: 'object', additionalProperties: true },
           parameters: { type: 'array', items: { type: 'object', additionalProperties: true } },
           values: { type: 'object', additionalProperties: true },
-          output: {
-            type: 'object',
-            properties: {
-              format: { type: 'string', enum: ['text', 'markdown', 'table', 'auto'] },
-              prefix: { type: 'string' },
-              suffix: { type: 'string' },
-              maxChars: { type: 'integer', minimum: 100, maximum: 100000 },
-            },
-            additionalProperties: false,
-          },
         },
         required: ['payload', 'parameters', 'values'],
         additionalProperties: false,

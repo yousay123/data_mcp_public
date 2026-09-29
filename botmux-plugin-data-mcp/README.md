@@ -19,8 +19,8 @@ environments and enabled only for selected bots.
   - exposes identity-bound tools that forward explicit SQL to the Data MCP
     service side for validation/execution
   - exposes `execute_frozen_query` for host-approved templates: the plugin owns
-    SQL literal encoding plus byte-exact validate/run, and returns only a
-    channel-neutral `fallbackText` plus Markdown/table-only `blocks` contract with non-SQL metadata
+    SQL literal encoding plus byte-exact validate/run, and returns only the service
+    fields `rows`, `columns`, `row_count`, `query_id`, and `error_code`; BotMux owns display
   - exposes signed local snapshot refresh/search over the same private Unix socket
 - CLI:
   - `botmux data-mcp:status`

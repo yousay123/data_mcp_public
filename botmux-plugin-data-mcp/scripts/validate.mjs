@@ -1203,7 +1203,6 @@ try {
             payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
             parameters: [{ name: 'value', type: 'string' }],
             values: { value: "\\' OR 1=1 --" },
-            output: { format: 'table', maxChars: 12000 },
             requestUserUnionId: 'on_forged_argument',
           },
           _meta: {
@@ -1213,17 +1212,6 @@ try {
               requestLarkAppId: 'cli_test',
               senderType: 'user',
             },
-          },
-        },
-      };
-      const frozenTextCall = {
-        ...frozenQueryCall,
-        id: 18,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            ...frozenQueryCall.params.arguments,
-            output: { format: 'text', maxChars: 12000 },
           },
         },
       };
@@ -1247,7 +1235,6 @@ try {
           socketRefreshCall,
           socketValidateCall,
           frozenQueryCall,
-          frozenTextCall,
           frozenInvalidValuesCall,
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
@@ -1286,44 +1273,33 @@ try {
       }
       const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
       const frozenPayload = JSON.parse(frozenText);
-      const frozenPresentation = JSON.stringify({
-        fallbackText: frozenPayload.fallbackText,
-        blocks: frozenPayload.blocks,
-        data: frozenPayload.data,
-      });
       if (
-        !frozenText.includes('"contractVersion": 2')
-        || !frozenText.includes('"queryId": "q_frozen"')
-        || frozenPayload.blocks.some(block => block?.type === 'text')
+        frozenPayload.query_id !== 'q_frozen'
+        || frozenPayload.row_count !== 1
+        || !Array.isArray(frozenPayload.rows)
+        || frozenPayload.rows[0]?.probe !== '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_'
+        || !Array.isArray(frozenPayload.columns)
+        || frozenPayload.error_code !== null
         || frozenText.includes('OR 1=1')
         || frozenText.includes('on_forged_argument')
-        || frozenPresentation.includes('<at')
-        || frozenPresentation.includes('[点我领奖](http://evil)')
-        || frozenPresentation.includes('**bold**')
-        || frozenPresentation.includes('_italic_')
+        || frozenText.includes('contractVersion')
+        || frozenText.includes('blocks')
+        || frozenText.includes('fallbackText')
       ) {
-        fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
-      }
-      const frozenTextPayload = JSON.parse(socketResponses.find(response => response.id === 18)?.result?.content?.[0]?.text ?? '{}');
-      if (
-        frozenTextPayload.contractVersion !== 2
-        || !Array.isArray(frozenTextPayload.blocks)
-        || frozenTextPayload.blocks.length < 1
-        || frozenTextPayload.blocks.some(block => !['markdown', 'table'].includes(block?.type))
-      ) {
-        fail(`execute_frozen_query text format must still use the markdown/table-only v2 carrier: ${JSON.stringify(frozenTextPayload)}`);
+        fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
       }
       const frozenInvalidValuesPayload = JSON.parse(
         socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
       );
       if (
-        frozenInvalidValuesPayload.contractVersion !== 2
-        || frozenInvalidValuesPayload.status !== 'error'
-        || frozenInvalidValuesPayload.errorCode !== 'invalid_request'
-        || frozenInvalidValuesPayload.message !== '固化查询定义或参数不合法。'
+        frozenInvalidValuesPayload.error_code !== 'invalid_request'
+        || frozenInvalidValuesPayload.row_count !== 0
+        || frozenInvalidValuesPayload.query_id !== null
+        || !Array.isArray(frozenInvalidValuesPayload.rows)
+        || !Array.isArray(frozenInvalidValuesPayload.columns)
         || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
       ) {
-        fail(`execute_frozen_query must expose only fixed public errors: ${JSON.stringify(frozenInvalidValuesPayload)}`);
+        fail(`execute_frozen_query must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
       }
 
       const executionValidateCall = {
