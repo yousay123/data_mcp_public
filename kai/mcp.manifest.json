@@ -1,8 +1,8 @@
 {
   "name": "ksher-agent-data-mcp",
   "description": "让 Agent 按当前提问人权限执行受控 TChouse-C SELECT / SHOW 查询，并返回可审计的结构化数据结果。",
-  "version": "0.2.0",
-  "release_notes": "Data MCP 0.2.0：生产 agent 链路固定走 stdio + BotMux 身份注入；内部 HTTP adapter 默认使用 UDS，TCP 仅作为显式本地回退；导出改为本机 outbox 文件交付；源码 archive 不再携带预编译 wheel，部署机从 src 现场构建。",
+  "version": "0.2.2",
+  "release_notes": "Data MCP 0.2.2：以脱敏公共仓库作为正式交付源，部署配置继续由各机器私有注入；发布前执行源码与可达 Git 历史安全扫描，并通过 Python、Java 网关及 BotMux 插件验证。",
   "command": "/bin/bash",
   "args": [
     "-lc",
