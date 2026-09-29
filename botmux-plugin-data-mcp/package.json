@@ -1,6 +1,6 @@
 {
   "name": "@ksher/plugin-data-mcp",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "Private Botmux plugin for trusted Data MCP access.",
   "type": "module",
   "scripts": {

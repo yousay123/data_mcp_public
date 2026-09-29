@@ -1,8 +1,8 @@
 {
   "name": "ksher-agent-data-mcp",
   "description": "让 Agent 按当前提问人权限执行受控 TChouse-C SELECT / SHOW 查询，并返回可审计的结构化数据结果。",
-  "version": "0.3.0",
-  "release_notes": "Data MCP 0.3.0：新增固化查询执行契约，由插件负责参数编码、同字节校验与执行，并返回不含 SQL 的跨渠道结构化展示结果。",
+  "version": "0.3.1",
+  "release_notes": "Data MCP 0.3.1：升级通用固化命令展示契约，收紧参数映射、错误文案与 Markdown 展示边界。",
   "command": "/bin/bash",
   "args": [
     "-lc",
