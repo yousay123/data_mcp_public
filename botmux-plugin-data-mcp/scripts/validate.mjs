@@ -1085,7 +1085,12 @@ try {
               )
               ? 'wrong_execution_context'
               : req.url === '/agent/validate-sql'
-                && parsed.execution_mode !== (parsed.sql === frozenSql ? 'single' : 'compare')
+                && parsed.execution_mode !== (
+                  parsed.sql === frozenSql
+                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout)$/.test(parsed.sql)
+                    ? 'single'
+                    : 'compare'
+                )
                 ? 'wrong_execution_mode'
                 : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
                   ? 'wrong_frozen_query_plan'
@@ -1095,6 +1100,17 @@ try {
           if (failureCode) {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: failureCode }] }));
+            return;
+          }
+          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403)$/)?.[1];
+          if (req.url === '/agent/validate-sql' && frozenFailure) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ status: 'validation_error', error_code: frozenFailure }));
+            return;
+          }
+          if (req.url === '/agent/run-query' && parsed.sql === 'SELECT run_query_timeout') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', error_code: 'query_timeout' }));
             return;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
@@ -1226,6 +1242,24 @@ try {
           },
         },
       };
+      const frozenErrorCalls = [
+        ['query_timeout', 'timeout', 20],
+        ['datasource_unreachable', 'temporarily_unavailable', 21],
+        ['http_403', 'permission_denied', 22],
+        ['run_query_timeout', 'timeout', 23],
+      ].map(([serviceCode, expectedCode, id]) => ({
+        ...frozenQueryCall,
+        id,
+        expectedCode,
+        params: {
+          ...frozenQueryCall.params,
+          arguments: {
+            payload: { sql: `SELECT ${serviceCode}`, datasource: 'tchouse-c' },
+            parameters: [],
+            values: {},
+          },
+        },
+      }));
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
         input: [
@@ -1236,6 +1270,7 @@ try {
           socketValidateCall,
           frozenQueryCall,
           frozenInvalidValuesCall,
+          ...frozenErrorCalls.map(({ expectedCode: _expectedCode, ...call }) => call),
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
@@ -1300,6 +1335,14 @@ try {
         || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
       ) {
         fail(`execute_frozen_query must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
+      }
+      for (const { id, expectedCode } of frozenErrorCalls) {
+        const payload = JSON.parse(
+          socketResponses.find(response => response.id === id)?.result?.content?.[0]?.text ?? '{}',
+        );
+        if (payload.error_code !== expectedCode) {
+          fail(`execute_frozen_query must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
+        }
       }
 
       const executionValidateCall = {

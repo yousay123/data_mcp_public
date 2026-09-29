@@ -313,6 +313,16 @@ function frozenQueryError(code) {
   };
 }
 
+function frozenQueryServiceError(code) {
+  const value = String(code || '');
+  if (/permission|forbidden|unauthori[sz]ed|access_denied|http_?403/i.test(value)) return 'permission_denied';
+  if (/rate.?limit|too_many_requests|http_?429/i.test(value)) return 'rate_limited';
+  if (/timed?_?out|timeout/i.test(value)) return 'timeout';
+  if (/unavailable|unreachable|connection|transport|socket|overload/i.test(value)) return 'temporarily_unavailable';
+  if (/not.?found|http_?404/i.test(value)) return 'not_found';
+  return 'execution_failed';
+}
+
 function sqlLiteral(value, type) {
   if (type === 'integer') {
     if (!Number.isSafeInteger(value)) throw new Error('argument_invalid_integer');
@@ -366,11 +376,11 @@ async function executeFrozenQuery(caller, args) {
   catch { return frozenQueryError('invalid_request'); }
   const validate = await callDataMcpService('validate', caller, { sql: rendered.sql, datasource: rendered.datasource, execution_mode: 'single' });
   if (!validate || validate.status !== 'success' || typeof validate.query_plan_id !== 'string') {
-    return frozenQueryError(validate?.error_code);
+    return frozenQueryError(frozenQueryServiceError(validate?.error_code));
   }
   const run = await callDataMcpService('run', caller, { sql: rendered.sql, datasource: rendered.datasource, query_plan_id: validate.query_plan_id });
   if (!run || run.status === 'error' || run.status === 'validation_error') {
-    return frozenQueryError(run?.error_code);
+    return frozenQueryError(frozenQueryServiceError(run?.error_code));
   }
   const rows = Array.isArray(run.rows) ? run.rows : Array.isArray(run.data) ? run.data : [];
   return {
