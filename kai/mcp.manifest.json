@@ -1,8 +1,8 @@
 {
   "name": "ksher-agent-data-mcp",
   "description": "让 Agent 按当前提问人权限执行受控 TChouse-C SELECT / SHOW 查询，并返回可审计的结构化数据结果。",
-  "version": "0.4.0",
-  "release_notes": "Data MCP 0.4.0：固化查询改为返回服务端原始结构化结果，展示与安全策略统一交由 BotMux 宿主处理。",
+  "version": "0.4.1",
+  "release_notes": "Data MCP 0.4.1：补齐固化查询身份与账号类错误码的权限语义映射。",
   "command": "/bin/bash",
   "args": [
     "-lc",

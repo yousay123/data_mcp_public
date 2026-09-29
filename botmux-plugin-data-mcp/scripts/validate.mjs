@@ -1087,7 +1087,7 @@ try {
               : req.url === '/agent/validate-sql'
                 && parsed.execution_mode !== (
                   parsed.sql === frozenSql
-                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout)$/.test(parsed.sql)
+                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit)$/.test(parsed.sql)
                     ? 'single'
                     : 'compare'
                 )
@@ -1102,7 +1102,7 @@ try {
             res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: failureCode }] }));
             return;
           }
-          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403)$/)?.[1];
+          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit)$/)?.[1];
           if (req.url === '/agent/validate-sql' && frozenFailure) {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'validation_error', error_code: frozenFailure }));
@@ -1247,6 +1247,11 @@ try {
         ['datasource_unreachable', 'temporarily_unavailable', 21],
         ['http_403', 'permission_denied', 22],
         ['run_query_timeout', 'timeout', 23],
+        ['missing_union_id', 'permission_denied', 24],
+        ['trusted_human_or_schedule_required', 'permission_denied', 25],
+        ['account_mapping_unavailable', 'permission_denied', 26],
+        ['account_mismatch', 'permission_denied', 27],
+        ['query_concurrency_limit', 'execution_failed', 28],
       ].map(([serviceCode, expectedCode, id]) => ({
         ...frozenQueryCall,
         id,

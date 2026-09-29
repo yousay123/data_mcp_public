@@ -315,7 +315,7 @@ function frozenQueryError(code) {
 
 function frozenQueryServiceError(code) {
   const value = String(code || '');
-  if (/permission|forbidden|unauthori[sz]ed|access_denied|http_?403/i.test(value)) return 'permission_denied';
+  if (/permission|forbidden|unauthori[sz]ed|access_denied|http_?403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch/i.test(value)) return 'permission_denied';
   if (/rate.?limit|too_many_requests|http_?429/i.test(value)) return 'rate_limited';
   if (/timed?_?out|timeout/i.test(value)) return 'timeout';
   if (/unavailable|unreachable|connection|transport|socket|overload/i.test(value)) return 'temporarily_unavailable';
