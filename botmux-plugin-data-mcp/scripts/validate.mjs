@@ -1216,9 +1216,21 @@ try {
           },
         },
       };
+      const frozenTextCall = {
+        ...frozenQueryCall,
+        id: 18,
+        params: {
+          ...frozenQueryCall.params,
+          arguments: {
+            ...frozenQueryCall.params.arguments,
+            output: { format: 'text', maxChars: 12000 },
+          },
+        },
+      };
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
-        input: [initialize, socketCall, socketSearchCall, socketRefreshCall, socketValidateCall, frozenQueryCall].map(message => JSON.stringify(message)).join('\n') + '\n',
+        input: [initialize, socketCall, socketSearchCall, socketRefreshCall, socketValidateCall, frozenQueryCall, frozenTextCall]
+          .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
         timeout: 5000,
         env: {
@@ -1260,14 +1272,24 @@ try {
         data: frozenPayload.data,
       });
       if (
-        !frozenText.includes('"contractVersion": 1')
+        !frozenText.includes('"contractVersion": 2')
         || !frozenText.includes('"queryId": "q_frozen"')
+        || frozenPayload.blocks.some(block => block?.type === 'text')
         || frozenText.includes('OR 1=1')
         || frozenText.includes('on_forged_argument')
         || frozenPresentation.includes('<at')
         || frozenPresentation.includes('[点我领奖](http://evil)')
       ) {
         fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
+      }
+      const frozenTextPayload = JSON.parse(socketResponses.find(response => response.id === 18)?.result?.content?.[0]?.text ?? '{}');
+      if (
+        frozenTextPayload.contractVersion !== 2
+        || !Array.isArray(frozenTextPayload.blocks)
+        || frozenTextPayload.blocks.length < 1
+        || frozenTextPayload.blocks.some(block => !['markdown', 'table'].includes(block?.type))
+      ) {
+        fail(`execute_frozen_query text format must still use the markdown/table-only v2 carrier: ${JSON.stringify(frozenTextPayload)}`);
       }
 
       const executionValidateCall = {

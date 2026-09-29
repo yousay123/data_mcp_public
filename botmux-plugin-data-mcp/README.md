@@ -20,7 +20,7 @@ environments and enabled only for selected bots.
     service side for validation/execution
   - exposes `execute_frozen_query` for host-approved templates: the plugin owns
     SQL literal encoding plus byte-exact validate/run, and returns only a
-    channel-neutral `fallbackText`/`blocks` contract with non-SQL metadata
+    channel-neutral `fallbackText` plus Markdown/table-only `blocks` contract with non-SQL metadata
   - exposes signed local snapshot refresh/search over the same private Unix socket
 - CLI:
   - `botmux data-mcp:status`

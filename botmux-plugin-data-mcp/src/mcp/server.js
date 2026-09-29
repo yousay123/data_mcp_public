@@ -9,7 +9,7 @@ const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
 const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-mcp', 'run', 'api.sock');
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
-const FROZEN_QUERY_CONTRACT_VERSION = 1;
+const FROZEN_QUERY_CONTRACT_VERSION = 2;
 const FROZEN_QUERY_MAX_ROWS = 50;
 const FROZEN_QUERY_MAX_DATA_ROWS = 1000;
 const FROZEN_QUERY_MAX_COLUMNS = 20;
@@ -436,11 +436,14 @@ function buildFrozenQueryPresentation(body, output = {}) {
     if (rows.length > 0) {
       blocks.push({ type: 'table', columns: business.columns, rows, totalRows: business.totalRows, truncated: business.totalRows > rows.length });
     } else {
-      blocks.push({ type: 'text', text: fallbackText });
+      blocks.push({ type: 'markdown', markdown: fallbackText });
     }
     if (suffix) blocks.push({ type: 'markdown', markdown: suffix });
   } else {
-    blocks.push(format === 'markdown' ? { type: 'markdown', markdown: fallbackText } : { type: 'text', text: fallbackText });
+    // The channel-neutral contract has only markdown and table carriers.
+    // BotMux chooses text message versus card from the command's output.format
+    // and uses fallbackText for the former.
+    blocks.push({ type: 'markdown', markdown: fallbackText });
   }
   return {
     contractVersion: FROZEN_QUERY_CONTRACT_VERSION,
