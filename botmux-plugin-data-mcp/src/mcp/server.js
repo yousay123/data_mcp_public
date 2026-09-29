@@ -9,6 +9,14 @@ const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
 const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-mcp', 'run', 'api.sock');
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
+const FROZEN_QUERY_CONTRACT_VERSION = 1;
+const FROZEN_QUERY_MAX_ROWS = 50;
+const FROZEN_QUERY_MAX_DATA_ROWS = 1000;
+const FROZEN_QUERY_MAX_COLUMNS = 20;
+const FROZEN_QUERY_MAX_CELL_CHARS = 1000;
+const FROZEN_QUERY_MAX_DATA_CELL_CHARS = 10000;
+const FROZEN_QUERY_MAX_COLUMN_KEY_CHARS = 128;
+const FROZEN_QUERY_MAX_COLUMN_LABEL_CHARS = 256;
 let hostEnvCache;
 let packageVersionCache;
 
@@ -301,6 +309,178 @@ function argsFrom(request) {
   return request.params?.arguments && typeof request.params.arguments === 'object'
     ? request.params.arguments
     : {};
+}
+
+function frozenQueryError(code, message) {
+  return { contractVersion: FROZEN_QUERY_CONTRACT_VERSION, status: 'error', errorCode: code, message };
+}
+
+function sqlLiteral(value, type) {
+  if (type === 'integer') {
+    if (!Number.isSafeInteger(value)) throw new Error('argument_invalid_integer');
+    return String(value);
+  }
+  if (type === 'enum' && typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('argument_invalid_enum');
+    return String(value);
+  }
+  if (!['string', 'enum', 'date'].includes(type)) throw new Error('argument_type_unsupported');
+  if (typeof value !== 'string' || value.includes('\0')) throw new Error('argument_invalid_string');
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('argument_invalid_date');
+  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+}
+
+function renderFrozenQuery(args) {
+  const payload = args.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('payload_invalid');
+  const template = payload.sql;
+  if (typeof template !== 'string' || !template.trim() || template.length > 200_000) throw new Error('payload_sql_required');
+  const datasource = typeof payload.datasource === 'string' && payload.datasource.trim()
+    ? payload.datasource.trim() : 'tchouse-c';
+  if (datasource !== 'tchouse-c') throw new Error('unsupported_datasource');
+  if (!Array.isArray(args.parameters) || args.parameters.length > 64
+    || !args.values || typeof args.values !== 'object' || Array.isArray(args.values)) {
+    throw new Error('arguments_invalid');
+  }
+  const encoded = new Map();
+  for (const parameter of args.parameters) {
+    if (!parameter || typeof parameter !== 'object' || Array.isArray(parameter)) throw new Error('parameter_invalid');
+    if (typeof parameter.name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter.name)) throw new Error('parameter_name_invalid');
+    if (encoded.has(parameter.name)) throw new Error('parameter_duplicate');
+    if (!Object.hasOwn(args.values, parameter.name)) throw new Error('parameter_required');
+    encoded.set(parameter.name, sqlLiteral(args.values[parameter.name], parameter.type));
+  }
+  for (const key of Object.keys(args.values)) if (!encoded.has(key)) throw new Error('argument_unknown');
+  const referenced = new Set();
+  const sql = template.replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_match, name) => {
+    if (!encoded.has(name)) throw new Error('placeholder_unknown');
+    referenced.add(name);
+    return encoded.get(name);
+  });
+  if (/\{\{|\}\}/.test(sql)) throw new Error('placeholder_invalid');
+  for (const name of encoded.keys()) if (!referenced.has(name)) throw new Error('parameter_unused');
+  return { sql, datasource };
+}
+
+function safeDisplayText(value) {
+  return String(value ?? '—')
+    // Query values are display data, never markup. Replacing delimiters is
+    // deliberately non-recursive and therefore cannot expose a new tag after
+    // an earlier match is removed (for example nested `<a<at>t ...>` input).
+    .replace(/</g, '＜')
+    .replace(/>/g, '＞')
+    .replace(/\[/g, '［')
+    .replace(/\]/g, '］')
+    .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
+}
+
+function frozenBusinessRows(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const raw = Array.isArray(body.rows) ? body.rows : Array.isArray(body.data) ? body.data : null;
+  if (!raw) return null;
+  const sampledRows = raw.slice(0, FROZEN_QUERY_MAX_DATA_ROWS);
+  if (sampledRows.some(row => !row || typeof row !== 'object' || Array.isArray(row))) return null;
+  const rows = sampledRows.filter(row => Object.keys(row).length > 0);
+  if (rows.some(row => Object.values(row).some(value => value !== null && !['string', 'number', 'boolean'].includes(typeof value)))) return null;
+  const labels = new Map();
+  if (Array.isArray(body.columns)) {
+    for (const column of body.columns) {
+      if (column && typeof column === 'object' && !Array.isArray(column) && typeof column.name === 'string') {
+        labels.set(column.name, safeDisplayText(column.description || column.name));
+      }
+    }
+  }
+  const columns = [...new Set([...labels.keys(), ...rows.flatMap(row => Object.keys(row))])]
+    .filter(key => key.length > 0 && key.length <= FROZEN_QUERY_MAX_COLUMN_KEY_CHARS)
+    .slice(0, FROZEN_QUERY_MAX_COLUMNS).map(key => ({
+      key,
+      label: (labels.get(key) || safeDisplayText(key)).slice(0, FROZEN_QUERY_MAX_COLUMN_LABEL_CHARS),
+    }));
+  const totalRows = Number.isSafeInteger(body.row_count) && body.row_count >= raw.length ? body.row_count : raw.length;
+  return { rows, columns, totalRows };
+}
+
+function buildFrozenQueryPresentation(body, output = {}) {
+  const maxChars = Number.isSafeInteger(output.maxChars) ? Math.max(100, Math.min(100000, output.maxChars)) : 12000;
+  const format = ['text', 'markdown', 'table', 'auto'].includes(output.format) ? output.format : 'auto';
+  const prefix = typeof output.prefix === 'string' ? output.prefix.slice(0, maxChars) : '';
+  const suffix = typeof output.suffix === 'string' ? output.suffix.slice(0, Math.max(0, maxChars - prefix.length)) : '';
+  const business = frozenBusinessRows(body);
+  let core = '查询已完成。';
+  if (business) {
+    if (business.rows.length === 0) core = '查询完成，未找到符合条件的数据。';
+    else core = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS)
+      .map((row, index) => `${business.totalRows > 1 ? `${index + 1}. ` : ''}${business.columns.map(column => `${column.label}：${safeDisplayText(row[column.key])}`).join('；')}`)
+      .join('\n');
+  }
+  const fallbackText = `${prefix}${core}${suffix}`.slice(0, maxChars);
+  const useTable = business && business.rows.length > 0 && business.columns.length > 0
+    && (format === 'table' || (format === 'auto' && (business.rows.length > 1 || business.columns.length > 1)));
+  const blocks = [];
+  if (useTable) {
+    if (prefix) blocks.push({ type: 'markdown', markdown: prefix });
+    const candidateRows = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS).map(row => Object.fromEntries(
+      business.columns.map(column => [column.key, safeDisplayText(row[column.key]).slice(0, FROZEN_QUERY_MAX_CELL_CHARS)]),
+    ));
+    const fixedChars = prefix.length + suffix.length
+      + business.columns.reduce((sum, column) => sum + column.key.length + column.label.length, 0);
+    let presentationChars = fixedChars;
+    const rows = [];
+    for (const row of candidateRows) {
+      const rowChars = business.columns.reduce((sum, column) => sum + String(row[column.key] ?? '').length, 0);
+      if (presentationChars + rowChars > maxChars) break;
+      rows.push(row);
+      presentationChars += rowChars;
+    }
+    if (rows.length > 0) {
+      blocks.push({ type: 'table', columns: business.columns, rows, totalRows: business.totalRows, truncated: business.totalRows > rows.length });
+    } else {
+      blocks.push({ type: 'text', text: fallbackText });
+    }
+    if (suffix) blocks.push({ type: 'markdown', markdown: suffix });
+  } else {
+    blocks.push(format === 'markdown' ? { type: 'markdown', markdown: fallbackText } : { type: 'text', text: fallbackText });
+  }
+  return {
+    contractVersion: FROZEN_QUERY_CONTRACT_VERSION,
+    status: 'success',
+    fallbackText,
+    blocks,
+    meta: {
+      queryId: typeof body?.query_id === 'string' && body.query_id ? body.query_id : null,
+      totalRows: business?.totalRows ?? null,
+    },
+    ...(business ? {
+      data: {
+        rows: business.rows.slice(0, FROZEN_QUERY_MAX_DATA_ROWS).map(row => Object.fromEntries(
+          business.columns.map(column => {
+            const value = row[column.key];
+            return [column.key, typeof value === 'string'
+              ? safeDisplayText(value).slice(0, FROZEN_QUERY_MAX_DATA_CELL_CHARS)
+              : value ?? null];
+          }),
+        )),
+        columns: business.columns,
+        totalRows: business.totalRows,
+      },
+    } : {}),
+  };
+}
+
+async function executeFrozenQuery(caller, args) {
+  let rendered;
+  try { rendered = renderFrozenQuery(args); }
+  catch (error) { return frozenQueryError(error instanceof Error ? error.message : 'definition_invalid', '固化查询定义或参数不合法'); }
+  const validate = await callDataMcpService('validate', caller, { sql: rendered.sql, datasource: rendered.datasource, execution_mode: 'single' });
+  if (!validate || validate.status !== 'success' || typeof validate.query_plan_id !== 'string') {
+    return frozenQueryError(validate?.error_code || 'query_validation_failed', validate?.message || '查询校验失败');
+  }
+  const run = await callDataMcpService('run', caller, { sql: rendered.sql, datasource: rendered.datasource, query_plan_id: validate.query_plan_id });
+  if (!run || run.status === 'error' || run.status === 'validation_error') {
+    return frozenQueryError(run?.error_code || 'query_execution_failed', run?.message || '查询执行失败');
+  }
+  return buildFrozenQueryPresentation(run, args.output);
 }
 
 function serviceBaseUrl() {
@@ -798,6 +978,11 @@ async function handleToolCall(request) {
     return;
   }
 
+  if (name === 'execute_frozen_query') {
+    ok(request.id, jsonTool(await executeFrozenQuery(caller, argsFrom(request))));
+    return;
+  }
+
   if (name === 'export_query_to_excel_file') {
     ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request))));
     return;
@@ -879,6 +1064,30 @@ function toolSchemas() {
           query_plan_id: { type: 'string' },
         },
         required: ['sql', 'query_plan_id'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'execute_frozen_query',
+      description: 'Render, validate and run an approved frozen read-only query, returning a channel-neutral presentation without SQL.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          payload: { type: 'object', additionalProperties: true },
+          parameters: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          values: { type: 'object', additionalProperties: true },
+          output: {
+            type: 'object',
+            properties: {
+              format: { type: 'string', enum: ['text', 'markdown', 'table', 'auto'] },
+              prefix: { type: 'string' },
+              suffix: { type: 'string' },
+              maxChars: { type: 'integer', minimum: 100, maximum: 100000 },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ['payload', 'parameters', 'values'],
         additionalProperties: false,
       },
     },
