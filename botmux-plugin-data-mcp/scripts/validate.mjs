@@ -836,7 +836,7 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'execute_frozen_query', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
@@ -852,7 +852,16 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
+    const visibleFrozenSchema = tools.find(tool => tool.name === 'execute_frozen_query')?.inputSchema;
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
+    if (
+      JSON.stringify(visibleFrozenSchema).includes('requestUser')
+      || JSON.stringify(visibleFrozenSchema).includes('request_user')
+      || JSON.stringify(visibleFrozenSchema).includes('caller')
+      || JSON.stringify(visibleFrozenSchema).includes('identity')
+    ) {
+      fail('execute_frozen_query schema must not expose trusted identity arguments');
+    }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
     }
@@ -1062,6 +1071,7 @@ try {
             res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
             return;
           }
+          const frozenSql = "SELECT 'O''Reilly' AS probe";
           const expectedContextId = parsed.sql === '  SELECT execution_context  '
             ? 'execution_socket_probe'
             : parsed.sql === 'SELECT precedence_context'
@@ -1074,8 +1084,13 @@ try {
                 && parsed.caller_session_id !== expectedContextId
               )
               ? 'wrong_execution_context'
-              : req.url === '/agent/validate-sql' && parsed.execution_mode !== 'compare'
+              : req.url === '/agent/validate-sql'
+                && parsed.execution_mode !== (parsed.sql === frozenSql ? 'single' : 'compare')
                 ? 'wrong_execution_mode'
+                : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
+                  ? 'wrong_frozen_query_plan'
+                : parsed.sql?.includes("O'Reilly")
+                  ? 'frozen_sql_literal_not_escaped'
                 : null;
           if (failureCode) {
             res.writeHead(400, { 'content-type': 'application/json' });
@@ -1083,7 +1098,15 @@ try {
             return;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
+          res.end(JSON.stringify({
+            status: 'success',
+            transport: 'unix_socket',
+            endpoint: req.url,
+            ...(req.url === '/agent/validate-sql' ? { query_plan_id: parsed.sql === frozenSql ? 'qplan_frozen' : 'qplan_socket' } : {}),
+            ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
+              ? { query_id: 'q_frozen', rows: [{ probe: "O'Reilly" }], row_count: 1 }
+              : {}),
+          }));
         });
       });
       server.listen(process.env.SOCKET_PATH, () => {
@@ -1166,9 +1189,32 @@ try {
           },
         },
       };
+      const frozenQueryCall = {
+        jsonrpc: '2.0',
+        id: 17,
+        method: 'tools/call',
+        params: {
+          name: 'execute_frozen_query',
+          arguments: {
+            payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
+            parameters: [{ name: 'value', type: 'string' }],
+            values: { value: "O'Reilly" },
+            output: { format: 'table', maxChars: 12000 },
+            requestUserUnionId: 'on_forged_argument',
+          },
+          _meta: {
+            botmuxTrustedCaller: {
+              requestUserOpenId: 'ou_socket_user',
+              requestUserUnionId: 'on_socket_user',
+              requestLarkAppId: 'cli_test',
+              senderType: 'user',
+            },
+          },
+        },
+      };
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
-        input: [initialize, socketCall, socketSearchCall, socketRefreshCall, socketValidateCall].map(message => JSON.stringify(message)).join('\n') + '\n',
+        input: [initialize, socketCall, socketSearchCall, socketRefreshCall, socketValidateCall, frozenQueryCall].map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
         timeout: 5000,
         env: {
@@ -1201,6 +1247,15 @@ try {
       const validateText = socketResponses.find(response => response.id === 16)?.result?.content?.[0]?.text ?? '';
       if (!validateText.includes('/agent/validate-sql')) {
         fail('validate_sql_for_user must forward session binding and compare mode over the shared Unix socket');
+      }
+      const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
+      if (
+        !frozenText.includes('"contractVersion": 1')
+        || !frozenText.includes('"queryId": "q_frozen"')
+        || frozenText.includes("SELECT 'O''Reilly'")
+        || frozenText.includes('on_forged_argument')
+      ) {
+        fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
       }
 
       const executionValidateCall = {

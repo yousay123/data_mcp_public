@@ -18,6 +18,9 @@ environments and enabled only for selected bots.
   - fails closed when Gateway trusted-caller metadata is absent
   - exposes identity-bound tools that forward explicit SQL to the Data MCP
     service side for validation/execution
+  - exposes `execute_frozen_query` for host-approved templates: the plugin owns
+    SQL literal encoding plus byte-exact validate/run, and returns only a
+    channel-neutral `fallbackText`/`blocks` contract with non-SQL metadata
   - exposes signed local snapshot refresh/search over the same private Unix socket
 - CLI:
   - `botmux data-mcp:status`
@@ -117,9 +120,18 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Optional service-to-service token sent as `X-Internal-Auth`.
 
-The plugin never generates business SQL itself. It forwards explicit SQL and
-Botmux Gateway trusted identity to the Data MCP service, where SQL validation,
-permission checks, account mapping, execution, export limits, and audit belong.
+For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
+trusted identity to the Data MCP service. For `execute_frozen_query`, Botmux
+passes an approved template plus already type-checked values as opaque plugin
+payload; the plugin alone encodes SQL literals, renders the final SQL, and sends
+the exact same bytes through validate and run. The returned presentation never
+contains SQL and raw HTML is not part of the contract. SQL validation,
+permission checks, account mapping, execution, export limits, and audit remain
+on the Data MCP side.
+
+Each `execute_frozen_query` call performs one validate/run pair. The plugin does
+not replay a failed run with an old plan; a caller retry starts a new invocation
+and obtains a new plan under the same host-injected identity boundary.
 Metadata discovery calls `search_metadata_snapshot`; refresh accepts only a
 host-injected `schedule_creator` identity with task/app/owner binding and never
 accepts SQL, table names, identity, or task fields from model arguments.
