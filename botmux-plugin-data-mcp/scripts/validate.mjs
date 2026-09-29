@@ -1071,7 +1071,7 @@ try {
             res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
             return;
           }
-          const frozenSql = "SELECT 'O''Reilly' AS probe";
+          const frozenSql = "SELECT '\\\\\\\\'' OR 1=1 --' AS probe";
           const expectedContextId = parsed.sql === '  SELECT execution_context  '
             ? 'execution_socket_probe'
             : parsed.sql === 'SELECT precedence_context'
@@ -1089,7 +1089,7 @@ try {
                 ? 'wrong_execution_mode'
                 : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
                   ? 'wrong_frozen_query_plan'
-                : parsed.sql?.includes("O'Reilly")
+                : parsed.sql !== frozenSql && parsed.sql?.includes('OR 1=1')
                   ? 'frozen_sql_literal_not_escaped'
                 : null;
           if (failureCode) {
@@ -1104,7 +1104,11 @@ try {
             endpoint: req.url,
             ...(req.url === '/agent/validate-sql' ? { query_plan_id: parsed.sql === frozenSql ? 'qplan_frozen' : 'qplan_socket' } : {}),
             ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
-              ? { query_id: 'q_frozen', rows: [{ probe: "O'Reilly" }], row_count: 1 }
+              ? {
+                  query_id: 'q_frozen',
+                  rows: [{ probe: '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil)' }],
+                  row_count: 1,
+                }
               : {}),
           }));
         });
@@ -1198,7 +1202,7 @@ try {
           arguments: {
             payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
             parameters: [{ name: 'value', type: 'string' }],
-            values: { value: "O'Reilly" },
+            values: { value: "\\' OR 1=1 --" },
             output: { format: 'table', maxChars: 12000 },
             requestUserUnionId: 'on_forged_argument',
           },
@@ -1249,11 +1253,19 @@ try {
         fail('validate_sql_for_user must forward session binding and compare mode over the shared Unix socket');
       }
       const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
+      const frozenPayload = JSON.parse(frozenText);
+      const frozenPresentation = JSON.stringify({
+        fallbackText: frozenPayload.fallbackText,
+        blocks: frozenPayload.blocks,
+        data: frozenPayload.data,
+      });
       if (
         !frozenText.includes('"contractVersion": 1')
         || !frozenText.includes('"queryId": "q_frozen"')
-        || frozenText.includes("SELECT 'O''Reilly'")
+        || frozenText.includes('OR 1=1')
         || frozenText.includes('on_forged_argument')
+        || frozenPresentation.includes('<at')
+        || frozenPresentation.includes('[点我领奖](http://evil)')
       ) {
         fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
       }

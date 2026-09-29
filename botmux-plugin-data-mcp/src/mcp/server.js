@@ -364,7 +364,13 @@ function renderFrozenQuery(args) {
 
 function safeDisplayText(value) {
   return String(value ?? '—')
-    .replace(/<\/?(?:at|script|style)\b[^>]*>/gi, '')
+    // Query values are display data, never markup. Replacing delimiters is
+    // deliberately non-recursive and therefore cannot expose a new tag after
+    // an earlier match is removed (for example nested `<a<at>t ...>` input).
+    .replace(/</g, '＜')
+    .replace(/>/g, '＞')
+    .replace(/\[/g, '［')
+    .replace(/\]/g, '］')
     .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
 }
@@ -414,10 +420,24 @@ function buildFrozenQueryPresentation(body, output = {}) {
   const blocks = [];
   if (useTable) {
     if (prefix) blocks.push({ type: 'markdown', markdown: prefix });
-    const rows = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS).map(row => Object.fromEntries(
+    const candidateRows = business.rows.slice(0, FROZEN_QUERY_MAX_ROWS).map(row => Object.fromEntries(
       business.columns.map(column => [column.key, safeDisplayText(row[column.key]).slice(0, FROZEN_QUERY_MAX_CELL_CHARS)]),
     ));
-    blocks.push({ type: 'table', columns: business.columns, rows, totalRows: business.totalRows, truncated: business.totalRows > rows.length });
+    const fixedChars = prefix.length + suffix.length
+      + business.columns.reduce((sum, column) => sum + column.key.length + column.label.length, 0);
+    let presentationChars = fixedChars;
+    const rows = [];
+    for (const row of candidateRows) {
+      const rowChars = business.columns.reduce((sum, column) => sum + String(row[column.key] ?? '').length, 0);
+      if (presentationChars + rowChars > maxChars) break;
+      rows.push(row);
+      presentationChars += rowChars;
+    }
+    if (rows.length > 0) {
+      blocks.push({ type: 'table', columns: business.columns, rows, totalRows: business.totalRows, truncated: business.totalRows > rows.length });
+    } else {
+      blocks.push({ type: 'text', text: fallbackText });
+    }
     if (suffix) blocks.push({ type: 'markdown', markdown: suffix });
   } else {
     blocks.push(format === 'markdown' ? { type: 'markdown', markdown: fallbackText } : { type: 'text', text: fallbackText });
@@ -436,7 +456,9 @@ function buildFrozenQueryPresentation(body, output = {}) {
         rows: business.rows.slice(0, FROZEN_QUERY_MAX_DATA_ROWS).map(row => Object.fromEntries(
           business.columns.map(column => {
             const value = row[column.key];
-            return [column.key, typeof value === 'string' ? value.slice(0, FROZEN_QUERY_MAX_DATA_CELL_CHARS) : value ?? null];
+            return [column.key, typeof value === 'string'
+              ? safeDisplayText(value).slice(0, FROZEN_QUERY_MAX_DATA_CELL_CHARS)
+              : value ?? null];
           }),
         )),
         columns: business.columns,
