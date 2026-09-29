@@ -311,8 +311,32 @@ function argsFrom(request) {
     : {};
 }
 
-function frozenQueryError(code, message) {
-  return { contractVersion: FROZEN_QUERY_CONTRACT_VERSION, status: 'error', errorCode: code, message };
+const FROZEN_QUERY_PUBLIC_ERRORS = {
+  invalid_request: '固化查询定义或参数不合法。',
+  permission_denied: '当前用户无权执行该固化查询。',
+  rate_limited: '查询请求过于频繁，请稍后重试。',
+  timeout: '固化查询执行超时，请稍后重试。',
+  temporarily_unavailable: '查询服务暂时不可用，请稍后重试。',
+  execution_failed: '固化查询执行失败。',
+};
+
+function frozenQueryError(code) {
+  const safeCode = Object.hasOwn(FROZEN_QUERY_PUBLIC_ERRORS, code) ? code : 'execution_failed';
+  return {
+    contractVersion: FROZEN_QUERY_CONTRACT_VERSION,
+    status: 'error',
+    errorCode: safeCode,
+    message: FROZEN_QUERY_PUBLIC_ERRORS[safeCode],
+  };
+}
+
+function frozenQueryServiceError(code) {
+  const value = String(code || '');
+  if (/permission|forbidden|unauthori[sz]ed|access_denied/i.test(value)) return 'permission_denied';
+  if (/rate.?limit|too_many_requests/i.test(value)) return 'rate_limited';
+  if (/timed?_?out|timeout/i.test(value)) return 'timeout';
+  if (/unavailable|unreachable|connection|transport|socket|overload/i.test(value)) return 'temporarily_unavailable';
+  return 'execution_failed';
 }
 
 function sqlLiteral(value, type) {
@@ -371,6 +395,14 @@ function safeDisplayText(value) {
     .replace(/>/g, '＞')
     .replace(/\[/g, '［')
     .replace(/\]/g, '］')
+    .replace(/\\/g, '＼')
+    .replace(/\*/g, '＊')
+    .replace(/_/g, '＿')
+    .replace(/`/g, '｀')
+    .replace(/~/g, '～')
+    .replace(/#/g, '＃')
+    .replace(/!/g, '！')
+    .replace(/\|/g, '｜')
     .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
 }
@@ -474,14 +506,14 @@ function buildFrozenQueryPresentation(body, output = {}) {
 async function executeFrozenQuery(caller, args) {
   let rendered;
   try { rendered = renderFrozenQuery(args); }
-  catch (error) { return frozenQueryError(error instanceof Error ? error.message : 'definition_invalid', '固化查询定义或参数不合法'); }
+  catch { return frozenQueryError('invalid_request'); }
   const validate = await callDataMcpService('validate', caller, { sql: rendered.sql, datasource: rendered.datasource, execution_mode: 'single' });
   if (!validate || validate.status !== 'success' || typeof validate.query_plan_id !== 'string') {
-    return frozenQueryError(validate?.error_code || 'query_validation_failed', validate?.message || '查询校验失败');
+    return frozenQueryError(frozenQueryServiceError(validate?.error_code));
   }
   const run = await callDataMcpService('run', caller, { sql: rendered.sql, datasource: rendered.datasource, query_plan_id: validate.query_plan_id });
   if (!run || run.status === 'error' || run.status === 'validation_error') {
-    return frozenQueryError(run?.error_code || 'query_execution_failed', run?.message || '查询执行失败');
+    return frozenQueryError(frozenQueryServiceError(run?.error_code));
   }
   return buildFrozenQueryPresentation(run, args.output);
 }

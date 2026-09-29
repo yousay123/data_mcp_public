@@ -1106,7 +1106,7 @@ try {
             ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
               ? {
                   query_id: 'q_frozen',
-                  rows: [{ probe: '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil)' }],
+                  rows: [{ probe: '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_' }],
                   row_count: 1,
                 }
               : {}),
@@ -1227,9 +1227,29 @@ try {
           },
         },
       };
+      const frozenInvalidValuesCall = {
+        ...frozenQueryCall,
+        id: 19,
+        params: {
+          ...frozenQueryCall.params,
+          arguments: {
+            ...frozenQueryCall.params.arguments,
+            values: { sql: 'not-a-command-parameter' },
+          },
+        },
+      };
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
-        input: [initialize, socketCall, socketSearchCall, socketRefreshCall, socketValidateCall, frozenQueryCall, frozenTextCall]
+        input: [
+          initialize,
+          socketCall,
+          socketSearchCall,
+          socketRefreshCall,
+          socketValidateCall,
+          frozenQueryCall,
+          frozenTextCall,
+          frozenInvalidValuesCall,
+        ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
         timeout: 5000,
@@ -1279,6 +1299,8 @@ try {
         || frozenText.includes('on_forged_argument')
         || frozenPresentation.includes('<at')
         || frozenPresentation.includes('[点我领奖](http://evil)')
+        || frozenPresentation.includes('**bold**')
+        || frozenPresentation.includes('_italic_')
       ) {
         fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
       }
@@ -1290,6 +1312,18 @@ try {
         || frozenTextPayload.blocks.some(block => !['markdown', 'table'].includes(block?.type))
       ) {
         fail(`execute_frozen_query text format must still use the markdown/table-only v2 carrier: ${JSON.stringify(frozenTextPayload)}`);
+      }
+      const frozenInvalidValuesPayload = JSON.parse(
+        socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
+      );
+      if (
+        frozenInvalidValuesPayload.contractVersion !== 2
+        || frozenInvalidValuesPayload.status !== 'error'
+        || frozenInvalidValuesPayload.errorCode !== 'invalid_request'
+        || frozenInvalidValuesPayload.message !== '固化查询定义或参数不合法。'
+        || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
+      ) {
+        fail(`execute_frozen_query must expose only fixed public errors: ${JSON.stringify(frozenInvalidValuesPayload)}`);
       }
 
       const executionValidateCall = {
