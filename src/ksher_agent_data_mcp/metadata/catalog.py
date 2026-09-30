@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from uuid import uuid4
 from urllib.error import HTTPError
 
 from ksher_agent_data_mcp.config import Settings
@@ -81,7 +82,7 @@ class TChouseCMetadataCatalog(MetadataCatalog):
             execute_clickhouse_json(
                 target=target,
                 sql=sql,
-                query_id="metadata_probe_table",
+                query_id=f"metadata_probe_table_{uuid4().hex}",
                 timeout_seconds=min(self.settings.query_timeout_seconds, 15),
             )
         except HTTPError as exc:
@@ -119,7 +120,7 @@ class TChouseCMetadataCatalog(MetadataCatalog):
             payload = execute_clickhouse_json(
                 target=target,
                 sql=sql,
-                query_id="metadata_suggest_tables",
+                query_id=f"metadata_suggest_tables_{uuid4().hex}",
                 timeout_seconds=min(self.settings.query_timeout_seconds, 15),
             )
         except Exception:

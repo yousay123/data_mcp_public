@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from urllib.error import HTTPError, URLError
 
@@ -565,6 +566,55 @@ def test_dynamic_catalog_uses_query_level_probe_for_union_all(monkeypatch) -> No
     assert "UNION ALL SELECT ds, 'fx' AS metric" in seen_sql[0]
     assert seen_sql[0].endswith(") AS _mcp_query_probe LIMIT 0")
     assert catalog.describe_called is False
+
+
+def test_concurrent_validations_use_distinct_query_probe_ids(monkeypatch) -> None:
+    active_query_ids: set[str] = set()
+    seen_query_ids: list[str] = []
+    lock = threading.Lock()
+    both_started = threading.Event()
+
+    def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds):
+        with lock:
+            duplicate = query_id in active_query_ids
+            seen_query_ids.append(query_id)
+            if not duplicate:
+                active_query_ids.add(query_id)
+            if len(seen_query_ids) == 2:
+                both_started.set()
+
+        if duplicate:
+            raise _clickhouse_http_error("QUERY_WITH_SAME_ID_IS_ALREADY_RUNNING")
+
+        try:
+            assert both_started.wait(timeout=1)
+            return {"meta": [], "data": [], "rows": 0}
+        finally:
+            with lock:
+                active_query_ids.remove(query_id)
+
+    monkeypatch.setattr(sql_guard_module, "execute_clickhouse_json", fake_execute_clickhouse_json)
+    guard = SqlGuard(
+        settings=Settings(METADATA_PROVIDER="tchouse_c", REQUIRE_PARTITION_FILTER=False),
+        catalog=DenyingTChouseCMetadataCatalog(),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                guard.validate,
+                _user(),
+                "SELECT * FROM analytics.payment_order_daily LIMIT 1",
+                credential=_credential(),
+            )
+            for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+
+    assert [result.status for result in results] == [Status.SUCCESS, Status.SUCCESS]
+    assert len(seen_query_ids) == 2
+    assert len(set(seen_query_ids)) == 2
+    assert all(query_id.startswith("metadata_probe_query_") for query_id in seen_query_ids)
 
 
 def test_query_probe_not_an_aggregate_returns_sql_error(monkeypatch) -> None:

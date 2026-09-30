@@ -1,6 +1,7 @@
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from uuid import uuid4
 from urllib.error import HTTPError, URLError
 
 import sqlglot
@@ -359,7 +360,7 @@ class SqlGuard:
             execute_clickhouse_json(
                 target=target,
                 sql=probe_sql,
-                query_id="metadata_probe_query",
+                query_id=f"metadata_probe_query_{uuid4().hex}",
                 timeout_seconds=min(self.settings.query_timeout_seconds, 15),
             )
         except HTTPError as exc:

@@ -20,9 +20,11 @@ def _credential() -> CredentialRef:
 
 def test_tchouse_c_catalog_describes_existing_table(monkeypatch) -> None:
     seen_sql = []
+    seen_query_ids = []
 
     def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds):
         seen_sql.append(sql)
+        seen_query_ids.append(query_id)
         return {"data": []}
 
     monkeypatch.setattr(catalog_module, "execute_clickhouse_json", fake_execute_clickhouse_json)
@@ -34,6 +36,33 @@ def test_tchouse_c_catalog_describes_existing_table(monkeypatch) -> None:
     assert table.full_name == "analytics.payment_order_daily"
     assert table.columns == []
     assert seen_sql == ["SELECT 1 FROM `analytics`.`payment_order_daily` LIMIT 0"]
+    assert len(seen_query_ids) == 1
+    assert seen_query_ids[0].startswith("metadata_probe_table_")
+
+
+def test_tchouse_c_catalog_uses_unique_query_ids(monkeypatch) -> None:
+    seen_query_ids = []
+
+    def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds):
+        seen_query_ids.append(query_id)
+        return {"data": []}
+
+    monkeypatch.setattr(catalog_module, "execute_clickhouse_json", fake_execute_clickhouse_json)
+    catalog = TChouseCMetadataCatalog(Settings())
+
+    catalog.describe_table("analytics.payment_order_daily", _credential())
+    catalog.describe_table("analytics.merchant_dimension", _credential())
+    catalog.suggest_tables("analytics.payment", credential=_credential())
+    catalog.suggest_tables("analytics.merchant", credential=_credential())
+
+    assert len(seen_query_ids) == 4
+    assert len(set(seen_query_ids)) == 4
+    assert all(
+        query_id.startswith("metadata_probe_table_") for query_id in seen_query_ids[:2]
+    )
+    assert all(
+        query_id.startswith("metadata_suggest_tables_") for query_id in seen_query_ids[2:]
+    )
 
 
 def test_tchouse_c_catalog_denies_when_probe_fails(monkeypatch) -> None:
