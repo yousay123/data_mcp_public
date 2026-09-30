@@ -836,8 +836,11 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'execute_frozen_query', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
+    }
+    if (tools.some(tool => tool.name === 'execute_frozen_query')) {
+      fail('retired MCP tool execute_frozen_query must not be exposed');
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
     if (tools.some(tool => tool.name === removedClusterComparisonTool)) {
@@ -852,7 +855,7 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleFrozenSchema = tools.find(tool => tool.name === 'execute_frozen_query')?.inputSchema;
+    const visibleFrozenSchema = tools.find(tool => tool.name === 'frozen_query_raw')?.inputSchema;
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     if (
       JSON.stringify(visibleFrozenSchema).includes('requestUser')
@@ -860,7 +863,7 @@ try {
       || JSON.stringify(visibleFrozenSchema).includes('caller')
       || JSON.stringify(visibleFrozenSchema).includes('identity')
     ) {
-      fail('execute_frozen_query schema must not expose trusted identity arguments');
+      fail('frozen_query_raw schema must not expose trusted identity arguments');
     }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
@@ -1214,7 +1217,7 @@ try {
         id: 17,
         method: 'tools/call',
         params: {
-          name: 'execute_frozen_query',
+          name: 'frozen_query_raw',
           arguments: {
             payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
             parameters: [{ name: 'value', type: 'string' }],
@@ -1329,7 +1332,7 @@ try {
         || frozenText.includes('blocks')
         || frozenText.includes('fallbackText')
       ) {
-        fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
+        fail(`frozen_query_raw must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
       }
       const frozenInvalidValuesPayload = JSON.parse(
         socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
@@ -1342,14 +1345,14 @@ try {
         || !Array.isArray(frozenInvalidValuesPayload.columns)
         || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
       ) {
-        fail(`execute_frozen_query must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
+        fail(`frozen_query_raw must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
       }
       for (const { id, expectedCode } of frozenErrorCalls) {
         const payload = JSON.parse(
           socketResponses.find(response => response.id === id)?.result?.content?.[0]?.text ?? '{}',
         );
         if (payload.error_code !== expectedCode) {
-          fail(`execute_frozen_query must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
+          fail(`frozen_query_raw must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
         }
       }
 

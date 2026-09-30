@@ -887,7 +887,7 @@ async function handleToolCall(request) {
     return;
   }
 
-  if (name === 'execute_frozen_query') {
+  if (name === 'frozen_query_raw') {
     ok(request.id, jsonTool(await executeFrozenQuery(caller, argsFrom(request))));
     return;
   }
@@ -977,7 +977,7 @@ function toolSchemas() {
       },
     },
     {
-      name: 'execute_frozen_query',
+      name: 'frozen_query_raw',
       description: 'Render, validate and run an approved frozen read-only query, returning the raw data result without SQL.',
       inputSchema: {
         type: 'object',
