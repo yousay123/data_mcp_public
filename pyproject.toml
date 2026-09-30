@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ksher-agent-data-mcp"
-version = "0.3.1"
+version = "0.4.2"
 description = "Secure MCP service for agent-governed TChouse data access"
 readme = "README.md"
 requires-python = ">=3.11"

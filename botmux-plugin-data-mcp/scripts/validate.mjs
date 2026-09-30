@@ -836,8 +836,11 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'execute_frozen_query', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
+    }
+    if (tools.some(tool => tool.name === 'execute_frozen_query')) {
+      fail('retired MCP tool execute_frozen_query must not be exposed');
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
     if (tools.some(tool => tool.name === removedClusterComparisonTool)) {
@@ -852,7 +855,7 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleFrozenSchema = tools.find(tool => tool.name === 'execute_frozen_query')?.inputSchema;
+    const visibleFrozenSchema = tools.find(tool => tool.name === 'frozen_query_raw')?.inputSchema;
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     if (
       JSON.stringify(visibleFrozenSchema).includes('requestUser')
@@ -860,7 +863,7 @@ try {
       || JSON.stringify(visibleFrozenSchema).includes('caller')
       || JSON.stringify(visibleFrozenSchema).includes('identity')
     ) {
-      fail('execute_frozen_query schema must not expose trusted identity arguments');
+      fail('frozen_query_raw schema must not expose trusted identity arguments');
     }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
@@ -1085,7 +1088,12 @@ try {
               )
               ? 'wrong_execution_context'
               : req.url === '/agent/validate-sql'
-                && parsed.execution_mode !== (parsed.sql === frozenSql ? 'single' : 'compare')
+                && parsed.execution_mode !== (
+                  parsed.sql === frozenSql
+                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/.test(parsed.sql)
+                    ? 'single'
+                    : 'compare'
+                )
                 ? 'wrong_execution_mode'
                 : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
                   ? 'wrong_frozen_query_plan'
@@ -1095,6 +1103,17 @@ try {
           if (failureCode) {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: failureCode }] }));
+            return;
+          }
+          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/)?.[1];
+          if (req.url === '/agent/validate-sql' && frozenFailure) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ status: 'validation_error', error_code: frozenFailure }));
+            return;
+          }
+          if (req.url === '/agent/run-query' && parsed.sql === 'SELECT run_query_timeout') {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', error_code: 'query_timeout' }));
             return;
           }
           res.writeHead(200, { 'content-type': 'application/json' });
@@ -1198,12 +1217,11 @@ try {
         id: 17,
         method: 'tools/call',
         params: {
-          name: 'execute_frozen_query',
+          name: 'frozen_query_raw',
           arguments: {
             payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
             parameters: [{ name: 'value', type: 'string' }],
             values: { value: "\\' OR 1=1 --" },
-            output: { format: 'table', maxChars: 12000 },
             requestUserUnionId: 'on_forged_argument',
           },
           _meta: {
@@ -1213,17 +1231,6 @@ try {
               requestLarkAppId: 'cli_test',
               senderType: 'user',
             },
-          },
-        },
-      };
-      const frozenTextCall = {
-        ...frozenQueryCall,
-        id: 18,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            ...frozenQueryCall.params.arguments,
-            output: { format: 'text', maxChars: 12000 },
           },
         },
       };
@@ -1238,6 +1245,32 @@ try {
           },
         },
       };
+      const frozenErrorCalls = [
+        ['query_timeout', 'timeout', 20],
+        ['datasource_unreachable', 'temporarily_unavailable', 21],
+        ['http_403', 'permission_denied', 22],
+        ['run_query_timeout', 'timeout', 23],
+        ['missing_union_id', 'permission_denied', 24],
+        ['trusted_human_or_schedule_required', 'permission_denied', 25],
+        ['account_mapping_unavailable', 'permission_denied', 26],
+        ['account_mismatch', 'permission_denied', 27],
+        ['query_concurrency_limit', 'execution_failed', 28],
+        ['restricted_access_metadata', 'permission_denied', 29],
+        ['restricted_system_columns', 'permission_denied', 30],
+        ['unknown_table', 'not_found', 31],
+      ].map(([serviceCode, expectedCode, id]) => ({
+        ...frozenQueryCall,
+        id,
+        expectedCode,
+        params: {
+          ...frozenQueryCall.params,
+          arguments: {
+            payload: { sql: `SELECT ${serviceCode}`, datasource: 'tchouse-c' },
+            parameters: [],
+            values: {},
+          },
+        },
+      }));
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
         input: [
@@ -1247,8 +1280,8 @@ try {
           socketRefreshCall,
           socketValidateCall,
           frozenQueryCall,
-          frozenTextCall,
           frozenInvalidValuesCall,
+          ...frozenErrorCalls.map(({ expectedCode: _expectedCode, ...call }) => call),
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
@@ -1286,44 +1319,41 @@ try {
       }
       const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
       const frozenPayload = JSON.parse(frozenText);
-      const frozenPresentation = JSON.stringify({
-        fallbackText: frozenPayload.fallbackText,
-        blocks: frozenPayload.blocks,
-        data: frozenPayload.data,
-      });
       if (
-        !frozenText.includes('"contractVersion": 2')
-        || !frozenText.includes('"queryId": "q_frozen"')
-        || frozenPayload.blocks.some(block => block?.type === 'text')
+        frozenPayload.query_id !== 'q_frozen'
+        || frozenPayload.row_count !== 1
+        || !Array.isArray(frozenPayload.rows)
+        || frozenPayload.rows[0]?.probe !== '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_'
+        || !Array.isArray(frozenPayload.columns)
+        || frozenPayload.error_code !== null
         || frozenText.includes('OR 1=1')
         || frozenText.includes('on_forged_argument')
-        || frozenPresentation.includes('<at')
-        || frozenPresentation.includes('[点我领奖](http://evil)')
-        || frozenPresentation.includes('**bold**')
-        || frozenPresentation.includes('_italic_')
+        || frozenText.includes('contractVersion')
+        || frozenText.includes('blocks')
+        || frozenText.includes('fallbackText')
       ) {
-        fail(`execute_frozen_query must bind trusted identity, escape SQL literals, keep validate/run bytes identical, and omit SQL from output: ${frozenText}`);
-      }
-      const frozenTextPayload = JSON.parse(socketResponses.find(response => response.id === 18)?.result?.content?.[0]?.text ?? '{}');
-      if (
-        frozenTextPayload.contractVersion !== 2
-        || !Array.isArray(frozenTextPayload.blocks)
-        || frozenTextPayload.blocks.length < 1
-        || frozenTextPayload.blocks.some(block => !['markdown', 'table'].includes(block?.type))
-      ) {
-        fail(`execute_frozen_query text format must still use the markdown/table-only v2 carrier: ${JSON.stringify(frozenTextPayload)}`);
+        fail(`frozen_query_raw must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
       }
       const frozenInvalidValuesPayload = JSON.parse(
         socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
       );
       if (
-        frozenInvalidValuesPayload.contractVersion !== 2
-        || frozenInvalidValuesPayload.status !== 'error'
-        || frozenInvalidValuesPayload.errorCode !== 'invalid_request'
-        || frozenInvalidValuesPayload.message !== '固化查询定义或参数不合法。'
+        frozenInvalidValuesPayload.error_code !== 'invalid_request'
+        || frozenInvalidValuesPayload.row_count !== 0
+        || frozenInvalidValuesPayload.query_id !== null
+        || !Array.isArray(frozenInvalidValuesPayload.rows)
+        || !Array.isArray(frozenInvalidValuesPayload.columns)
         || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
       ) {
-        fail(`execute_frozen_query must expose only fixed public errors: ${JSON.stringify(frozenInvalidValuesPayload)}`);
+        fail(`frozen_query_raw must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
+      }
+      for (const { id, expectedCode } of frozenErrorCalls) {
+        const payload = JSON.parse(
+          socketResponses.find(response => response.id === id)?.result?.content?.[0]?.text ?? '{}',
+        );
+        if (payload.error_code !== expectedCode) {
+          fail(`frozen_query_raw must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
+        }
       }
 
       const executionValidateCall = {
