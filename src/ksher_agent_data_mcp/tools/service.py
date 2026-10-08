@@ -418,6 +418,7 @@ class DataMcpService:
             sql,
             datasource,
             credential=credential,
+            max_rows=self._query_max_rows(audit_context),
         )
         audit_logger.emit(
             AuditEvent(
@@ -1035,6 +1036,7 @@ class DataMcpService:
             sql,
             datasource,
             credential=credential,
+            max_rows=self._query_max_rows(audit_context),
         )
         if validation.status != Status.SUCCESS or validation.normalized_sql is None:
             audit_logger.emit(
@@ -1460,7 +1462,18 @@ class DataMcpService:
             "amber_channel": _clean_string(context.get("amber_channel")),
             "amber_jti_ref": _clean_string(context.get("amber_jti_ref")),
             "amber_call": _clean_string(context.get("amber_call")),
+            "query_max_rows": _clean_string(context.get("query_max_rows")),
         }
+
+    def _query_max_rows(self, audit_context: AuditContext | None) -> int | None:
+        value = self._audit_detail(audit_context).get("query_max_rows")
+        if not value:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
 
 
 def _safe_export_error_message(error_code: str) -> str:

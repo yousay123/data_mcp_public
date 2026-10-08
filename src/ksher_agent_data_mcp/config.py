@@ -116,6 +116,24 @@ class Settings(BaseSettings):
         ge=1,
         le=600,
     )
+    amber_replay_grace_seconds: int = Field(
+        default=120,
+        alias="DATA_MCP_AMBER_REPLAY_GRACE_SECONDS",
+        ge=60,
+        le=3600,
+    )
+    amber_trial_max_rows: int = Field(
+        default=20,
+        alias="DATA_MCP_AMBER_TRIAL_MAX_ROWS",
+        ge=1,
+        le=1000,
+    )
+    amber_schedule_max_calls_per_minute: int = Field(
+        default=10,
+        alias="DATA_MCP_AMBER_SCHEDULE_MAX_CALLS_PER_MINUTE",
+        ge=1,
+        le=1000,
+    )
     tchouse_d_credential_sql: str | None = Field(
         default=None,
         alias="TCHOUSE_D_CREDENTIAL_SQL",

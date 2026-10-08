@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import stat
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ class AmberAuthError(ValueError):
 
 
 class AmberReplayError(AmberAuthError):
+    pass
+
+
+class AmberRateLimitError(AmberAuthError):
     pass
 
 
@@ -203,24 +208,30 @@ class AmberStateStore:
         self.audit_key, self.audit_key_id = self._load_audit_key(audit_key_file)
         database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(database.parent, 0o700)
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS amber_replay (
-                  issuer TEXT NOT NULL, jti TEXT NOT NULL, expires_at INTEGER NOT NULL,
-                  PRIMARY KEY (issuer, jti)
-                );
-                CREATE TABLE IF NOT EXISTS amber_sql_audit (
-                  audit_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
-                  union_id TEXT NOT NULL, command_id TEXT NOT NULL, revision TEXT NOT NULL,
-                  run_id TEXT NOT NULL, jti_ref TEXT NOT NULL, channel TEXT NOT NULL,
-                  call_index INTEGER NOT NULL, call_count INTEGER NOT NULL,
-                  datasource TEXT NOT NULL, sql_sha256 TEXT NOT NULL,
-                  key_id TEXT NOT NULL, nonce BLOB NOT NULL, encrypted_sql BLOB NOT NULL,
-                  status TEXT NOT NULL, error_code TEXT, row_count INTEGER
-                );
-                """
-            )
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS amber_replay (
+                      issuer TEXT NOT NULL, jti TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                      PRIMARY KEY (issuer, jti)
+                    );
+                    CREATE TABLE IF NOT EXISTS amber_sql_audit (
+                      audit_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+                      union_id TEXT NOT NULL, command_id TEXT NOT NULL, revision TEXT NOT NULL,
+                      run_id TEXT NOT NULL, jti_ref TEXT NOT NULL, channel TEXT NOT NULL,
+                      call_index INTEGER NOT NULL, call_count INTEGER NOT NULL,
+                      datasource TEXT NOT NULL, sql_sha256 TEXT NOT NULL,
+                      key_id TEXT NOT NULL, nonce BLOB NOT NULL, encrypted_sql BLOB NOT NULL,
+                      status TEXT NOT NULL, error_code TEXT, row_count INTEGER
+                    );
+                    CREATE TABLE IF NOT EXISTS amber_rate_limit (
+                      subject TEXT NOT NULL, channel TEXT NOT NULL,
+                      window_start INTEGER NOT NULL, call_count INTEGER NOT NULL,
+                      PRIMARY KEY (subject, channel, window_start)
+                    );
+                    """
+                )
         os.chmod(database, 0o600)
 
     @staticmethod
@@ -231,12 +242,15 @@ class AmberStateStore:
             raise AmberAuthError("amber_audit_key_unavailable") from exc
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077:
             raise AmberAuthError("amber_audit_key_unsafe")
-        raw = path.read_bytes().strip()
-        if len(raw) != 32:
-            try:
-                raw = base64.urlsafe_b64decode(raw + b"=" * (-len(raw) % 4))
-            except Exception as exc:
-                raise AmberAuthError("amber_audit_key_invalid") from exc
+        try:
+            encoded = path.read_text(encoding="ascii").strip()
+            raw = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise AmberAuthError("amber_audit_key_invalid") from exc
         if len(raw) != 32:
             raise AmberAuthError("amber_audit_key_invalid")
         return raw, hashlib.sha256(raw).hexdigest()[:16]
@@ -264,19 +278,13 @@ class AmberStateStore:
         ).encode("utf-8")
         encrypted = AESGCM(self.audit_key).encrypt(nonce, sql.encode("utf-8"), aad)
         now = int(time.time())
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "DELETE FROM amber_replay WHERE expires_at < ?", (now,)
-                )
+                connection.execute("DELETE FROM amber_replay WHERE expires_at < ?", (now,))
                 connection.execute(
                     "INSERT INTO amber_replay (issuer, jti, expires_at) VALUES (?, ?, ?)",
-                    (
-                        claims.issuer,
-                        claims.jti,
-                        claims.expires_at + self.replay_grace_seconds,
-                    ),
+                    (claims.issuer, claims.jti, claims.expires_at + self.replay_grace_seconds),
                 )
                 connection.execute(
                     """
@@ -310,6 +318,43 @@ class AmberStateStore:
                 raise AmberReplayError("amber_token_replayed") from exc
         return audit_id
 
+    def consume_rate_limit(
+        self,
+        claims: AmberClaims,
+        *,
+        max_calls: int,
+        window_seconds: int = 60,
+        now: int | None = None,
+    ) -> None:
+        current = int(time.time()) if now is None else now
+        window_start = current - current % window_seconds
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM amber_rate_limit WHERE window_start < ?",
+                (window_start - window_seconds,),
+            )
+            row = connection.execute(
+                """
+                SELECT call_count FROM amber_rate_limit
+                WHERE subject = ? AND channel = ? AND window_start = ?
+                """,
+                (claims.subject, "schedule", window_start),
+            ).fetchone()
+            if row is not None and int(row[0]) >= max_calls:
+                connection.rollback()
+                raise AmberRateLimitError("amber_schedule_rate_limit")
+            connection.execute(
+                """
+                INSERT INTO amber_rate_limit (subject, channel, window_start, call_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(subject, channel, window_start)
+                DO UPDATE SET call_count = call_count + 1
+                """,
+                (claims.subject, "schedule", window_start),
+            )
+            connection.commit()
+
     def finish(
         self,
         audit_id: str,
@@ -318,12 +363,13 @@ class AmberStateStore:
         error_code: str | None = None,
         row_count: int | None = None,
     ) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE amber_sql_audit
-                SET status = ?, error_code = ?, row_count = ?
-                WHERE audit_id = ?
-                """,
-                (status, error_code, row_count, audit_id),
-            )
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE amber_sql_audit
+                    SET status = ?, error_code = ?, row_count = ?
+                    WHERE audit_id = ?
+                    """,
+                    (status, error_code, row_count, audit_id),
+                )

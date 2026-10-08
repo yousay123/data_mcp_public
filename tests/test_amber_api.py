@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import base64
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -35,7 +36,7 @@ def build_runtime(tmp_path):
     jwks = tmp_path / "amber.jwks.json"
     kid = write_jwks(jwks, private_key)
     audit_key = tmp_path / "audit.key"
-    audit_key.write_bytes(b"k" * 32)
+    audit_key.write_bytes(base64.urlsafe_b64encode(b"k" * 32).rstrip(b"="))
     audit_key.chmod(0o600)
     settings = Settings(
         DATA_MCP_AMBER_ENABLED=True,
@@ -162,3 +163,55 @@ def test_enum_status_is_persisted_as_wire_value(tmp_path) -> None:
     with sqlite3.connect(runtime.state.database) as connection:
         stored = connection.execute("SELECT status FROM amber_sql_audit").fetchone()
     assert stored == ("success",)
+
+
+def test_schedule_uses_schedule_identity_and_persistent_rate_limit(tmp_path) -> None:
+    runtime, service, private_key, kid = build_runtime(tmp_path)
+    runtime.settings.amber_schedule_max_calls_per_minute = 1
+    amber_app.dependency_overrides[get_amber_runtime] = lambda: runtime
+    client = TestClient(amber_app)
+    try:
+        first = client.post(
+            "/amber/query",
+            headers={
+                "Authorization": f"Amber {sign_token(private_key, kid, overrides={'channel': 'schedule'})}"
+            },
+            json={"sql": "SELECT 1"},
+        )
+        second = client.post(
+            "/amber/query",
+            headers={
+                "Authorization": f"Amber {sign_token(private_key, kid, overrides={'channel': 'schedule', 'jti': 'schedule-2'})}"
+            },
+            json={"sql": "SELECT 1"},
+        )
+    finally:
+        amber_app.dependency_overrides.clear()
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    context = service.calls[0][2]["audit_context"]
+    assert context["sender_type"] == "bot"
+    assert context["caller_source"] == "schedule_creator"
+    assert context["task_id"] == "amber:cmd_test"
+    assert len(service.calls) == 2
+
+
+def test_trial_channel_sets_restricted_query_limit(tmp_path) -> None:
+    runtime, service, private_key, kid = build_runtime(tmp_path)
+
+    runtime.execute(
+        f"Amber {sign_token(private_key, kid, overrides={'channel': 'bot.trial'})}",
+        AmberQueryRequest(sql="SELECT 1"),
+    )
+
+    context = service.calls[0][2]["audit_context"]
+    assert context["sender_type"] == "user"
+    assert context["query_max_rows"] == "20"
+
+
+def test_amber_app_does_not_publish_api_schema() -> None:
+    client = TestClient(amber_app)
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404

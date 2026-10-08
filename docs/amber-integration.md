@@ -46,6 +46,11 @@ Data MCP 不要求 token 按序消费，也不要求全部用完；每张 token 
 必须逐字一致，query plan 同时绑定 `sub`、`run` 对应的 session 和部署侧固定的
 `trust_domain`。
 
+渠道策略：`schedule` / `schedule.trial` 使用 `sender_type=bot` 和独立的
+`schedule_creator + task_id` 来源，不伪装成在场真人，并按用户每分钟限流；所有
+`.trial` 渠道把 SQL 输出上限收紧到 `DATA_MCP_AMBER_TRIAL_MAX_ROWS`。默认定时上限
+为每用户每分钟 10 次，试运行输出上限为 20 行。
+
 ## 持久化与审计
 
 `DATA_MCP_AMBER_STATE_DB` 同时保存防重放状态与 Amber SQL 审计。目录启动时收紧为
@@ -54,7 +59,8 @@ Data MCP 不要求 token 按序消费，也不要求全部用完；每张 token 
 
 实际执行的完整 SQL 使用 AES-256-GCM 加密后写入受限审计表。密钥由
 `DATA_MCP_AMBER_AUDIT_KEY_FILE` 指定，文件必须已经存在、是普通文件且权限不宽于
-0600；密钥必须是 32 个原始字节或其 URL-safe Base64。密钥不能提交到 Git，也不能
+0600；文件内容只接受 32 个随机字节的 URL-safe Base64 编码，不接受原始文本、
+hex 或二进制。密钥不能提交到 Git，也不能
 放进 Amber 脚本、模型上下文或普通日志。密钥轮换和审计解密访问须通过部署/安全
 流程另行留痕。
 
@@ -66,11 +72,15 @@ export DATA_MCP_AMBER_JWKS_FILE=/restricted/amber-jwks.json
 export DATA_MCP_AMBER_STATE_DB=/restricted/data-mcp/amber-state.db
 export DATA_MCP_AMBER_AUDIT_KEY_FILE=/restricted/data-mcp/amber-audit.key
 export DATA_MCP_AMBER_TRUST_DOMAIN=dev-beta:ksher-user
+export DATA_MCP_AMBER_REPLAY_GRACE_SECONDS=120
+export DATA_MCP_AMBER_TRIAL_MAX_ROWS=20
+export DATA_MCP_AMBER_SCHEDULE_MAX_CALLS_PER_MINUTE=10
 ksher-agent-data-amber-api
 ```
 
 进程在绑定端口前校验固定公钥、审计密钥和状态库；任何一项缺失或权限不安全都
-启动失败。不要把真实内部路径、密钥、数据库凭证或 token 写回仓库。
+启动失败。防重放保留时长必须至少比验签时钟偏差多 60 秒，避免过期边界上的
+跨秒竞态。不要把真实内部路径、密钥、数据库凭证或 token 写回仓库。
 
 ## 验收
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import base64
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -29,11 +30,15 @@ def build_verifier(tmp_path):
     return private_key, kid, verifier
 
 
-def build_store(tmp_path):
+def build_store(tmp_path, *, replay_grace_seconds: int = 120):
     key = tmp_path / "audit.key"
-    key.write_bytes(b"a" * 32)
+    key.write_bytes(base64.urlsafe_b64encode(b"a" * 32).rstrip(b"="))
     key.chmod(0o600)
-    return AmberStateStore(tmp_path / "state" / "amber.db", key)
+    return AmberStateStore(
+        tmp_path / "state" / "amber.db",
+        key,
+        replay_grace_seconds=replay_grace_seconds,
+    )
 
 
 def test_verifier_accepts_pinned_eddsa_token_and_required_claims(tmp_path) -> None:
@@ -158,3 +163,30 @@ def test_replay_record_outlives_token_clock_skew_window(tmp_path, monkeypatch) -
     )
     with pytest.raises(AmberReplayError, match="amber_token_replayed"):
         store.consume_and_record(claims, "SELECT 1", "tchouse-c")
+
+
+def test_replay_race_at_last_valid_second_is_rejected(tmp_path, monkeypatch) -> None:
+    private_key, kid, verifier = build_verifier(tmp_path)
+    issued_at = 2_000_000_000
+    token = sign_token(private_key, kid, now=issued_at)
+    claims = verifier.verify(token, now=issued_at)
+    store = build_store(tmp_path, replay_grace_seconds=90)
+    monkeypatch.setattr("ksher_agent_data_mcp.amber_auth.time.time", lambda: issued_at)
+    store.consume_and_record(claims, "SELECT 1", "tchouse-c")
+
+    verifier.verify(token, now=claims.expires_at + 30)
+    monkeypatch.setattr(
+        "ksher_agent_data_mcp.amber_auth.time.time",
+        lambda: claims.expires_at + 31,
+    )
+    with pytest.raises(AmberReplayError, match="amber_token_replayed"):
+        store.consume_and_record(claims, "SELECT 1", "tchouse-c")
+
+
+def test_audit_key_requires_base64url_not_raw_text(tmp_path) -> None:
+    key = tmp_path / "audit.key"
+    key.write_text("a" * 32, encoding="ascii")
+    key.chmod(0o600)
+
+    with pytest.raises(AmberAuthError, match="amber_audit_key_invalid"):
+        AmberStateStore(tmp_path / "state" / "amber.db", key)
