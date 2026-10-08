@@ -105,7 +105,7 @@ def test_query_plan_accepts_explicit_non_lark_trust_domain() -> None:
         SQL,
         DATASOURCE,
         session_id="amber:run_1",
-        trust_domain="dev-beta:ksher:amber",
+        trust_domain="test-host:service-user:amber",
     )
 
     ok, code = store.consume(
@@ -114,7 +114,7 @@ def test_query_plan_accepts_explicit_non_lark_trust_domain() -> None:
         union_id=UNION_ID,
         sql=SQL,
         datasource=DATASOURCE,
-        trust_domain="dev-beta:ksher:amber",
+        trust_domain="test-host:service-user:amber",
     )
 
     assert (ok, code) == (True, "ok")
@@ -127,7 +127,7 @@ def test_query_plan_rejects_changed_non_lark_trust_domain() -> None:
         SQL,
         DATASOURCE,
         session_id="amber:run_1",
-        trust_domain="dev-beta:ksher:amber",
+        trust_domain="test-host:service-user:amber",
     )
 
     ok, code = store.consume(

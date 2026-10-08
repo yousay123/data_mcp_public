@@ -45,7 +45,7 @@ def build_runtime(tmp_path):
         DATA_MCP_AMBER_JWKS_FILE=jwks,
         DATA_MCP_AMBER_STATE_DB=tmp_path / "state" / "amber.db",
         DATA_MCP_AMBER_AUDIT_KEY_FILE=audit_key,
-        DATA_MCP_AMBER_TRUST_DOMAIN="dev-beta:ksher:amber",
+        DATA_MCP_AMBER_TRUST_DOMAIN="test-host:service-user:amber",
     )
     service = FakeService()
     runtime = AmberRuntime(settings, service=service)  # type: ignore[arg-type]
@@ -73,7 +73,7 @@ def test_amber_query_uses_only_signed_identity_and_exact_sql(tmp_path) -> None:
     assert validate[1][1] is None
     assert validate[1][2] == sql
     assert run[1][2] == sql
-    assert validate[2]["audit_context"]["trust_domain"] == "dev-beta:ksher:amber"
+    assert validate[2]["audit_context"]["trust_domain"] == "test-host:service-user:amber"
     assert validate[2]["audit_context"]["amber_call"] == "1/1"
     assert sql.encode() not in runtime.state.database.read_bytes()
 
