@@ -448,14 +448,14 @@ class DataMcpService:
             return self._redact_validation_schema_detail(response, audit_context)
         if result.status == Status.SUCCESS and result.normalized_sql is not None:
             assert plan_scope is not None
-            session_id, lark_app_id, task_id = plan_scope
+            session_id, trust_domain, task_id = plan_scope
             response["query_plan_id"] = self.query_plans.issue(
                 user.union_id,
                 sql,
                 datasource,
                 active_chain_id,
                 session_id=session_id,
-                lark_app_id=lark_app_id,
+                trust_domain=trust_domain,
                 task_id=task_id,
                 execution_mode=execution_mode,
             )
@@ -511,14 +511,14 @@ class DataMcpService:
                 user, query_plan_id, datasource, scope_or_error, audit_context
             )
             return scope_or_error
-        session_id, lark_app_id, task_id = scope_or_error
+        session_id, trust_domain, task_id = scope_or_error
         plan_error, plan_run = self._consume_query_plan(
             query_plan_id,
             session_id,
             user.union_id,
             sql,
             datasource,
-            lark_app_id,
+            trust_domain,
             task_id,
         )
         if plan_error is not None:
@@ -591,14 +591,14 @@ class DataMcpService:
                 user, query_plan_id, datasource, scope_or_error, audit_context
             )
             return scope_or_error
-        session_id, lark_app_id, task_id = scope_or_error
+        session_id, trust_domain, task_id = scope_or_error
         plan_error, plan_run = self._consume_query_plan(
             query_plan_id,
             session_id,
             user.union_id,
             sql,
             datasource,
-            lark_app_id,
+            trust_domain,
             task_id,
         )
         if plan_error is not None:
@@ -844,7 +844,7 @@ class DataMcpService:
         union_id: str,
         sql: str,
         datasource: str,
-        lark_app_id: str,
+        trust_domain: str,
         task_id: str | None,
     ) -> tuple[dict[str, Any] | None, QueryPlanRun | None]:
         if not isinstance(query_plan_id, str) or not query_plan_id.strip():
@@ -860,7 +860,7 @@ class DataMcpService:
             union_id=union_id,
             sql=sql,
             datasource=datasource,
-            lark_app_id=lark_app_id,
+            trust_domain=trust_domain,
             task_id=task_id,
         )
         if ok:
@@ -879,15 +879,18 @@ class DataMcpService:
                 "query_plan_session_required",
                 "查询计划必须绑定 BotMux session_id",
             )
-        if not user.lark_app_id:
+        trust_domain = detail.get("trust_domain")
+        if not trust_domain and user.lark_app_id:
+            trust_domain = f"lark:{user.lark_app_id}"
+        if not trust_domain:
             return self._query_plan_error(
                 "query_plan_app_required",
-                "查询计划必须绑定签发当前身份的飞书 app_id",
+                "查询计划必须绑定宿主注入的飞书应用身份",
             )
         task_id = (
             detail["task_id"] if detail["caller_source"] == "schedule_creator" else None
         )
-        return session_id, user.lark_app_id, task_id
+        return session_id, trust_domain, task_id
 
     def _validate_public_query_datasource(self, datasource: str) -> dict[str, Any] | None:
         if datasource == "tchouse-c":
@@ -1450,6 +1453,13 @@ class DataMcpService:
             "turn_id": _clean_string(context.get("turn_id")),
             "captured_at": _clean_string(context.get("captured_at")),
             "caller_source": _clean_string(context.get("caller_source")),
+            "trust_domain": _clean_string(context.get("trust_domain")),
+            "amber_cmd": _clean_string(context.get("amber_cmd")),
+            "amber_rev": _clean_string(context.get("amber_rev")),
+            "amber_run": _clean_string(context.get("amber_run")),
+            "amber_channel": _clean_string(context.get("amber_channel")),
+            "amber_jti_ref": _clean_string(context.get("amber_jti_ref")),
+            "amber_call": _clean_string(context.get("amber_call")),
         }
 
 

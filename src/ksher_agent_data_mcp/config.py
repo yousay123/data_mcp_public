@@ -95,6 +95,27 @@ class Settings(BaseSettings):
         ge=1,
         le=100,
     )
+    amber_enabled: bool = Field(default=False, alias="DATA_MCP_AMBER_ENABLED")
+    amber_bind_port: int = Field(default=8766, alias="DATA_MCP_AMBER_PORT", ge=1, le=65535)
+    amber_jwks_file: Path | None = Field(default=None, alias="DATA_MCP_AMBER_JWKS_FILE")
+    amber_state_db: Path | None = Field(default=None, alias="DATA_MCP_AMBER_STATE_DB")
+    amber_audit_key_file: Path | None = Field(
+        default=None, alias="DATA_MCP_AMBER_AUDIT_KEY_FILE"
+    )
+    amber_issuer: str = Field(default="amber", alias="DATA_MCP_AMBER_ISSUER")
+    amber_audience: str = Field(default="data-mcp", alias="DATA_MCP_AMBER_AUDIENCE")
+    amber_trust_domain: str | None = Field(
+        default=None, alias="DATA_MCP_AMBER_TRUST_DOMAIN"
+    )
+    amber_clock_skew_seconds: int = Field(
+        default=30, alias="DATA_MCP_AMBER_CLOCK_SKEW_SECONDS", ge=0, le=120
+    )
+    amber_max_token_lifetime_seconds: int = Field(
+        default=300,
+        alias="DATA_MCP_AMBER_MAX_TOKEN_LIFETIME_SECONDS",
+        ge=1,
+        le=600,
+    )
     tchouse_d_credential_sql: str | None = Field(
         default=None,
         alias="TCHOUSE_D_CREDENTIAL_SQL",

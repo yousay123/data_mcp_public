@@ -26,7 +26,7 @@ class QueryPlan:
     union_id: str
     sql: str
     datasource: str
-    lark_app_id: str
+    trust_domain: str
     task_id: str | None
     issued_at: float
     ttl_seconds: int
@@ -69,14 +69,14 @@ class QueryPlanStore:
         repair_chain_id: str | None = None,
         *,
         session_id: str,
-        lark_app_id: str,
+        trust_domain: str | None = None,
+        lark_app_id: str | None = None,
         task_id: str | None = None,
         execution_mode: str = EXECUTION_MODE_SINGLE,
     ) -> str:
         if not session_id.strip():
             raise ValueError("query plan session_id must not be empty")
-        if not lark_app_id.strip():
-            raise ValueError("query plan lark_app_id must not be empty")
+        domain = _resolve_trust_domain(trust_domain, lark_app_id)
         if execution_mode not in EXECUTION_MODE_MAX_RUNS:
             raise ValueError(f"unsupported query plan execution mode: {execution_mode}")
         ttl_seconds = (
@@ -92,7 +92,7 @@ class QueryPlanStore:
                 union_id=union_id,
                 sql=sql,
                 datasource=datasource,
-                lark_app_id=lark_app_id,
+                trust_domain=domain,
                 task_id=task_id,
                 issued_at=time.time(),
                 ttl_seconds=ttl_seconds,
@@ -110,7 +110,8 @@ class QueryPlanStore:
         union_id: str,
         sql: str,
         datasource: str,
-        lark_app_id: str,
+        trust_domain: str | None = None,
+        lark_app_id: str | None = None,
         task_id: str | None = None,
     ) -> tuple[bool, str]:
         ok, code, _ = self.consume_for_run(
@@ -119,6 +120,7 @@ class QueryPlanStore:
             union_id=union_id,
             sql=sql,
             datasource=datasource,
+            trust_domain=trust_domain,
             lark_app_id=lark_app_id,
             task_id=task_id,
         )
@@ -132,9 +134,11 @@ class QueryPlanStore:
         union_id: str,
         sql: str,
         datasource: str,
-        lark_app_id: str,
+        trust_domain: str | None = None,
+        lark_app_id: str | None = None,
         task_id: str | None = None,
     ) -> tuple[bool, str, QueryPlanRun | None]:
+        domain = _resolve_trust_domain(trust_domain, lark_app_id)
         with self._lock:
             now = time.time()
             self._purge_expired(now)
@@ -156,8 +160,13 @@ class QueryPlanStore:
                 return False, "query_plan_sql_mismatch", None
             if plan.datasource != datasource:
                 return False, "query_plan_datasource_mismatch", None
-            if plan.lark_app_id != lark_app_id:
-                return False, "query_plan_app_mismatch", None
+            if plan.trust_domain != domain:
+                code = (
+                    "query_plan_app_mismatch"
+                    if plan.trust_domain.startswith("lark:") and domain.startswith("lark:")
+                    else "query_plan_trust_domain_mismatch"
+                )
+                return False, code, None
             if plan.task_id != task_id:
                 return False, "query_plan_task_mismatch", None
             plan.runs_used += 1
@@ -180,7 +189,8 @@ class QueryPlanStore:
         union_id: str,
         sql: str,
         datasource: str,
-        lark_app_id: str,
+        trust_domain: str | None = None,
+        lark_app_id: str | None = None,
         task_id: str | None = None,
     ) -> tuple[bool, str, str | None]:
         ok, code, run = self.consume_for_run(
@@ -189,6 +199,7 @@ class QueryPlanStore:
             union_id=union_id,
             sql=sql,
             datasource=datasource,
+            trust_domain=trust_domain,
             lark_app_id=lark_app_id,
             task_id=task_id,
         )
@@ -198,6 +209,21 @@ class QueryPlanStore:
         for plan_id, plan in list(self._plans.items()):
             if plan.issued_at < now - plan.ttl_seconds:
                 del self._plans[plan_id]
+
+
+def _resolve_trust_domain(trust_domain: str | None, lark_app_id: str | None) -> str:
+    """Bind a plan to its host-authenticated identity issuer.
+
+    ``lark_app_id`` remains as a compatibility input for the BotMux path.  New
+    trusted callers must provide an explicit, host-owned ``trust_domain`` and
+    must never invent a Lark application id.
+    """
+
+    if isinstance(trust_domain, str) and trust_domain.strip():
+        return trust_domain.strip()
+    if isinstance(lark_app_id, str) and lark_app_id.strip():
+        return f"lark:{lark_app_id.strip()}"
+    raise ValueError("query plan trust_domain must not be empty")
 
 
 @dataclass

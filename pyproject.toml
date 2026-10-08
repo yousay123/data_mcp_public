@@ -33,6 +33,7 @@ jdbc = [
 ksher-agent-data-mcp = "ksher_agent_data_mcp.server:main"
 ksher-agent-data-mcp-kai = "ksher_agent_data_mcp.kai_bootstrap:main"
 ksher-agent-data-api = "ksher_agent_data_mcp.api:main"
+ksher-agent-data-amber-api = "ksher_agent_data_mcp.amber_api:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ksher_agent_data_mcp"]
