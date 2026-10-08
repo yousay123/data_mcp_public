@@ -144,7 +144,7 @@ class AmberRuntime:
         if claims.channel.removesuffix(".trial") == "schedule":
             self.state.consume_rate_limit(
                 claims,
-                max_calls=self.settings.amber_schedule_max_calls_per_minute,
+                max_runs=self.settings.amber_schedule_max_runs_per_minute,
             )
 
 

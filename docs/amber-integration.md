@@ -47,9 +47,14 @@ Data MCP 不要求 token 按序消费，也不要求全部用完；每张 token 
 `trust_domain`。
 
 渠道策略：`schedule` / `schedule.trial` 使用 `sender_type=bot` 和独立的
-`schedule_creator + task_id` 来源，不伪装成在场真人，并按用户每分钟限流；所有
+`schedule_creator + task_id` 来源，不伪装成在场真人，并按用户每分钟的新 run 数限流；同一
+run 的多张调用凭证只计一次。所有
 `.trial` 渠道把 SQL 输出上限收紧到 `DATA_MCP_AMBER_TRIAL_MAX_ROWS`。默认定时上限
 为每用户每分钟 10 次，试运行输出上限为 20 行。
+
+审计检索不要只按 `caller_source=amber`：定时执行的 caller_source 必须是
+`schedule_creator`。统一检索 Amber 调用应使用 `trust_domain` 加非空
+`amber_channel`，再按 `amber_channel` 区分交互、试运行和定时。
 
 ## 持久化与审计
 
@@ -74,7 +79,7 @@ export DATA_MCP_AMBER_AUDIT_KEY_FILE=/restricted/data-mcp/amber-audit.key
 export DATA_MCP_AMBER_TRUST_DOMAIN=dev-beta:ksher-user
 export DATA_MCP_AMBER_REPLAY_GRACE_SECONDS=120
 export DATA_MCP_AMBER_TRIAL_MAX_ROWS=20
-export DATA_MCP_AMBER_SCHEDULE_MAX_CALLS_PER_MINUTE=10
+export DATA_MCP_AMBER_SCHEDULE_MAX_RUNS_PER_MINUTE=10
 ksher-agent-data-amber-api
 ```
 

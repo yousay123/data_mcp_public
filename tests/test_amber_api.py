@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import base64
+from pathlib import Path
 from typing import Any
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
@@ -167,7 +169,7 @@ def test_enum_status_is_persisted_as_wire_value(tmp_path) -> None:
 
 def test_schedule_uses_schedule_identity_and_persistent_rate_limit(tmp_path) -> None:
     runtime, service, private_key, kid = build_runtime(tmp_path)
-    runtime.settings.amber_schedule_max_calls_per_minute = 1
+    runtime.settings.amber_schedule_max_runs_per_minute = 1
     amber_app.dependency_overrides[get_amber_runtime] = lambda: runtime
     client = TestClient(amber_app)
     try:
@@ -181,7 +183,7 @@ def test_schedule_uses_schedule_identity_and_persistent_rate_limit(tmp_path) -> 
         second = client.post(
             "/amber/query",
             headers={
-                "Authorization": f"Amber {sign_token(private_key, kid, overrides={'channel': 'schedule', 'jti': 'schedule-2'})}"
+                "Authorization": f"Amber {sign_token(private_key, kid, overrides={'channel': 'schedule', 'jti': 'schedule-2', 'run': 'run_other'})}"
             },
             json={"sql": "SELECT 1"},
         )
@@ -197,6 +199,20 @@ def test_schedule_uses_schedule_identity_and_persistent_rate_limit(tmp_path) -> 
     assert len(service.calls) == 2
 
 
+def test_schedule_calls_from_one_run_count_once(tmp_path) -> None:
+    runtime, service, private_key, kid = build_runtime(tmp_path)
+    runtime.settings.amber_schedule_max_runs_per_minute = 1
+
+    for call_index in range(1, 16):
+        result = runtime.execute(
+            f"Amber {sign_token(private_key, kid, overrides={'channel': 'schedule', 'jti': f'schedule-{call_index}', 'call_index': call_index, 'call_count': 15})}",
+            AmberQueryRequest(sql="SELECT 1"),
+        )
+        assert result["status"] == "success"
+
+    assert len(service.calls) == 30
+
+
 def test_trial_channel_sets_restricted_query_limit(tmp_path) -> None:
     runtime, service, private_key, kid = build_runtime(tmp_path)
 
@@ -208,6 +224,57 @@ def test_trial_channel_sets_restricted_query_limit(tmp_path) -> None:
     context = service.calls[0][2]["audit_context"]
     assert context["sender_type"] == "user"
     assert context["query_max_rows"] == "20"
+
+
+def test_trial_limit_is_applied_again_by_run_guard(tmp_path, monkeypatch) -> None:
+    configured, _, private_key, kid = build_runtime(tmp_path)
+    settings = configured.settings.model_copy(
+        update={
+            "credential_memory_file": Path("examples/credentials.example.json"),
+            "require_partition_filter": False,
+        }
+    )
+    runtime = AmberRuntime(settings)
+    guard_calls: list[int | None] = []
+    guard_type = type(runtime.service.container.sql_guard)
+    original_validate = guard_type.validate
+
+    def validate_without_network_probe(
+        self, user, sql, datasource="tchouse-c", credential=None, max_rows=None
+    ):
+        guard_calls.append(max_rows)
+        return original_validate(
+            self,
+            user,
+            sql,
+            datasource,
+            credential=None,
+            max_rows=max_rows,
+        )
+
+    monkeypatch.setattr(guard_type, "validate", validate_without_network_probe)
+
+    result = runtime.execute(
+        f"Amber {sign_token(private_key, kid, overrides={'sub': 'on_example_user', 'channel': 'bot.trial'})}",
+        AmberQueryRequest(sql="SELECT 1 LIMIT 500"),
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["sql"].endswith("LIMIT 20")
+    assert guard_calls == [20, 20]
+
+
+def test_runtime_rejects_replay_grace_shorter_than_skew_margin(tmp_path) -> None:
+    configured, service, _, _ = build_runtime(tmp_path)
+    unsafe = configured.settings.model_copy(
+        update={
+            "amber_clock_skew_seconds": 120,
+            "amber_replay_grace_seconds": 60,
+        }
+    )
+
+    with pytest.raises(ValueError, match="amber_replay_grace_too_short"):
+        AmberRuntime(unsafe, service=service)  # type: ignore[arg-type]
 
 
 def test_amber_app_does_not_publish_api_schema() -> None:

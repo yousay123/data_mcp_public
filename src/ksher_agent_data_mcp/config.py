@@ -128,9 +128,9 @@ class Settings(BaseSettings):
         ge=1,
         le=1000,
     )
-    amber_schedule_max_calls_per_minute: int = Field(
+    amber_schedule_max_runs_per_minute: int = Field(
         default=10,
-        alias="DATA_MCP_AMBER_SCHEDULE_MAX_CALLS_PER_MINUTE",
+        alias="DATA_MCP_AMBER_SCHEDULE_MAX_RUNS_PER_MINUTE",
         ge=1,
         le=1000,
     )

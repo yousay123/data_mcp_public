@@ -225,10 +225,10 @@ class AmberStateStore:
                       key_id TEXT NOT NULL, nonce BLOB NOT NULL, encrypted_sql BLOB NOT NULL,
                       status TEXT NOT NULL, error_code TEXT, row_count INTEGER
                     );
-                    CREATE TABLE IF NOT EXISTS amber_rate_limit (
-                      subject TEXT NOT NULL, channel TEXT NOT NULL,
-                      window_start INTEGER NOT NULL, call_count INTEGER NOT NULL,
-                      PRIMARY KEY (subject, channel, window_start)
+                    CREATE TABLE IF NOT EXISTS amber_schedule_runs (
+                      subject TEXT NOT NULL, run_id TEXT NOT NULL,
+                      window_start INTEGER NOT NULL,
+                      PRIMARY KEY (subject, run_id)
                     );
                     """
                 )
@@ -322,7 +322,7 @@ class AmberStateStore:
         self,
         claims: AmberClaims,
         *,
-        max_calls: int,
+        max_runs: int,
         window_seconds: int = 60,
         now: int | None = None,
     ) -> None:
@@ -331,27 +331,35 @@ class AmberStateStore:
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "DELETE FROM amber_rate_limit WHERE window_start < ?",
-                (window_start - window_seconds,),
+                "DELETE FROM amber_schedule_runs WHERE window_start < ?",
+                (window_start - 24 * 60 * 60,),
             )
             row = connection.execute(
                 """
-                SELECT call_count FROM amber_rate_limit
-                WHERE subject = ? AND channel = ? AND window_start = ?
+                SELECT 1 FROM amber_schedule_runs
+                WHERE subject = ? AND run_id = ?
                 """,
-                (claims.subject, "schedule", window_start),
+                (claims.subject, claims.run),
             ).fetchone()
-            if row is not None and int(row[0]) >= max_calls:
+            if row is not None:
+                connection.commit()
+                return
+            count = connection.execute(
+                """
+                SELECT COUNT(*) FROM amber_schedule_runs
+                WHERE subject = ? AND window_start = ?
+                """,
+                (claims.subject, window_start),
+            ).fetchone()
+            if count is not None and int(count[0]) >= max_runs:
                 connection.rollback()
                 raise AmberRateLimitError("amber_schedule_rate_limit")
             connection.execute(
                 """
-                INSERT INTO amber_rate_limit (subject, channel, window_start, call_count)
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(subject, channel, window_start)
-                DO UPDATE SET call_count = call_count + 1
+                INSERT INTO amber_schedule_runs (subject, run_id, window_start)
+                VALUES (?, ?, ?)
                 """,
-                (claims.subject, "schedule", window_start),
+                (claims.subject, claims.run, window_start),
             )
             connection.commit()
 
