@@ -122,8 +122,10 @@ class SqlGuard:
         sql: str,
         datasource: str = "tchouse-c",
         credential: CredentialRef | None = None,
+        max_rows: int | None = None,
     ) -> SqlValidationResult:
         issues: list[ValidationIssue] = []
+        effective_max_rows = min(max_rows or self.settings.max_rows, self.settings.max_rows)
         datasource = datasource.lower()
         if datasource != SUPPORTED_DATASOURCE:
             issues.append(
@@ -269,7 +271,9 @@ class SqlGuard:
         if self.settings.require_partition_filter:
             issues.extend(self._partition_issues(expression, datasource, tables, table_metas))
 
-        normalized_sql, limit_was_injected, limit_was_capped = self._bounded_sql(expression)
+        normalized_sql, limit_was_injected, limit_was_capped = self._bounded_sql(
+            expression, effective_max_rows
+        )
         if limit_was_injected:
             issues.append(
                 ValidationIssue(
@@ -277,7 +281,7 @@ class SqlGuard:
                     severity="warning",
                     message=(
                         "SQL 未显式限制返回行数，服务将追加 LIMIT "
-                        f"{min(self.settings.default_limit, self.settings.max_rows)}"
+                        f"{min(self.settings.default_limit, effective_max_rows)}"
                     ),
                 )
             )
@@ -286,7 +290,7 @@ class SqlGuard:
                 ValidationIssue(
                     code="limit_capped",
                     severity="warning",
-                    message=f"SQL 返回行数上限已收敛为 LIMIT {self.settings.max_rows}",
+                    message=f"SQL 返回行数上限已收敛为 LIMIT {effective_max_rows}",
                 )
             )
 
@@ -429,11 +433,13 @@ class SqlGuard:
             issues=issues,
         )
 
-    def _bounded_sql(self, expression: exp.Expression) -> tuple[str, bool, bool]:
+    def _bounded_sql(
+        self, expression: exp.Expression, max_rows: int
+    ) -> tuple[str, bool, bool]:
         bounded = expression.copy()
         root_limit = bounded.args.get("limit")
         if root_limit is None:
-            output_limit = min(self.settings.default_limit, self.settings.max_rows)
+            output_limit = min(self.settings.default_limit, max_rows)
             bounded.set("limit", exp.Limit(expression=exp.Literal.number(output_limit)))
             return self._normalize_sql(bounded), True, False
 
@@ -444,10 +450,10 @@ class SqlGuard:
                 limit_value = int(limit_expression.this)
             except (TypeError, ValueError):
                 limit_value = None
-        if limit_value is not None and 0 <= limit_value <= self.settings.max_rows:
+        if limit_value is not None and 0 <= limit_value <= max_rows:
             return self._normalize_sql(bounded), False, False
 
-        root_limit.set("expression", exp.Literal.number(self.settings.max_rows))
+        root_limit.set("expression", exp.Literal.number(max_rows))
         return self._normalize_sql(bounded), False, True
 
     @staticmethod

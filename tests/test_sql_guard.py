@@ -461,6 +461,23 @@ def test_user_limit_is_capped_to_service_max_rows() -> None:
     assert any(issue.code == "limit_capped" for issue in result.issues)
 
 
+def test_caller_specific_limit_is_stricter_than_service_max_rows() -> None:
+    guard = SqlGuard(
+        settings=Settings(REQUIRE_PARTITION_FILTER=False, DEFAULT_LIMIT=100, MAX_ROWS=1000),
+        catalog=MemoryMetadataCatalog(),
+    )
+
+    result = guard.validate(
+        _user(),
+        "SELECT dt FROM dwd.dwd_payment_order_di LIMIT 500",
+        max_rows=20,
+    )
+
+    assert result.status == Status.SUCCESS
+    assert result.normalized_sql is not None
+    assert result.normalized_sql.endswith("LIMIT 20")
+
+
 def test_dynamic_catalog_access_denied_returns_permission_denied() -> None:
     guard = SqlGuard(
         settings=Settings(REQUIRE_PARTITION_FILTER=False),

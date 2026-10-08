@@ -98,6 +98,51 @@ def test_query_plan_accepts_unchanged_context() -> None:
     assert result["status"] == Status.SUCCESS
 
 
+def test_query_plan_accepts_explicit_non_lark_trust_domain() -> None:
+    store = QueryPlanStore()
+    plan_id = store.issue(
+        UNION_ID,
+        SQL,
+        DATASOURCE,
+        session_id="amber:run_1",
+        trust_domain="test-host:service-user:amber",
+    )
+
+    ok, code = store.consume(
+        plan_id,
+        session_id="amber:run_1",
+        union_id=UNION_ID,
+        sql=SQL,
+        datasource=DATASOURCE,
+        trust_domain="test-host:service-user:amber",
+    )
+
+    assert (ok, code) == (True, "ok")
+
+
+def test_query_plan_rejects_changed_non_lark_trust_domain() -> None:
+    store = QueryPlanStore()
+    plan_id = store.issue(
+        UNION_ID,
+        SQL,
+        DATASOURCE,
+        session_id="amber:run_1",
+        trust_domain="test-host:service-user:amber",
+    )
+
+    ok, code = store.consume(
+        plan_id,
+        session_id="amber:run_1",
+        union_id=UNION_ID,
+        sql=SQL,
+        datasource=DATASOURCE,
+        trust_domain="other-host:amber",
+    )
+
+    assert ok is False
+    assert code == "query_plan_trust_domain_mismatch"
+
+
 def test_validate_issues_compare_plan_with_fixed_server_limits() -> None:
     service = build_service()
 

@@ -44,6 +44,13 @@ ksher-agent-data-mcp
 
 完整配置项参见 [.env.example](.env.example)。生产账号应遵循最小权限原则，并由人工或密钥管理系统配置。
 
+## Amber 受信调用入口
+
+Amber 可通过独立的 loopback HTTP 进程调用只读 `/amber/query`，不复用内部
+`/agent/*` 接口或内部 token。入口默认关闭；固定公钥、一次性凭证、防重放、
+渠道限流和加密 SQL 审计的完整配置见
+[`docs/amber-integration.md`](docs/amber-integration.md)。
+
 ## 部署与更新
 
 其他使用者可以从本仓库拉取固定 tag 或 commit，在各自环境构建并部署：
