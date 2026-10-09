@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         default=10 * 1024 * 1024 * 1024, alias="QUERY_MAX_BYTES_TO_READ", ge=1
     )
     query_max_memory_bytes: int = Field(
-        default=512 * 1024 * 1024, alias="QUERY_MAX_MEMORY_BYTES", ge=1
+        default=2 * 1024 * 1024 * 1024, alias="QUERY_MAX_MEMORY_BYTES", ge=1
     )
     query_max_concurrency: int = Field(default=4, alias="QUERY_MAX_CONCURRENCY", ge=1)
     query_repair_max_failures: int = Field(

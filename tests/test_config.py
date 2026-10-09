@@ -49,6 +49,10 @@ def test_query_read_limit_defaults_to_ten_gibibytes() -> None:
     assert Settings().query_max_bytes_to_read == 10 * 1024 * 1024 * 1024
 
 
+def test_query_memory_limit_defaults_to_two_gibibytes() -> None:
+    assert Settings().query_max_memory_bytes == 2 * 1024 * 1024 * 1024
+
+
 def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
     assert Settings().query_plan_compare_ttl_seconds == 900
     shortened = Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=600)
