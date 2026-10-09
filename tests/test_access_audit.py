@@ -807,6 +807,9 @@ def test_access_audit_uses_dedicated_result_limit_and_throw_mode() -> None:
     assert seen_query_settings
     assert {item["max_result_rows"] for item in seen_query_settings} == {"1234"}
     assert {item["result_overflow_mode"] for item in seen_query_settings} == {"throw"}
+    assert all("max_rows_to_read" not in item for item in seen_query_settings)
+    assert all("max_bytes_to_read" not in item for item in seen_query_settings)
+    assert all("max_memory_usage" not in item for item in seen_query_settings)
 
 
 class _StubAuditor:

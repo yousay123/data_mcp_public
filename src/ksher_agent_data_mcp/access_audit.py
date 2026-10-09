@@ -430,9 +430,6 @@ class AccessInspectionAuditor:
             self.settings.query_timeout_seconds,
             {
                 "max_execution_time": str(self.settings.query_timeout_seconds),
-                "max_rows_to_read": str(self.settings.query_max_rows_to_read),
-                "max_bytes_to_read": str(self.settings.query_max_bytes_to_read),
-                "max_memory_usage": str(self.settings.query_max_memory_bytes),
                 "max_result_rows": str(self.settings.access_audit_max_rows),
                 "result_overflow_mode": "throw",
             },

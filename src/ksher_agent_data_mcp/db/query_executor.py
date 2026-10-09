@@ -135,9 +135,6 @@ class TChouseCQueryExecutor(QueryExecutor):
                     "max_execution_time": str(
                         min(timeout_seconds, self.settings.query_timeout_seconds)
                     ),
-                    "max_rows_to_read": str(self.settings.query_max_rows_to_read),
-                    "max_bytes_to_read": str(self.settings.query_max_bytes_to_read),
-                    "max_memory_usage": str(self.settings.query_max_memory_bytes),
                     "max_result_rows": str(effective_max_rows),
                     "result_overflow_mode": "throw",
                 },
@@ -288,9 +285,6 @@ def execute_clickhouse_json(
     for key, value in (query_settings or {}).items():
         if key in {
             "max_execution_time",
-            "max_rows_to_read",
-            "max_bytes_to_read",
-            "max_memory_usage",
             "max_result_rows",
             "result_overflow_mode",
         }:

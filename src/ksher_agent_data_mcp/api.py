@@ -157,9 +157,7 @@ def health() -> dict[str, Any]:
         },
         "query_resource_limits": {
             "timeout_seconds": settings.query_timeout_seconds,
-            "max_rows_to_read": settings.query_max_rows_to_read,
-            "max_bytes_to_read": settings.query_max_bytes_to_read,
-            "max_memory_bytes": settings.query_max_memory_bytes,
+            "clickhouse_read_and_memory_limits": "cluster_profile",
             "max_concurrency": settings.query_max_concurrency,
             "repair_max_failures": settings.query_repair_max_failures,
             "query_plan_single_ttl_seconds": service.query_plans.ttl_seconds,

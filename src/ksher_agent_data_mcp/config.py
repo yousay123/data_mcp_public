@@ -15,13 +15,6 @@ class Settings(BaseSettings):
     max_rows: int = Field(default=1000, alias="MAX_ROWS", ge=1)
     default_limit: int = Field(default=200, alias="DEFAULT_LIMIT", ge=1)
     query_timeout_seconds: int = Field(default=60, alias="QUERY_TIMEOUT_SECONDS", ge=1)
-    query_max_rows_to_read: int = Field(default=50_000_000, alias="QUERY_MAX_ROWS_TO_READ", ge=1)
-    query_max_bytes_to_read: int = Field(
-        default=10 * 1024 * 1024 * 1024, alias="QUERY_MAX_BYTES_TO_READ", ge=1
-    )
-    query_max_memory_bytes: int = Field(
-        default=2 * 1024 * 1024 * 1024, alias="QUERY_MAX_MEMORY_BYTES", ge=1
-    )
     query_max_concurrency: int = Field(default=4, alias="QUERY_MAX_CONCURRENCY", ge=1)
     query_repair_max_failures: int = Field(
         default=3, alias="QUERY_REPAIR_MAX_FAILURES", ge=1, le=10

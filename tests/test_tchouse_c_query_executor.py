@@ -1,5 +1,6 @@
 from io import BytesIO
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -35,6 +36,48 @@ def test_parse_clickhouse_jdbc_url() -> None:
     assert target.password == "demo_password"
 
 
+def test_clickhouse_transport_ignores_service_side_read_and_memory_limits(
+    monkeypatch,
+) -> None:
+    seen_params: dict[str, list[str]] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"data": [], "rows": 0}'
+
+    def fake_urlopen(request, timeout):
+        seen_params.update(parse_qs(urlparse(request.full_url).query))
+        return FakeResponse()
+
+    monkeypatch.setattr(query_executor, "urlopen", fake_urlopen)
+    target = parse_clickhouse_jdbc_url(_credential().jdbc_url)
+
+    query_executor.execute_clickhouse_json(
+        target=target,
+        sql="SELECT 1",
+        query_id="q_test",
+        timeout_seconds=30,
+        query_settings={
+            "max_rows_to_read": "1",
+            "max_bytes_to_read": "1",
+            "max_memory_usage": "1",
+            "max_result_rows": "1000",
+        },
+    )
+
+    assert seen_params["readonly"] == ["2"]
+    assert seen_params["max_result_rows"] == ["1000"]
+    assert "max_rows_to_read" not in seen_params
+    assert "max_bytes_to_read" not in seen_params
+    assert "max_memory_usage" not in seen_params
+
+
 def test_tchouse_c_executor_converts_json_response(monkeypatch) -> None:
     seen_settings = {}
 
@@ -64,9 +107,9 @@ def test_tchouse_c_executor_converts_json_response(monkeypatch) -> None:
     assert result.read_bytes == 345
     assert not result.truncated
     assert seen_settings["max_execution_time"] == "30"
-    assert seen_settings["max_rows_to_read"] == "50000000"
-    assert seen_settings["max_bytes_to_read"] == str(10 * 1024 * 1024 * 1024)
-    assert seen_settings["max_memory_usage"] == str(2 * 1024 * 1024 * 1024)
+    assert "max_rows_to_read" not in seen_settings
+    assert "max_bytes_to_read" not in seen_settings
+    assert "max_memory_usage" not in seen_settings
     assert seen_settings["max_result_rows"] == "1000"
     assert seen_settings["result_overflow_mode"] == "throw"
 

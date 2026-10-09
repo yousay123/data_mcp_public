@@ -45,12 +45,12 @@ def test_snapshot_configuration_keeps_online_metadata_provider_separate() -> Non
     assert "DATA_MCP_SEARCH_METADATA_SNAPSHOT_ENDPOINT" not in aliases
 
 
-def test_query_read_limit_defaults_to_ten_gibibytes() -> None:
-    assert Settings().query_max_bytes_to_read == 10 * 1024 * 1024 * 1024
+def test_query_read_and_memory_limits_are_not_service_configuration() -> None:
+    aliases = {field.alias for field in Settings.model_fields.values()}
 
-
-def test_query_memory_limit_defaults_to_two_gibibytes() -> None:
-    assert Settings().query_max_memory_bytes == 2 * 1024 * 1024 * 1024
+    assert "QUERY_MAX_ROWS_TO_READ" not in aliases
+    assert "QUERY_MAX_BYTES_TO_READ" not in aliases
+    assert "QUERY_MAX_MEMORY_BYTES" not in aliases
 
 
 def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
