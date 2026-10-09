@@ -227,6 +227,10 @@ def test_rejects_settings_clause_in_every_select_scope() -> None:
         "SELECT 1 UNION ALL SELECT 2 SETTINGS max_memory_usage=1",
         "SELECT 1 WHERE 1 IN (SELECT 1 SETTINGS max_memory_usage=1)",
         "SELECT 1 SETTINGS max_memory_usage=1 FORMAT JSON",
+        "(SELECT 1) SETTINGS max_result_rows=0",
+        "(SELECT 1 UNION ALL SELECT 2) SETTINGS max_result_rows=0",
+        "SELECT 1 UNION ALL (SELECT 2) SETTINGS max_result_rows=0",
+        "(SELECT 1) UNION ALL (SELECT 2) SETTINGS max_result_rows=0",
     ):
         result = guard.validate(_user(), sql)
 
@@ -241,6 +245,8 @@ def test_rejects_settings_clause_in_show_commands() -> None:
         "SHOW TABLES FROM dwd SETTINGS max_threads=1",
         "SHOW CREATE TABLE x SETTINGS max_execution_time=999",
         "SHOW TABLES SETTINGS /* comment */ max_threads = 1",
+        "SHOW TABLES FROM dwd SETTINGS `max_threads`=1",
+        'SHOW TABLES FROM dwd SETTINGS "max_threads"=1',
     ):
         result = guard.validate(_user(), sql)
 
@@ -258,6 +264,8 @@ def test_settings_word_in_identifiers_strings_and_comments_is_not_rejected() -> 
         "SHOW TABLES LIKE '%settings%'",
         "SHOW TABLES /* SETTINGS max_threads=1 */",
         "SHOW CREATE TABLE settings",
+        "SHOW CREATE TABLE `settings`",
+        'SHOW CREATE TABLE "settings"',
     ):
         result = guard.validate(_user(), sql)
 

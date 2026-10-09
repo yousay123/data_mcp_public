@@ -111,7 +111,7 @@ ALLOWED_SHOW_PREFIX = re.compile(
 )
 
 SHOW_SETTINGS_CLAUSE = re.compile(
-    r"\bSETTINGS\b\s+[A-Za-z_][A-Za-z0-9_]*\s*=",
+    r'''\bSETTINGS\b\s+(?:[A-Za-z_][A-Za-z0-9_]*|`(?:``|[^`])+`|"(?:""|[^"])+")\s*=''',
     re.IGNORECASE,
 )
 
@@ -507,17 +507,17 @@ def _is_allowed_show_command(expression: exp.Expression) -> bool:
 
 
 def _has_query_settings_clause(expression: exp.Expression, sql: str) -> bool:
-    if any(
-        isinstance(node, exp.Select) and node.args.get("settings") is not None
-        for node in expression.walk()
-    ):
+    if any(node.args.get("settings") is not None for node in expression.walk()):
         return True
     if isinstance(expression, exp.Command) and str(expression.this).upper() == "SHOW":
-        return SHOW_SETTINGS_CLAUSE.search(_strip_comments_and_quoted_content(sql)) is not None
+        return (
+            SHOW_SETTINGS_CLAUSE.search(_strip_comments_and_single_quoted_content(sql))
+            is not None
+        )
     return False
 
 
-def _strip_comments_and_quoted_content(sql: str) -> str:
+def _strip_comments_and_single_quoted_content(sql: str) -> str:
     result: list[str] = []
     index = 0
     length = len(sql)
@@ -542,8 +542,7 @@ def _strip_comments_and_quoted_content(sql: str) -> str:
                 result.append("\n" if sql[index] == "\n" else " ")
                 index += 1
             continue
-        if current in {"'", '"', "`"}:
-            quote = current
+        if current == "'":
             result.append(" ")
             index += 1
             while index < length:
@@ -555,8 +554,8 @@ def _strip_comments_and_quoted_content(sql: str) -> str:
                     result.append("\n" if sql[index] == "\n" else " ")
                     index += 1
                     continue
-                if current == quote:
-                    if following == quote:
+                if current == "'":
+                    if following == "'":
                         result.append(" ")
                         index += 1
                         continue
