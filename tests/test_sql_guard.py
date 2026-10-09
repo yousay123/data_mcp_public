@@ -218,6 +218,58 @@ def test_validate_show_table_metadata_remains_available() -> None:
         assert result.status == Status.SUCCESS, sql
 
 
+def test_rejects_settings_clause_in_every_select_scope() -> None:
+    guard = _guard(require_partition_filter=False)
+    for sql in (
+        "SELECT 1 SETTINGS max_memory_usage=1",
+        "SELECT * FROM (SELECT 1 SETTINGS max_memory_usage=1)",
+        "WITH q AS (SELECT 1 SETTINGS max_memory_usage=1) SELECT * FROM q",
+        "SELECT 1 UNION ALL SELECT 2 SETTINGS max_memory_usage=1",
+        "SELECT 1 WHERE 1 IN (SELECT 1 SETTINGS max_memory_usage=1)",
+        "SELECT 1 SETTINGS max_memory_usage=1 FORMAT JSON",
+    ):
+        result = guard.validate(_user(), sql)
+
+        assert result.status == Status.VALIDATION_ERROR, sql
+        assert result.normalized_sql is None
+        assert any(issue.code == "query_settings_not_allowed" for issue in result.issues)
+
+
+def test_rejects_settings_clause_in_show_commands() -> None:
+    guard = _guard(require_partition_filter=False)
+    for sql in (
+        "SHOW TABLES FROM dwd SETTINGS max_threads=1",
+        "SHOW CREATE TABLE x SETTINGS max_execution_time=999",
+        "SHOW TABLES SETTINGS /* comment */ max_threads = 1",
+    ):
+        result = guard.validate(_user(), sql)
+
+        assert result.status == Status.VALIDATION_ERROR, sql
+        assert result.normalized_sql is None
+        assert any(issue.code == "query_settings_not_allowed" for issue in result.issues)
+
+
+def test_settings_word_in_identifiers_strings_and_comments_is_not_rejected() -> None:
+    guard = _guard(require_partition_filter=False)
+    for sql in (
+        "SELECT 1 AS settings",
+        "SELECT 'SETTINGS max_memory_usage=1' AS note",
+        "SELECT 1 /* SETTINGS max_memory_usage=1 */ AS value",
+        "SHOW TABLES LIKE '%settings%'",
+        "SHOW TABLES /* SETTINGS max_threads=1 */",
+        "SHOW CREATE TABLE settings",
+    ):
+        result = guard.validate(_user(), sql)
+
+        assert not any(issue.code == "query_settings_not_allowed" for issue in result.issues), sql
+
+    table_result = SqlGuard(
+        settings=Settings(REQUIRE_PARTITION_FILTER=False),
+        catalog=SlowCredentialAwareCatalog(),
+    ).validate(_user(), "SELECT value FROM demo.settings LIMIT 1")
+    assert table_result.status == Status.SUCCESS
+
+
 def test_blocks_non_show_command() -> None:
     result = _guard(require_partition_filter=False).validate(_user(), "EXPLAIN SELECT 1")
 

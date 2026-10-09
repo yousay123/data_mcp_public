@@ -110,6 +110,11 @@ ALLOWED_SHOW_PREFIX = re.compile(
     re.IGNORECASE,
 )
 
+SHOW_SETTINGS_CLAUSE = re.compile(
+    r"\bSETTINGS\b\s+[A-Za-z_][A-Za-z0-9_]*\s*=",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class SqlGuard:
@@ -174,6 +179,16 @@ class SqlGuard:
             return self._finish(datasource, None, [], [], issues)
 
         expression = expressions[0]
+        if _has_query_settings_clause(expression, sql):
+            issues.append(
+                ValidationIssue(
+                    code="query_settings_not_allowed",
+                    severity="error",
+                    message="SQL 不允许包含 SETTINGS 子句；查询设置由服务与 ClickHouse 集群统一管理",
+                )
+            )
+            return self._finish(datasource, None, [], [], issues)
+
         if self._is_show_command(expression):
             if not _is_allowed_show_command(expression):
                 issues.append(
@@ -489,6 +504,67 @@ def _is_allowed_show_command(expression: exp.Expression) -> bool:
     without_comments = re.sub(r"/\*.*?\*/|--[^\r\n]*", " ", raw_suffix, flags=re.DOTALL)
     normalized_suffix = " ".join(without_comments.split())
     return ALLOWED_SHOW_PREFIX.match(normalized_suffix) is not None
+
+
+def _has_query_settings_clause(expression: exp.Expression, sql: str) -> bool:
+    if any(
+        isinstance(node, exp.Select) and node.args.get("settings") is not None
+        for node in expression.walk()
+    ):
+        return True
+    if isinstance(expression, exp.Command) and str(expression.this).upper() == "SHOW":
+        return SHOW_SETTINGS_CLAUSE.search(_strip_comments_and_quoted_content(sql)) is not None
+    return False
+
+
+def _strip_comments_and_quoted_content(sql: str) -> str:
+    result: list[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        current = sql[index]
+        following = sql[index + 1] if index + 1 < length else ""
+        if current == "-" and following == "-":
+            result.extend((" ", " "))
+            index += 2
+            while index < length and sql[index] not in "\r\n":
+                result.append(" ")
+                index += 1
+            continue
+        if current == "/" and following == "*":
+            result.extend((" ", " "))
+            index += 2
+            while index < length:
+                if sql[index] == "*" and index + 1 < length and sql[index + 1] == "/":
+                    result.extend((" ", " "))
+                    index += 2
+                    break
+                result.append("\n" if sql[index] == "\n" else " ")
+                index += 1
+            continue
+        if current in {"'", '"', "`"}:
+            quote = current
+            result.append(" ")
+            index += 1
+            while index < length:
+                current = sql[index]
+                following = sql[index + 1] if index + 1 < length else ""
+                result.append("\n" if current == "\n" else " ")
+                index += 1
+                if current == "\\" and index < length:
+                    result.append("\n" if sql[index] == "\n" else " ")
+                    index += 1
+                    continue
+                if current == quote:
+                    if following == quote:
+                        result.append(" ")
+                        index += 1
+                        continue
+                    break
+            continue
+        result.append(current)
+        index += 1
+    return "".join(result)
 
 
 def _has_unsafe_system_users_projection(expression: exp.Expression) -> bool:
