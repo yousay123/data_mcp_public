@@ -34,6 +34,16 @@ The receipt records:
 `snapshot_version` is always `null` in schema version 1. The service does not
 claim transactional snapshot semantics.
 
+The two SQL hashes have different consumer semantics:
+
+- recompute `requested_sql_sha256` from the exact SQL bytes submitted with the
+  export plan and require an exact match;
+- retain `executed_sql_sha256` as the service's attestation of the normalized
+  SQL sent to the executor and cross-check it with service audit when needed.
+  The service may add or normalize a `LIMIT`, so consumers must not require the
+  requested and executed hashes to be equal. Schema version 1 does not expose
+  the executed SQL text or promise a client-reproducible rewrite algorithm.
+
 The default source-version provider reports `status=unavailable` and a null
 version. A consumer that needs a same-version multi-query batch must reject
 that receipt. When a caller supplies `expected_source_version`, the service
@@ -49,3 +59,14 @@ with its host-owned expected identity and fail closed on any mismatch.
 
 Cross-identity file confidentiality requires a separate authenticated read API
 or sandbox-isolated outbox roots and is outside schema version 1.
+
+## Deployment gate
+
+The Data MCP service itself must be able to write the outbox, so it cannot prove
+the consumer sandbox is read-only. Before enabling a sidecar consumer, the
+deployment operator must run the consumer under its real sandbox profile and
+verify that all of these outbox operations fail: create, overwrite, append,
+rename, delete, symbolic link, hard link, create directory, chmod, and remove
+directory. The probe result belongs to the deployment evidence. A consumer
+must also fail closed at runtime when its configured read-only self-check or
+the recorded deployment gate is absent.

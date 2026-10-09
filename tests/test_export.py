@@ -11,7 +11,12 @@ import pytest
 
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.dependencies import build_container
-from ksher_agent_data_mcp.export import ExportError, LocalExportWriter, build_xlsx_bytes
+from ksher_agent_data_mcp.export import (
+    ExportError,
+    LocalExportResult,
+    LocalExportWriter,
+    build_xlsx_bytes,
+)
 from ksher_agent_data_mcp.models.contracts import ColumnMeta, QueryResult, Status
 from ksher_agent_data_mcp.source_version import SourceVersionObservation
 from ksher_agent_data_mcp.tools import service as service_module
@@ -100,6 +105,20 @@ def test_local_export_writer_rejects_path_filename(tmp_path: Path) -> None:
             assert exc.code == "invalid_export_filename"
         else:
             raise AssertionError(f"path filename should fail: {filename}")
+
+
+def test_local_export_writer_rejects_invalid_export_id_before_path_join(
+    tmp_path: Path,
+) -> None:
+    writer = LocalExportWriter(
+        Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+    )
+
+    with pytest.raises(ExportError) as exc_info:
+        writer.write_excel("result.xlsx", b"xlsx", export_id="../escape")
+
+    assert exc_info.value.code == "invalid_export_id"
+    assert not list(tmp_path.iterdir())
 
 
 def test_local_export_writer_maps_nul_filename_to_export_error(tmp_path: Path) -> None:
@@ -346,6 +365,35 @@ def test_local_export_writer_removes_excel_when_receipt_cannot_be_serialized(
     assert not list(tmp_path.iterdir())
 
 
+def test_local_export_writer_rejects_receipt_outside_outbox_without_touching_file(
+    tmp_path: Path,
+) -> None:
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workbook = outside / "result.xlsx"
+    workbook.write_bytes(b"xlsx")
+    artifact = LocalExportResult(
+        path=str(workbook),
+        filename=workbook.name,
+        bytes=4,
+        sha256=hashlib.sha256(b"xlsx").hexdigest(),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        expires_at="2026-10-09T01:00:00Z",
+    )
+    writer = LocalExportWriter(
+        Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=outbox)
+    )
+
+    with pytest.raises(ExportError) as exc_info:
+        writer.write_receipt(artifact, {"status": "complete"})
+
+    assert exc_info.value.code == "unsafe_export_directory"
+    assert workbook.read_bytes() == b"xlsx"
+    assert not (outside / "receipt.json").exists()
+
+
 class _SequenceSourceVersionProvider:
     def __init__(self, *observations: SourceVersionObservation) -> None:
         self.observations = list(observations)
@@ -452,6 +500,60 @@ def test_export_writes_stable_source_version_to_receipt(monkeypatch, tmp_path: P
     assert receipt["source_version_provider"] == "fake-test-provider"
     assert receipt["source_version_nodes"] == ["shard-1", "shard-2"]
     assert receipt["requested_sql_sha256"] != receipt["executed_sql_sha256"]
+
+
+def test_scheduled_export_receipt_preserves_trusted_task_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+        )
+    )
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: {
+            "status": Status.SUCCESS,
+            "query_id": "q_scheduled",
+            "datasource": "tchouse-c",
+            "sql": "SELECT 1 LIMIT 100001",
+            "columns": [{"name": "1", "type": "UInt8"}],
+            "rows": [{"1": 1}],
+            "row_count": 1,
+            "truncated": False,
+            "tables": [],
+        },
+    )
+    sql = "SELECT 1"
+    task_id = "task_price_change_daily"
+    audit_context = {
+        "sender_type": "bot",
+        "caller_source": "schedule_creator",
+        "session_id": SESSION_ID,
+        "task_id": task_id,
+    }
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+            task_id=task_id,
+        ),
+        audit_context=audit_context,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    receipt = json.loads(Path(result["receipt"]["path"]).read_text())
+    assert receipt["task_id"] == task_id
+    assert receipt["sender_type"] == "bot"
+    assert receipt["caller_source"] == "schedule_creator"
 
 
 def test_export_rejects_source_version_change_without_leaving_artifact(
