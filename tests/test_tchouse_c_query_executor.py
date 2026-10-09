@@ -63,7 +63,7 @@ def test_tchouse_c_executor_converts_json_response(monkeypatch) -> None:
     assert not result.truncated
     assert seen_settings["max_execution_time"] == "30"
     assert seen_settings["max_rows_to_read"] == "50000000"
-    assert seen_settings["max_bytes_to_read"] == str(5 * 1024 * 1024 * 1024)
+    assert seen_settings["max_bytes_to_read"] == str(10 * 1024 * 1024 * 1024)
     assert seen_settings["max_memory_usage"] == str(512 * 1024 * 1024)
     assert seen_settings["max_result_rows"] == "1000"
     assert seen_settings["result_overflow_mode"] == "throw"

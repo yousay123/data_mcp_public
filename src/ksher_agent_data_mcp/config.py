@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     query_timeout_seconds: int = Field(default=60, alias="QUERY_TIMEOUT_SECONDS", ge=1)
     query_max_rows_to_read: int = Field(default=50_000_000, alias="QUERY_MAX_ROWS_TO_READ", ge=1)
     query_max_bytes_to_read: int = Field(
-        default=5 * 1024 * 1024 * 1024, alias="QUERY_MAX_BYTES_TO_READ", ge=1
+        default=10 * 1024 * 1024 * 1024, alias="QUERY_MAX_BYTES_TO_READ", ge=1
     )
     query_max_memory_bytes: int = Field(
         default=512 * 1024 * 1024, alias="QUERY_MAX_MEMORY_BYTES", ge=1
