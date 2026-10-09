@@ -1,5 +1,6 @@
 import hashlib
 from collections import OrderedDict
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Any
 
@@ -14,6 +15,7 @@ from ksher_agent_data_mcp.credentials.base import (
 from ksher_agent_data_mcp.dependencies import Container
 from ksher_agent_data_mcp.export import (
     ExportError,
+    LocalExportResult,
     LocalExportWriter,
     build_xlsx_bytes,
     export_validation_error,
@@ -38,13 +40,27 @@ from ksher_agent_data_mcp.query_plan import (
     QueryPlanStore,
     RepairChainStore,
 )
+from ksher_agent_data_mcp.source_version import (
+    SourceVersionObservation,
+    SourceVersionProvider,
+    UnavailableSourceVersionProvider,
+    reconcile_source_version,
+)
 
 AuditContext = dict[str, str | None]
 
 
 class DataMcpService:
-    def __init__(self, container: Container) -> None:
+    def __init__(
+        self,
+        container: Container,
+        *,
+        source_version_provider: SourceVersionProvider | None = None,
+    ) -> None:
         self.container = container
+        self.source_version_provider = (
+            source_version_provider or UnavailableSourceVersionProvider()
+        )
         # This process is intentionally single-worker; a multi-worker deploy
         # must move plans to shared storage before enabling this contract.
         self.query_plans = QueryPlanStore(
@@ -560,6 +576,7 @@ class DataMcpService:
         audit_context: AuditContext | None = None,
         *,
         query_plan_id: str,
+        expected_source_version: str | None = None,
     ) -> dict[str, Any]:
         user_or_error = self._build_user_context(
             request_user_union_id=request_user_union_id,
@@ -591,6 +608,13 @@ class DataMcpService:
                 "单次导出行数上限必须至少为 1",
                 "invalid_export_row_limit",
             )
+        if expected_source_version is not None:
+            expected_source_version = expected_source_version.strip()
+            if not expected_source_version or len(expected_source_version) > 256:
+                return export_validation_error(
+                    "expected_source_version 必须是 1 到 256 个字符",
+                    "invalid_expected_source_version",
+                )
         scope_or_error = self._query_plan_scope(user, audit_context)
         if isinstance(scope_or_error, dict):
             self._audit_query_plan_rejection(
@@ -598,6 +622,21 @@ class DataMcpService:
             )
             return scope_or_error
         session_id, trust_domain, task_id = scope_or_error
+        version_before, version_provider_error = _observe_source_version(
+            self.source_version_provider,
+            sql=sql,
+            datasource=datasource,
+        )
+        if version_provider_error is not None:
+            return version_provider_error
+        assert version_before is not None
+        version_error = _validate_expected_source_version(
+            version_before,
+            expected_source_version,
+            phase="before",
+        )
+        if version_error is not None:
+            return version_error
         plan_error, plan_run = self._consume_query_plan(
             query_plan_id,
             session_id,
@@ -638,6 +677,22 @@ class DataMcpService:
         result = self._attach_query_plan_run(result, plan_run)
         if result.get("status") != Status.SUCCESS:
             return result
+        version_after, version_provider_error = _observe_source_version(
+            self.source_version_provider,
+            sql=sql,
+            datasource=datasource,
+        )
+        if version_provider_error is not None:
+            return version_provider_error
+        assert version_after is not None
+        version_error = _validate_source_version_pair(
+            version_before,
+            version_after,
+            expected_source_version,
+        )
+        if version_error is not None:
+            return version_error
+        source_version = reconcile_source_version(version_before, version_after)
         row_count = int(result.get("row_count") or 0)
         if row_count > limit:
             return export_validation_error(
@@ -652,11 +707,27 @@ class DataMcpService:
 
         export_id = new_export_id()
         export_filename = sanitize_excel_filename(filename, export_id)
+        writer = LocalExportWriter(self.container.settings)
         try:
             content = build_xlsx_bytes(result.get("columns", []), result.get("rows", []))
-            artifact = LocalExportWriter(self.container.settings).write_excel(
-                export_filename, content
+            artifact = writer.write_excel(
+                export_filename,
+                content,
+                export_id=export_id,
             )
+            receipt = _build_export_receipt(
+                export_id=export_id,
+                artifact=artifact,
+                user=user,
+                requested_sql=sql,
+                executed_sql=str(result.get("sql") or ""),
+                result=result,
+                row_count=row_count,
+                audit_context=audit_context,
+                source_version=source_version,
+                expected_source_version=expected_source_version,
+            )
+            artifact = writer.write_receipt(artifact, receipt)
         except ExportError as exc:
             audit_logger.emit(
                 AuditEvent(
@@ -701,6 +772,11 @@ class DataMcpService:
                     "file_bytes": artifact.bytes,
                     "file_sha256": artifact.sha256,
                     "file_expires_at": artifact.expires_at,
+                    "requested_sql_sha256": receipt["requested_sql_sha256"],
+                    "executed_sql_sha256": receipt["executed_sql_sha256"],
+                    "source_version": receipt["source_version"],
+                    "source_version_provider": receipt["source_version_provider"],
+                    "source_version_status": receipt["source_version_status"],
                     **self._audit_detail(audit_context),
                 },
             )
@@ -726,6 +802,16 @@ class DataMcpService:
                 "mime": artifact.mime,
                 "expires_at": artifact.expires_at,
                 "row_count": row_count,
+            },
+            "receipt": {
+                "path": artifact.receipt_path,
+                "filename": "receipt.json",
+                "schema_version": receipt["schema_version"],
+                "source_version": receipt["source_version"],
+                "expected_source_version": receipt["expected_source_version"],
+                "source_version_provider": receipt["source_version_provider"],
+                "source_version_status": receipt["source_version_status"],
+                "snapshot_version": None,
             },
         }
 
@@ -1501,6 +1587,117 @@ class DataMcpService:
         return parsed if parsed > 0 else None
 
 
+def _observe_source_version(
+    provider: SourceVersionProvider,
+    *,
+    sql: str,
+    datasource: str,
+) -> tuple[SourceVersionObservation | None, dict[str, Any] | None]:
+    try:
+        return provider.observe(sql=sql, datasource=datasource), None
+    except Exception:  # noqa: BLE001 - version evidence must fail closed without leaking internals
+        return None, export_validation_error(
+            "数据版本提供方执行失败，拒绝生成可信导出",
+            "source_version_provider_failed",
+        )
+
+
+def _validate_expected_source_version(
+    observation: SourceVersionObservation,
+    expected: str | None,
+    *,
+    phase: str,
+) -> dict[str, Any] | None:
+    if expected is None:
+        return None
+    if observation.status != "available" or observation.version is None:
+        return export_validation_error(
+            f"数据版本在查询{phase}阶段不可用，拒绝按期望版本执行导出",
+            "source_version_unavailable",
+        )
+    if observation.version != expected:
+        return export_validation_error(
+            f"数据版本在查询{phase}阶段与 expected_source_version 不一致",
+            "source_version_mismatch",
+        )
+    return None
+
+
+def _validate_source_version_pair(
+    before: SourceVersionObservation,
+    after: SourceVersionObservation,
+    expected: str | None,
+) -> dict[str, Any] | None:
+    expected_error = _validate_expected_source_version(after, expected, phase="after")
+    if expected_error is not None:
+        return expected_error
+    if before.status == "unavailable" and after.status == "unavailable":
+        return None
+    if (
+        before.status != "available"
+        or after.status != "available"
+        or before.version is None
+        or before.version != after.version
+        or before.provider != after.provider
+        or before.nodes != after.nodes
+    ):
+        return export_validation_error(
+            "查询前后数据版本不一致或版本提供方状态异常，拒绝生成可信导出",
+            "source_version_changed",
+        )
+    return None
+
+
+def _build_export_receipt(
+    *,
+    export_id: str,
+    artifact: LocalExportResult,
+    user: UserContext,
+    requested_sql: str,
+    executed_sql: str,
+    result: dict[str, Any],
+    row_count: int,
+    audit_context: AuditContext | None,
+    source_version: SourceVersionObservation,
+    expected_source_version: str | None,
+) -> dict[str, Any]:
+    detail = audit_context or {}
+    return {
+        "schema_version": 1,
+        "status": "complete",
+        "export_id": export_id,
+        "query_id": result.get("query_id"),
+        "filename": artifact.filename,
+        "union_id": user.union_id,
+        "lark_app_id": user.lark_app_id,
+        "sender_type": _clean_string(detail.get("sender_type")) or "unknown_legacy",
+        "task_id": _clean_string(detail.get("task_id")),
+        "session_id": _clean_string(detail.get("session_id")),
+        "turn_id": _clean_string(detail.get("turn_id")),
+        "caller_source": _clean_string(detail.get("caller_source")),
+        "requested_sql_sha256": hashlib.sha256(requested_sql.encode("utf-8")).hexdigest(),
+        "executed_sql_sha256": hashlib.sha256(executed_sql.encode("utf-8")).hexdigest(),
+        "tables": list(result.get("tables", [])),
+        "row_count": row_count,
+        "file_bytes": artifact.bytes,
+        "file_sha256": artifact.sha256,
+        "truncated": bool(result.get("truncated")),
+        "read_rows": result.get("read_rows"),
+        "read_bytes": result.get("read_bytes"),
+        "execution_ms": result.get("execution_ms"),
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "file_expires_at": artifact.expires_at,
+        "source_version": source_version.version,
+        "expected_source_version": expected_source_version,
+        "source_version_provider": source_version.provider,
+        "source_version_status": source_version.status,
+        "source_version_nodes": list(source_version.nodes),
+        "source_version_captured_at": source_version.captured_at,
+        "snapshot_version": None,
+        "confidentiality_boundary": "tamper_evidence_only_not_read_isolation",
+    }
+
+
 def _safe_export_error_message(error_code: str) -> str:
     if error_code == "missing_export_outbox_dir":
         return "Data MCP 导出服务未配置本机 outbox 目录"
@@ -1508,7 +1705,12 @@ def _safe_export_error_message(error_code: str) -> str:
         return "Excel 导出文件名无效"
     if error_code == "export_file_size_limit_exceeded":
         return "Excel 已生成，但文件超过当前导出大小上限"
-    if error_code in {"local_export_write_failed", "local_export_size_mismatch"}:
+    if error_code in {
+        "local_export_write_failed",
+        "local_export_size_mismatch",
+        "export_receipt_write_failed",
+        "unsafe_export_directory",
+    }:
         return "Excel 已生成，但写入本机导出目录失败"
     return "Excel 导出失败"
 

@@ -70,7 +70,11 @@ When the user names a table directly:
 6. When the user explicitly asks for an Excel file, call
    `export_query_to_excel_file`. The tool runs the validated query, generates
    Excel in the local Data MCP outbox, and returns a local file path plus
-   `sha256`/`bytes` metadata for BotMux delivery.
+   `sha256`/`bytes` metadata for BotMux delivery. The same export directory also
+   contains an atomically published `receipt.json`; machine consumers must read
+   that sidecar from the outbox rather than trust JSON copied through an agent.
+   The receipt is tamper evidence for a read-only sandbox, not cross-identity
+   file confidentiality.
 7. When the user does not ask for a file/export/Excel attachment, do not call the
    export tool. Normal query responses must not include a `file` key.
 8. Before sending an exported file, verify that the returned local file exists

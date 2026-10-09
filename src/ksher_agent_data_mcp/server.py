@@ -115,6 +115,7 @@ def export_query_to_excel_file(
     datasource: Literal["tchouse-c"] = "tchouse-c",
     filename: str | None = None,
     max_export_rows: Annotated[int, Field(ge=1)] | None = None,
+    expected_source_version: Annotated[str, Field(min_length=1, max_length=256)] | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Export a validated read-only query to a local Excel file artifact."""
@@ -128,6 +129,7 @@ def export_query_to_excel_file(
         filename=filename,
         max_export_rows=max_export_rows,
         query_plan_id=query_plan_id,
+        expected_source_version=expected_source_version,
         audit_context=_audit_context(identity),
     )
 

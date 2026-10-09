@@ -90,6 +90,7 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                     "query_plan_id",
                     "filename",
                     "max_export_rows",
+                    "expected_source_version",
                 }
                 assert tool.input_schema["required"] == ["sql", "query_plan_id"]
                 row_limit_schema = properties["max_export_rows"]

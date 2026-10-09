@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import time
@@ -12,6 +13,7 @@ from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.export import ExportError, LocalExportWriter, build_xlsx_bytes
 from ksher_agent_data_mcp.models.contracts import ColumnMeta, QueryResult, Status
+from ksher_agent_data_mcp.source_version import SourceVersionObservation
 from ksher_agent_data_mcp.tools import service as service_module
 from ksher_agent_data_mcp.tools.service import DataMcpService
 
@@ -279,6 +281,29 @@ def test_export_query_to_excel_file_returns_local_file_without_urls(
         == hashlib.sha256(Path(result["file"]["path"]).read_bytes()).hexdigest()
     )
     assert Path(result["file"]["path"]).parent.parent == tmp_path
+    assert Path(result["file"]["path"]).parent.name == result["file"]["export_id"]
+    receipt_path = Path(result["receipt"]["path"])
+    assert receipt_path == Path(result["file"]["path"]).parent / "receipt.json"
+    assert receipt_path.stat().st_mode & 0o777 == 0o600
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["status"] == "complete"
+    assert receipt["export_id"] == result["file"]["export_id"]
+    assert receipt["query_id"] == "q_example"
+    assert receipt["union_id"] == "on_example_user"
+    assert receipt["lark_app_id"] == APP_ID
+    assert receipt["sender_type"] == "user"
+    assert receipt["requested_sql_sha256"] == hashlib.sha256(
+        b"SELECT 1 AS cnt"
+    ).hexdigest()
+    assert receipt["executed_sql_sha256"] == receipt["requested_sql_sha256"]
+    assert receipt["file_sha256"] == result["file"]["sha256"]
+    assert receipt["file_bytes"] == result["file"]["bytes"]
+    assert receipt["row_count"] == 1
+    assert receipt["truncated"] is False
+    assert receipt["source_version"] is None
+    assert receipt["source_version_status"] == "unavailable"
+    assert receipt["snapshot_version"] is None
+    assert receipt["confidentiality_boundary"] == "tamper_evidence_only_not_read_isolation"
     assert result["sql_account_binding"] == {
         "datasource": "tchouse-c",
         "tables": ["analytics.example"],
@@ -300,6 +325,216 @@ def test_export_query_to_excel_file_returns_local_file_without_urls(
     assert events[-1].detail["turn_id"] == "turn_123"
     assert events[-1].detail["caller_source"] == "lark_message"
     assert events[-1].detail["file_sha256"] == result["file"]["sha256"]
+
+
+def test_local_export_writer_removes_excel_when_receipt_cannot_be_serialized(
+    tmp_path: Path,
+) -> None:
+    writer = LocalExportWriter(
+        Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+    )
+    artifact = writer.write_excel(
+        "result.xlsx",
+        b"xlsx",
+        export_id="export-0123456789abcdef0123456789abcdef",
+    )
+
+    with pytest.raises(ExportError) as exc_info:
+        writer.write_receipt(artifact, {"not_json": object()})
+
+    assert exc_info.value.code == "export_receipt_write_failed"
+    assert not list(tmp_path.iterdir())
+
+
+class _SequenceSourceVersionProvider:
+    def __init__(self, *observations: SourceVersionObservation) -> None:
+        self.observations = list(observations)
+
+    def observe(self, *, sql: str, datasource: str) -> SourceVersionObservation:
+        assert sql
+        assert datasource == "tchouse-c"
+        return self.observations.pop(0)
+
+
+def _source_version(version: str) -> SourceVersionObservation:
+    return SourceVersionObservation(
+        version=version,
+        provider="fake-test-provider",
+        status="available",
+        nodes=("shard-1", "shard-2"),
+        captured_at="2026-10-09T00:00:00Z",
+    )
+
+
+def test_export_expected_source_version_fails_before_query_when_provider_unavailable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+        )
+    )
+    called = False
+
+    def fake_execute(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("query must not run")
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT 1"
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user", sql, "tchouse-c", session_id=SESSION_ID, lark_app_id=APP_ID
+        ),
+        expected_source_version="version-1",
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "source_version_unavailable"
+    assert called is False
+    assert not list(tmp_path.iterdir())
+
+
+def test_export_writes_stable_source_version_to_receipt(monkeypatch, tmp_path: Path) -> None:
+    provider = _SequenceSourceVersionProvider(
+        _source_version("version-1"),
+        _source_version("version-1"),
+    )
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+        ),
+        source_version_provider=provider,
+    )
+
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: {
+            "status": Status.SUCCESS,
+            "query_id": "q_versioned",
+            "datasource": "tchouse-c",
+            "sql": "SELECT 1 LIMIT 100001",
+            "columns": [{"name": "1", "type": "UInt8"}],
+            "rows": [{"1": 1}],
+            "row_count": 1,
+            "read_rows": 1,
+            "read_bytes": 8,
+            "execution_ms": 2,
+            "truncated": False,
+            "tables": ["analytics.example"],
+        },
+    )
+    sql = "SELECT 1"
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user", sql, "tchouse-c", session_id=SESSION_ID, lark_app_id=APP_ID
+        ),
+        expected_source_version="version-1",
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    receipt = json.loads(Path(result["receipt"]["path"]).read_text())
+    assert receipt["source_version"] == "version-1"
+    assert receipt["expected_source_version"] == "version-1"
+    assert receipt["source_version_status"] == "available"
+    assert receipt["source_version_provider"] == "fake-test-provider"
+    assert receipt["source_version_nodes"] == ["shard-1", "shard-2"]
+    assert receipt["requested_sql_sha256"] != receipt["executed_sql_sha256"]
+
+
+def test_export_rejects_source_version_change_without_leaving_artifact(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider = _SequenceSourceVersionProvider(
+        _source_version("version-1"),
+        _source_version("version-2"),
+    )
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+        ),
+        source_version_provider=provider,
+    )
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: {
+            "status": Status.SUCCESS,
+            "query_id": "q_changed",
+            "datasource": "tchouse-c",
+            "sql": "SELECT 1 LIMIT 100001",
+            "columns": [{"name": "1", "type": "UInt8"}],
+            "rows": [{"1": 1}],
+            "row_count": 1,
+            "truncated": False,
+            "tables": [],
+        },
+    )
+    sql = "SELECT 1"
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user", sql, "tchouse-c", session_id=SESSION_ID, lark_app_id=APP_ID
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "source_version_changed"
+    assert not list(tmp_path.iterdir())
+
+
+def test_export_source_version_provider_exception_fails_closed_before_query(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class BrokenProvider:
+        def observe(self, *, sql: str, datasource: str) -> SourceVersionObservation:
+            raise RuntimeError("must not leak")
+
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path)
+        ),
+        source_version_provider=BrokenProvider(),
+    )
+    called = False
+
+    def fake_execute(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("query must not run")
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT 1"
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user", sql, "tchouse-c", session_id=SESSION_ID, lark_app_id=APP_ID
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["issues"][0]["code"] == "source_version_provider_failed"
+    assert "must not leak" not in str(result)
+    assert called is False
 
 
 def test_export_query_to_excel_file_rejects_large_result(monkeypatch) -> None:

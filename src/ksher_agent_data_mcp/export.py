@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ class LocalExportResult:
     sha256: str
     mime: str
     expires_at: str
+    receipt_path: str | None = None
 
 
 def export_validation_error(message: str, code: str = "export_error") -> dict[str, Any]:
@@ -77,7 +79,13 @@ class LocalExportWriter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def write_excel(self, filename: str, content: bytes) -> LocalExportResult:
+    def write_excel(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        export_id: str | None = None,
+    ) -> LocalExportResult:
         if not filename or Path(filename).name != filename:
             raise ExportError("导出文件名不能包含路径", "invalid_export_filename")
         max_bytes = self.settings.export_max_bytes
@@ -94,12 +102,16 @@ class LocalExportWriter:
             base_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(base_dir, 0o700)
 
-            export_dir = Path(tempfile.mkdtemp(prefix="export-", dir=base_dir))
+            if export_id is None:
+                export_dir = Path(tempfile.mkdtemp(prefix="export-", dir=base_dir))
+            else:
+                if not re.fullmatch(r"export-[0-9a-f]{32}", export_id):
+                    raise ExportError("导出 ID 格式无效", "invalid_export_id")
+                export_dir = base_dir / export_id
+                export_dir.mkdir(mode=0o700)
             os.chmod(export_dir, 0o700)
             path = export_dir / filename
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as file:
-                file.write(content)
+            self._atomic_write(path, content)
             stat = path.stat()
         except (OSError, ValueError) as exc:
             if export_dir is not None:
@@ -118,6 +130,75 @@ class LocalExportWriter:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             expires_at=expires_at.isoformat().replace("+00:00", "Z"),
         )
+
+    def write_receipt(
+        self,
+        artifact: LocalExportResult,
+        receipt: dict[str, Any],
+    ) -> LocalExportResult:
+        path = Path(artifact.path)
+        export_dir = path.parent
+        try:
+            base_dir = self._base_dir().resolve(strict=True)
+            if export_dir.is_symlink() or export_dir.resolve(strict=True).parent != base_dir:
+                raise ExportError("导出目录越界或为符号链接", "unsafe_export_directory")
+            receipt_path = export_dir / "receipt.json"
+            payload = json.dumps(
+                receipt,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._atomic_write(receipt_path, payload)
+        except ExportError:
+            self.remove_export(artifact)
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            self.remove_export(artifact)
+            raise ExportError(
+                "Excel 已生成，但可信回执写入失败",
+                "export_receipt_write_failed",
+            ) from exc
+        return LocalExportResult(
+            path=artifact.path,
+            filename=artifact.filename,
+            bytes=artifact.bytes,
+            sha256=artifact.sha256,
+            mime=artifact.mime,
+            expires_at=artifact.expires_at,
+            receipt_path=str(receipt_path),
+        )
+
+    def remove_export(self, artifact: LocalExportResult) -> None:
+        export_dir = Path(artifact.path).parent
+        try:
+            base_dir = self._base_dir().resolve(strict=True)
+            if not export_dir.is_symlink() and export_dir.resolve(strict=True).parent == base_dir:
+                shutil.rmtree(export_dir)
+        except OSError:
+            return
+
+    @staticmethod
+    def _atomic_write(path: Path, content: bytes) -> None:
+        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        fd: int | None = None
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as file:
+                fd = None
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            temporary.unlink(missing_ok=True)
 
     def cleanup_expired(self) -> None:
         base_dir = self._base_dir()
@@ -317,4 +398,4 @@ def _app_xml() -> str:
 
 
 def new_export_id() -> str:
-    return f"export_{uuid.uuid4().hex}"
+    return f"export-{uuid.uuid4().hex}"

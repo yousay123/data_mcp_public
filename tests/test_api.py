@@ -43,6 +43,13 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
     assert payload["query_resource_limits"]["max_concurrency"] >= 1
     assert payload["query_resource_limits"]["query_plan_single_ttl_seconds"] == 300
     assert payload["query_resource_limits"]["query_plan_compare_ttl_seconds"] <= 900
+    assert payload["export_receipt"] == {
+        "schema_version": 1,
+        "atomic_sidecar": True,
+        "source_version_provider": "unavailable",
+        "read_isolation": False,
+        "trust_boundary": "tamper_evidence_only",
+    }
     assert payload["http_identity"]["dev_insecure_override"] is False
     assert payload["http_identity"]["dev_insecure_override_supported"] is False
     serialized = str(payload)
@@ -107,6 +114,35 @@ def test_export_endpoint_rejects_nonpositive_row_limit(
     )
 
     assert response.status_code == 422
+
+
+def test_export_endpoint_forwards_expected_source_version(monkeypatch) -> None:
+    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    captured: dict[str, Any] = {}
+
+    def fake_export(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"status": "success"}
+
+    monkeypatch.setattr(api_module.service, "export_query_to_excel_file", fake_export)
+    response = TestClient(app).post(
+        "/agent/export-query-excel-file",
+        headers={"X-Internal-Auth": "test-token"},
+        json={
+            "request_user_union_id": "on_user",
+            "request_user_open_id": "ou_user",
+            "request_lark_app_id": "cli_app",
+            "caller_sender_type": "user",
+            "caller_session_id": "session_bound",
+            "sql": "SELECT 1",
+            "query_plan_id": "plan_example",
+            "expected_source_version": "parts:v1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["kwargs"]["expected_source_version"] == "parts:v1"
 
 
 def test_http_identity_endpoint_ignores_removed_insecure_override(monkeypatch) -> None:

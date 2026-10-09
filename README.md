@@ -7,6 +7,11 @@
 - 运行时身份必须由可信网关注入，不能接受模型或普通消息自行声明的用户身份。
 - 数据库连接、凭证解析 SQL、元数据来源表等部署参数只通过本机环境或密钥管理系统提供。
 - 默认只允许只读查询，并限制行数、扫描量、内存、并发与超时。
+- Excel 导出目录会原子写入 `receipt.json` sidecar，记录可信调用身份、请求/执行 SQL
+  哈希、查询与文件摘要及数据版本状态。当前默认数据版本提供方为 `unavailable`，
+  不会伪造快照版本；需要同版本批处理的消费端必须 fail-closed。
+- sidecar 的当前信任边界是防止受控只读沙盒伪造，不提供共享 outbox 内的文件读取隔离。
+  跨身份文件机密性需要另行采用服务端鉴权读取或独立目录隔离。
 - 示例地址使用保留域名，示例账号和密码只用于测试，不能用于生产。
 - 不要把 `.env`、私有 launcher、wheel、查询结果或审计日志提交到 Git。
 
@@ -43,6 +48,8 @@ ksher-agent-data-mcp
 - `DATA_MCP_METADATA_SNAPSHOT_TABLE`：元数据快照来源，格式必须为 `database.table`。
 
 完整配置项参见 [.env.example](.env.example)。生产账号应遵循最小权限原则，并由人工或密钥管理系统配置。
+导出 sidecar 的字段、原子发布顺序与信任边界见
+[`docs/export-receipt.md`](docs/export-receipt.md)。
 
 ## Amber 受信调用入口
 

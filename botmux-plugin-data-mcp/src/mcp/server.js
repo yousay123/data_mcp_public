@@ -745,6 +745,9 @@ async function callDataMcpService(kind, caller, args) {
     if (Number.isSafeInteger(args.max_export_rows) && args.max_export_rows > 0) {
       payload.max_export_rows = args.max_export_rows;
     }
+    if (typeof args.expected_source_version === 'string' && args.expected_source_version.trim()) {
+      payload.expected_source_version = args.expected_source_version.trim();
+    }
   }
 
   let response;
@@ -1001,6 +1004,7 @@ function toolSchemas() {
           query_plan_id: { type: 'string' },
           filename: { type: 'string' },
           max_export_rows: { type: 'integer', minimum: 1 },
+          expected_source_version: { type: 'string', minLength: 1, maxLength: 256 },
         },
         required: ['sql', 'query_plan_id'],
         additionalProperties: false,

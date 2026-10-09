@@ -64,6 +64,7 @@ class AgentSqlRequest(AgentSqlRequestBase):
 class AgentExportRequest(AgentSqlRequest):
     filename: str | None = None
     max_export_rows: int | None = Field(default=None, ge=1)
+    expected_source_version: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class MetadataSnapshotRefreshRequest(BaseModel):
@@ -164,6 +165,13 @@ def health() -> dict[str, Any]:
             "query_plan_single_ttl_seconds": service.query_plans.ttl_seconds,
             "query_plan_compare_ttl_seconds": service.query_plans.compare_ttl_seconds,
         },
+        "export_receipt": {
+            "schema_version": 1,
+            "atomic_sidecar": True,
+            "source_version_provider": "unavailable",
+            "read_isolation": False,
+            "trust_boundary": "tamper_evidence_only",
+        },
         "access_audit": {
             "enabled": service.container.access_auditor_factory is not None,
             "execution_identity": "caller_bound",
@@ -255,6 +263,7 @@ def agent_export_query_excel_file(request: AgentExportRequest) -> dict[str, Any]
         request.max_export_rows,
         audit_context=request.audit_context(),
         query_plan_id=request.query_plan_id,
+        expected_source_version=request.expected_source_version,
     )
 
 
