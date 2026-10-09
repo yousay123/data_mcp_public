@@ -1,6 +1,8 @@
 from io import BytesIO
 from urllib.error import HTTPError
 
+import pytest
+
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.db import query_executor
 from ksher_agent_data_mcp.db.query_executor import (
@@ -88,6 +90,30 @@ def test_tchouse_c_executor_uses_per_call_export_row_limit(monkeypatch) -> None:
     assert result.status == Status.SUCCESS
     assert not result.truncated
     assert seen_settings["max_result_rows"] == "100001"
+
+
+@pytest.mark.parametrize(
+    ("returned_rows", "expected_truncated"),
+    [(1001, False), (100_001, True)],
+)
+def test_tchouse_c_executor_uses_per_call_limit_for_truncation_detection(
+    monkeypatch, returned_rows: int, expected_truncated: bool
+) -> None:
+    def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
+        return {
+            "meta": [{"name": "number", "type": "UInt64"}],
+            "data": [{"number": 1}] * returned_rows,
+            "rows": returned_rows,
+        }
+
+    monkeypatch.setattr(query_executor, "execute_clickhouse_json", fake_execute_clickhouse_json)
+
+    result = TChouseCQueryExecutor(Settings(MAX_ROWS=1000)).run(
+        _credential(), "SELECT number FROM numbers(100001)", 30, max_rows=100_001
+    )
+
+    assert result.status == Status.SUCCESS
+    assert result.truncated is expected_truncated
 
 
 def test_tchouse_c_executor_rejects_other_datasource() -> None:

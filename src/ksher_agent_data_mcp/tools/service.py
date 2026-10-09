@@ -586,6 +586,11 @@ class DataMcpService:
                 user, query_plan_id, datasource, datasource_error, audit_context
             )
             return datasource_error
+        if max_export_rows is not None and max_export_rows < 1:
+            return export_validation_error(
+                "单次导出行数上限必须至少为 1",
+                "invalid_export_row_limit",
+            )
         scope_or_error = self._query_plan_scope(user, audit_context)
         if isinstance(scope_or_error, dict):
             self._audit_query_plan_rejection(

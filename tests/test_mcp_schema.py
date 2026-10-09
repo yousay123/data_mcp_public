@@ -92,6 +92,10 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                     "max_export_rows",
                 }
                 assert tool.input_schema["required"] == ["sql", "query_plan_id"]
+                row_limit_schema = properties["max_export_rows"]
+                assert any(
+                    option.get("minimum") == 1 for option in row_limit_schema["anyOf"]
+                )
             elif tool.name == "refresh_metadata_snapshot":
                 assert properties == {}
             else:

@@ -40,7 +40,9 @@ class Settings(BaseSettings):
     credential_memory_file: Path | None = Field(default=None, alias="CREDENTIAL_MEMORY_FILE")
     query_executor: str = Field(default="dry_run", alias="QUERY_EXECUTOR")
     export_max_rows: int = Field(default=100_000, alias="DATA_MCP_EXPORT_MAX_ROWS", ge=1)
-    export_max_bytes: int = Field(default=20 * 1024 * 1024, alias="DATA_MCP_EXPORT_MAX_BYTES", ge=1)
+    export_max_bytes: int = Field(
+        default=1024 * 1024 * 1024, alias="DATA_MCP_EXPORT_MAX_BYTES", ge=1
+    )
     export_file_ttl_seconds: int = Field(
         default=3600, alias="DATA_MCP_EXPORT_FILE_TTL_SECONDS", ge=1
     )

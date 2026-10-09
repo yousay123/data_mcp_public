@@ -89,6 +89,26 @@ def test_http_identity_endpoint_rejects_wrong_internal_auth(monkeypatch) -> None
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize("max_export_rows", [0, -1])
+def test_export_endpoint_rejects_nonpositive_row_limit(
+    monkeypatch, max_export_rows: int
+) -> None:
+    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+
+    response = TestClient(app).post(
+        "/agent/export-query-excel-file",
+        headers={"X-Internal-Auth": "test-token"},
+        json={
+            "request_user_union_id": "on_example_user",
+            "sql": "SELECT 1",
+            "query_plan_id": "plan_example",
+            "max_export_rows": max_export_rows,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_http_identity_endpoint_ignores_removed_insecure_override(monkeypatch) -> None:
     monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
     monkeypatch.setenv(REMOVED_INSECURE_ENV, "1")

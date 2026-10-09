@@ -63,7 +63,7 @@ class AgentSqlRequest(AgentSqlRequestBase):
 
 class AgentExportRequest(AgentSqlRequest):
     filename: str | None = None
-    max_export_rows: int | None = None
+    max_export_rows: int | None = Field(default=None, ge=1)
 
 
 class MetadataSnapshotRefreshRequest(BaseModel):

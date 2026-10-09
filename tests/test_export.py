@@ -6,6 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.export import ExportError, LocalExportWriter, build_xlsx_bytes
@@ -20,6 +22,10 @@ HUMAN_AUDIT_CONTEXT = {"sender_type": "user", "session_id": SESSION_ID}
 
 def test_export_default_row_limit_is_one_hundred_thousand() -> None:
     assert Settings().export_max_rows == 100_000
+
+
+def test_export_default_file_limit_is_one_gibibyte() -> None:
+    assert Settings().export_max_bytes == 1024 * 1024 * 1024
 
 
 def test_export_sql_account_binding_preserves_unresolved_reason() -> None:
@@ -138,6 +144,21 @@ def test_local_export_writer_rejects_oversize_without_url(tmp_path: Path) -> Non
         raise AssertionError("oversize export should fail")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_local_export_writer_allows_file_at_configured_size_limit(tmp_path: Path) -> None:
+    writer = LocalExportWriter(
+        Settings(
+            METADATA_PROVIDER="memory",
+            DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+            DATA_MCP_EXPORT_MAX_BYTES=3,
+        )
+    )
+
+    artifact = writer.write_excel("result.xlsx", b"123")
+
+    assert artifact.bytes == 3
+    assert Path(artifact.path).read_bytes() == b"123"
 
 
 def test_local_export_writer_removes_export_dir_after_write_failure(
@@ -466,6 +487,77 @@ def test_export_rejects_one_row_over_configured_limit_before_truncation(monkeypa
     assert result["issues"][0]["code"] == "export_row_limit_exceeded"
     assert "100000" in result["message"]
     assert seen["result_max_rows"] == 100_001
+
+
+def test_export_rejects_incomplete_query_result(monkeypatch, tmp_path: Path) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                METADATA_PROVIDER="memory",
+                DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+            )
+        )
+    )
+
+    def fake_execute(*args, **kwargs):
+        return {
+            "status": Status.SUCCESS,
+            "query_id": "q_incomplete",
+            "datasource": "tchouse-c",
+            "sql": "SELECT number FROM numbers(2)",
+            "columns": [{"name": "number", "type": "UInt64"}],
+            "rows": [{"number": 1}],
+            "row_count": 2,
+            "truncated": True,
+            "tables": [],
+        }
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT number FROM numbers(2)"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "query_result_truncated"
+    assert not list(tmp_path.rglob("*.xlsx"))
+
+
+@pytest.mark.parametrize("max_export_rows", [0, -1])
+def test_export_rejects_nonpositive_caller_limit(max_export_rows: int) -> None:
+    service = DataMcpService(build_container(Settings(METADATA_PROVIDER="memory")))
+    sql = "SELECT 1"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        max_export_rows=max_export_rows,
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "invalid_export_row_limit"
 
 
 def test_plain_query_does_not_receive_export_row_override(monkeypatch) -> None:

@@ -1,8 +1,9 @@
 import os
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
+from pydantic import Field
 
 from ksher_agent_data_mcp import __version__
 from ksher_agent_data_mcp.config import get_settings
@@ -113,7 +114,7 @@ def export_query_to_excel_file(
     query_plan_id: str,
     datasource: Literal["tchouse-c"] = "tchouse-c",
     filename: str | None = None,
-    max_export_rows: int | None = None,
+    max_export_rows: Annotated[int, Field(ge=1)] | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Export a validated read-only query to a local Excel file artifact."""
