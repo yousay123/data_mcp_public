@@ -685,6 +685,36 @@ try {
         } },
       },
     };
+    const scheduleMismatchCaller = {
+      requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+      requestLarkAppId: 'cli_test', source: 'schedule_creator',
+      taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
+    };
+    const nearPrefixScheduleCalls = [
+      ['schedule:9567729:x', 28],
+      ['schedule:956772990:x', 29],
+    ].map(([turnId, id]) => ({
+      jsonrpc: '2.0', id, method: 'tools/call',
+      params: {
+        name: 'validate_sql_for_user',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+        _meta: { botmuxTrustedCaller: { ...scheduleMismatchCaller, turnId } },
+      },
+    }));
+    const mismatchedScheduleToolCalls = [
+      ['refresh_metadata_snapshot', {}, 30],
+      ['search_metadata_snapshot', { query: '账单' }, 31],
+      ['inspect_ck_subjects_by_table', { target_tables: ['demo.orders'] }, 32],
+      ['inspect_ck_resources_by_subject', { target_accounts: ['demo_user'] }, 33],
+      ['audit_ck_default_role_baseline', {}, 34],
+    ].map(([name, arguments_, id]) => ({
+      jsonrpc: '2.0', id, method: 'tools/call',
+      params: {
+        name,
+        arguments: arguments_,
+        _meta: { botmuxTrustedCaller: scheduleMismatchCaller },
+      },
+    }));
     const forgedScheduleCall = {
       jsonrpc: '2.0',
       id: 9,
@@ -888,6 +918,8 @@ try {
       spoofedScheduleTurnCall,
       mismatchedScheduleFrozenCall,
       missingScheduleTurnCall,
+      ...nearPrefixScheduleCalls,
+      ...mismatchedScheduleToolCalls,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
@@ -1045,6 +1077,24 @@ try {
     const missingScheduleTurnText = byId.get(27)?.result?.content?.[0]?.text ?? '';
     if (!missingScheduleTurnText.includes('schedule_turn_identity_mismatch')) {
       fail('schedule_creator callers must carry a matching schedule turn id');
+    }
+    for (const id of [28, 29]) {
+      const nearPrefixMismatchText = byId.get(id)?.result?.content?.[0]?.text ?? '';
+      if (!nearPrefixMismatchText.includes('schedule_turn_identity_mismatch')) {
+        fail('schedule task ids must match exactly, not by either-direction prefix');
+      }
+    }
+    for (const [id, name] of [
+      [30, 'refresh_metadata_snapshot'],
+      [31, 'search_metadata_snapshot'],
+      [32, 'inspect_ck_subjects_by_table'],
+      [33, 'inspect_ck_resources_by_subject'],
+      [34, 'audit_ck_default_role_baseline'],
+    ]) {
+      const toolMismatchText = byId.get(id)?.result?.content?.[0]?.text ?? '';
+      if (!toolMismatchText.includes('schedule_turn_identity_mismatch')) {
+        fail(`${name} must reject mismatched schedule task/turn identity at the shared entry guard`);
+      }
     }
     const forgedScheduleText = byId.get(9)?.result?.content?.[0]?.text ?? '';
     if (!forgedScheduleText.includes('trusted_human_or_schedule_required') || forgedScheduleText.includes('task_forged')) {
