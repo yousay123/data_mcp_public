@@ -605,8 +605,84 @@ try {
             requestLarkAppId: 'cli_test',
             source: 'schedule_creator',
             taskId: 'task_123',
+            turnId: 'schedule:task_123:turn-1',
           },
         },
+      },
+    };
+    const mismatchedScheduleValidateCall = {
+      jsonrpc: '2.0', id: 22, method: 'tools/call',
+      params: {
+        name: 'validate_sql_for_user',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+          requestLarkAppId: 'cli_test', source: 'schedule_creator',
+          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
+        } },
+      },
+    };
+    const mismatchedScheduleRunCall = {
+      jsonrpc: '2.0', id: 23, method: 'tools/call',
+      params: {
+        name: 'run_query_for_user',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c', query_plan_id: 'qp_test' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+          requestLarkAppId: 'cli_test', source: 'schedule_creator',
+          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
+        } },
+      },
+    };
+    const mismatchedScheduleExportCall = {
+      jsonrpc: '2.0', id: 24, method: 'tools/call',
+      params: {
+        name: 'export_query_to_excel_file',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c', query_plan_id: 'qp_test' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+          requestLarkAppId: 'cli_test', source: 'schedule_creator',
+          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
+        } },
+      },
+    };
+    const spoofedScheduleTurnCall = {
+      jsonrpc: '2.0', id: 25, method: 'tools/call',
+      params: {
+        name: 'validate_sql_for_user',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+          requestLarkAppId: 'cli_test', senderType: 'user', source: 'gateway_meta',
+          turnId: 'schedule:95677299:turn-1',
+        } },
+      },
+    };
+    const mismatchedScheduleFrozenCall = {
+      jsonrpc: '2.0', id: 26, method: 'tools/call',
+      params: {
+        name: 'frozen_query_raw',
+        arguments: {
+          payload: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+          parameters: [],
+          values: {},
+        },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+          requestLarkAppId: 'cli_test', source: 'schedule_creator',
+          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
+        } },
+      },
+    };
+    const missingScheduleTurnCall = {
+      jsonrpc: '2.0', id: 27, method: 'tools/call',
+      params: {
+        name: 'validate_sql_for_user',
+        arguments: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
+          requestLarkAppId: 'cli_test', source: 'schedule_creator', taskId: '95677299',
+        } },
       },
     };
     const forgedScheduleCall = {
@@ -806,6 +882,12 @@ try {
       emptySubjectScopeCall,
       excessiveTableScopeCall,
       invalidDatasourceCall,
+      mismatchedScheduleValidateCall,
+      mismatchedScheduleRunCall,
+      mismatchedScheduleExportCall,
+      spoofedScheduleTurnCall,
+      mismatchedScheduleFrozenCall,
+      missingScheduleTurnCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
@@ -945,6 +1027,24 @@ try {
     const scheduleCreatorText = byId.get(8)?.result?.content?.[0]?.text ?? '';
     if (!scheduleCreatorText.includes('"status":"success"') && !scheduleCreatorText.includes('"status": "success"')) {
       fail('MCP server must allow schedule_creator callers when taskId is present');
+    }
+    for (const id of [22, 23, 24, 26]) {
+      const mismatchText = byId.get(id)?.result?.content?.[0]?.text ?? '';
+      if (
+        !mismatchText.includes('schedule_turn_identity_mismatch')
+        || !mismatchText.includes('95677299')
+        || !mismatchText.includes('schedule:4e177326:3542f551-test')
+      ) {
+        fail('query and export tools must reject mismatched schedule task/turn identity with an explicit reason');
+      }
+    }
+    const spoofedScheduleTurnText = byId.get(25)?.result?.content?.[0]?.text ?? '';
+    if (!spoofedScheduleTurnText.includes('schedule_turn_source_mismatch')) {
+      fail('schedule turn ids must require caller_source=schedule_creator');
+    }
+    const missingScheduleTurnText = byId.get(27)?.result?.content?.[0]?.text ?? '';
+    if (!missingScheduleTurnText.includes('schedule_turn_identity_mismatch')) {
+      fail('schedule_creator callers must carry a matching schedule turn id');
     }
     const forgedScheduleText = byId.get(9)?.result?.content?.[0]?.text ?? '';
     if (!forgedScheduleText.includes('trusted_human_or_schedule_required') || forgedScheduleText.includes('task_forged')) {
@@ -1187,6 +1287,7 @@ try {
               requestLarkAppId: 'cli_test',
               source: 'schedule_creator',
               taskId: 'task_test',
+              turnId: 'schedule:task_test:turn-1',
             },
           },
         },

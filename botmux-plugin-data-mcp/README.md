@@ -47,6 +47,13 @@ identity must come only from Botmux MCP Gateway per-turn metadata:
 Gateway metadata is the sole trusted identity source. If it is absent, Data
 MCP tools fail closed; there is no second identity source.
 
+Scheduled data access also binds the trusted creator identity to the active
+turn. A `schedule_creator` caller is accepted only when `turnId` has the form
+`schedule:<taskId>:<turn>` and its embedded task id exactly matches the trusted
+`taskId`. Conversely, a `schedule:` turn is rejected unless its trusted caller
+source is `schedule_creator`. This prevents a scheduled input adopted into an
+already-active turn from using that turn's preserved caller identity.
+
 Query plans additionally bind to a host-injected execution context. The wrapper
 prefers a non-empty `BOTMUX_SESSION_ID` and otherwise uses a non-empty
 `BOTMUX_EXECUTION_ID` for sessionless execution. It reads both values only from

@@ -111,6 +111,8 @@ The plugin MCP server exposes:
 
 All three inspection results are explicitly marked `scope=single_endpoint`: they describe the entry-point node view, not cluster-global fact. The deployment union-id allowlist applies only to these three tools. It must not gate normal query, export, metadata refresh, or metadata search tools. A trusted `schedule_creator` turn with an owner identity may use the tools; ownerless scheduled/CLI work must fail closed.
 
+For scheduled data access, trusted identity and turn provenance must agree: `callerSource=schedule_creator` requires `turnId=schedule:<taskId>:<turn>` with an exact task-id match, while any `schedule:` turn without `schedule_creator` is rejected. Do not retry or rewrite a rejected mismatched turn; wait for an isolated turn or use a separate topic session.
+
 The plugin itself must not implement business SQL parsing beyond basic required
 argument checks. If the Data MCP service is unavailable or trusted identity is
 missing, fail closed.

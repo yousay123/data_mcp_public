@@ -229,6 +229,47 @@ function isTrustedHumanOrSchedule(caller) {
   return senderType === 'user' || (scheduleSource && !!caller.taskId);
 }
 
+function scheduleTurnBindingIssue(caller) {
+  const scheduleSource = caller.callerSource === 'schedule_creator';
+  const turnId = typeof caller.turnId === 'string' ? caller.turnId : '';
+  const taskId = typeof caller.taskId === 'string' ? caller.taskId : '';
+
+  if (scheduleSource) {
+    const scheduledTurn = /^schedule:([^:]+):(.+)$/.exec(turnId);
+    if (!taskId || !scheduledTurn || scheduledTurn[1] !== taskId) {
+      return {
+        status: 'validation_error',
+        result_class: 'policy_error',
+        message: '定时任务身份与当前执行轮次不一致，拒绝访问 Data MCP',
+        issues: [{
+          code: 'schedule_turn_identity_mismatch',
+          severity: 'error',
+          message: 'caller_source=schedule_creator 时，turn_id 必须是 schedule:<task_id>:<turn>，且 task_id 必须完全一致',
+          suggested_action: '请等待当前会话空闲后重试，或为不同创建人的定时任务使用独立话题会话',
+        }],
+        permission_scope: 'user_identity',
+        audit_context: auditContext(caller),
+      };
+    }
+  } else if (turnId.startsWith('schedule:')) {
+    return {
+      status: 'validation_error',
+      result_class: 'policy_error',
+      message: '定时任务轮次缺少可信 schedule_creator 身份来源，拒绝访问 Data MCP',
+      issues: [{
+        code: 'schedule_turn_source_mismatch',
+        severity: 'error',
+        message: 'turn_id 以 schedule: 开头时，caller_source 必须是 schedule_creator',
+        suggested_action: '请由 Botmux 定时任务宿主重新注入可信调用身份',
+      }],
+      permission_scope: 'user_identity',
+      audit_context: auditContext(caller),
+    };
+  }
+
+  return null;
+}
+
 function callerPolicyIssue(caller) {
   if (!isTrustedHumanOrSchedule(caller)) {
     return {
@@ -861,6 +902,14 @@ async function handleToolCall(request) {
       queryPlanContextSource: trustedQueryPlanContext()?.source ?? null,
     }));
     return;
+  }
+
+  if (name !== 'data_mcp_query_plan') {
+    const bindingIssue = scheduleTurnBindingIssue(caller);
+    if (bindingIssue) {
+      ok(request.id, jsonTool(bindingIssue));
+      return;
+    }
   }
 
   if (name === 'data_mcp_query_plan') {
