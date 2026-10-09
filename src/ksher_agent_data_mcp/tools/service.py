@@ -608,6 +608,15 @@ class DataMcpService:
             )
             return plan_error
         assert plan_run is not None
+        configured_limit = self.container.settings.export_max_rows
+        limit = (
+            min(max_export_rows, configured_limit)
+            if max_export_rows is not None
+            else configured_limit
+        )
+        # Fetch one sentinel row beyond the export ceiling. This distinguishes an
+        # exact-limit complete result from a larger result without materializing
+        # the full oversized query.
         result = self._execute_sql_for_user(
             user,
             sql,
@@ -615,6 +624,7 @@ class DataMcpService:
             request_user_tchouse_account,
             audit_context,
             plan_run.repair_chain_id,
+            result_max_rows=limit + 1,
         )
         result = self._attach_repair_chain(result, plan_run.repair_chain_id)
         self._audit_query_plan_execution(
@@ -623,18 +633,16 @@ class DataMcpService:
         result = self._attach_query_plan_run(result, plan_run)
         if result.get("status") != Status.SUCCESS:
             return result
-        if result.get("truncated"):
-            return export_validation_error(
-                "查询结果已被截断，拒绝导出不完整 Excel；请缩小查询范围或补充更严格过滤条件",
-                "query_result_truncated",
-            )
-
         row_count = int(result.get("row_count") or 0)
-        limit = max_export_rows or self.container.settings.export_max_rows
         if row_count > limit:
             return export_validation_error(
                 f"导出行数 {row_count} 超过当前上限 {limit}，请缩小范围或由运维调整 DATA_MCP_EXPORT_MAX_ROWS",
                 "export_row_limit_exceeded",
+            )
+        if result.get("truncated"):
+            return export_validation_error(
+                "查询结果已被截断，拒绝导出不完整 Excel；请缩小查询范围或补充更严格过滤条件",
+                "query_result_truncated",
             )
 
         export_id = new_export_id()
@@ -1023,6 +1031,7 @@ class DataMcpService:
         request_user_tchouse_account: str | None,
         audit_context: AuditContext | None,
         repair_chain_id: str | None = None,
+        result_max_rows: int | None = None,
     ) -> dict[str, Any]:
         credential = self._resolve_credential(user, datasource)
         if isinstance(credential, dict):
@@ -1031,12 +1040,20 @@ class DataMcpService:
         if account_error is not None:
             return account_error
 
+        guard_kwargs: dict[str, Any] = {
+            "credential": credential,
+            "max_rows": (
+                None if result_max_rows is not None else self._query_max_rows(audit_context)
+            ),
+        }
+        if result_max_rows is not None:
+            guard_kwargs["max_rows_ceiling"] = result_max_rows
+            guard_kwargs["default_rows"] = result_max_rows
         validation = self.container.sql_guard.validate(
             user,
             sql,
             datasource,
-            credential=credential,
-            max_rows=self._query_max_rows(audit_context),
+            **guard_kwargs,
         )
         if validation.status != Status.SUCCESS or validation.normalized_sql is None:
             audit_logger.emit(
@@ -1061,11 +1078,14 @@ class DataMcpService:
             self._attach_sql_account_binding(response, credential)
             return response
 
-        result = self.container.executor.run(
-            credential=credential,
-            sql=validation.normalized_sql,
-            timeout_seconds=self.container.settings.query_timeout_seconds,
-        )
+        executor_kwargs: dict[str, Any] = {
+            "credential": credential,
+            "sql": validation.normalized_sql,
+            "timeout_seconds": self.container.settings.query_timeout_seconds,
+        }
+        if result_max_rows is not None:
+            executor_kwargs["max_rows"] = result_max_rows
+        result = self.container.executor.run(**executor_kwargs)
         audit_logger.emit(
             AuditEvent(
                 event_type="select",

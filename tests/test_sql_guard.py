@@ -478,6 +478,36 @@ def test_caller_specific_limit_is_stricter_than_service_max_rows() -> None:
     assert result.normalized_sql.endswith("LIMIT 20")
 
 
+def test_explicit_service_ceiling_can_raise_only_the_internal_export_limit() -> None:
+    guard = SqlGuard(
+        settings=Settings(REQUIRE_PARTITION_FILTER=False, DEFAULT_LIMIT=100, MAX_ROWS=1000),
+        catalog=MemoryMetadataCatalog(),
+    )
+
+    normal = guard.validate(
+        _user(), "SELECT dt FROM dwd.dwd_payment_order_di LIMIT 100001"
+    )
+    export = guard.validate(
+        _user(),
+        "SELECT dt FROM dwd.dwd_payment_order_di LIMIT 100001",
+        max_rows_ceiling=100001,
+    )
+
+    assert normal.normalized_sql is not None
+    assert normal.normalized_sql.endswith("LIMIT 1000")
+    assert export.normalized_sql is not None
+    assert export.normalized_sql.endswith("LIMIT 100001")
+
+    export_without_limit = guard.validate(
+        _user(),
+        "SELECT dt FROM dwd.dwd_payment_order_di",
+        max_rows_ceiling=100001,
+        default_rows=100001,
+    )
+    assert export_without_limit.normalized_sql is not None
+    assert export_without_limit.normalized_sql.endswith("LIMIT 100001")
+
+
 def test_dynamic_catalog_access_denied_returns_permission_denied() -> None:
     guard = SqlGuard(
         settings=Settings(REQUIRE_PARTITION_FILTER=False),

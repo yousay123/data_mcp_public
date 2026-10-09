@@ -42,6 +42,7 @@ class QueryExecutor(ABC):
         credential: CredentialRef,
         sql: str,
         timeout_seconds: int,
+        max_rows: int | None = None,
     ) -> QueryResult:
         """Run a validated read-only query using the resolved user credential."""
 
@@ -55,6 +56,7 @@ class DryRunQueryExecutor(QueryExecutor):
         credential: CredentialRef,
         sql: str,
         timeout_seconds: int,
+        max_rows: int | None = None,
     ) -> QueryResult:
         started = time.perf_counter()
         return QueryResult(
@@ -95,8 +97,10 @@ class TChouseCQueryExecutor(QueryExecutor):
         credential: CredentialRef,
         sql: str,
         timeout_seconds: int,
+        max_rows: int | None = None,
     ) -> QueryResult:
         started = time.perf_counter()
+        effective_max_rows = max_rows or self.settings.max_rows
         if credential.datasource != "tchouse-c":
             return QueryResult(
                 status=Status.ERROR,
@@ -134,7 +138,7 @@ class TChouseCQueryExecutor(QueryExecutor):
                     "max_rows_to_read": str(self.settings.query_max_rows_to_read),
                     "max_bytes_to_read": str(self.settings.query_max_bytes_to_read),
                     "max_memory_usage": str(self.settings.query_max_memory_bytes),
-                    "max_result_rows": str(self.settings.max_rows),
+                    "max_result_rows": str(effective_max_rows),
                     "result_overflow_mode": "throw",
                 },
             )
@@ -208,7 +212,7 @@ class TChouseCQueryExecutor(QueryExecutor):
         ]
         row_count = int(payload.get("rows", len(rows)))
         statistics = payload.get("statistics") or {}
-        truncated = len(rows) >= self.settings.max_rows or len(rows) < row_count
+        truncated = len(rows) >= effective_max_rows or len(rows) < row_count
         warnings = []
         if truncated:
             warnings.append("返回结果可能被 LIMIT 或服务最大行数限制截断")

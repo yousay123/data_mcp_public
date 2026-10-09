@@ -2,19 +2,24 @@ import hashlib
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from zipfile import ZipFile
 
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.export import ExportError, LocalExportWriter, build_xlsx_bytes
-from ksher_agent_data_mcp.models.contracts import ColumnMeta, Status
+from ksher_agent_data_mcp.models.contracts import ColumnMeta, QueryResult, Status
 from ksher_agent_data_mcp.tools import service as service_module
 from ksher_agent_data_mcp.tools.service import DataMcpService
 
 APP_ID = "cli_example"
 SESSION_ID = "session_example"
 HUMAN_AUDIT_CONTEXT = {"sender_type": "user", "session_id": SESSION_ID}
+
+
+def test_export_default_row_limit_is_one_hundred_thousand() -> None:
+    assert Settings().export_max_rows == 100_000
 
 
 def test_export_sql_account_binding_preserves_unresolved_reason() -> None:
@@ -312,6 +317,195 @@ def test_export_query_to_excel_file_rejects_large_result(monkeypatch) -> None:
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "export_row_limit_exceeded"
+
+
+def test_export_allows_exact_configured_limit_and_probes_one_extra_row(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                METADATA_PROVIDER="memory",
+                DATA_MCP_EXPORT_MAX_ROWS=100_000,
+                DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+            )
+        )
+    )
+    seen = {}
+
+    def fake_execute(*args, **kwargs):
+        seen.update(kwargs)
+        return {
+            "status": Status.SUCCESS,
+            "query_id": "q_exact_limit",
+            "datasource": "tchouse-c",
+            "sql": "SELECT number FROM numbers(100000) LIMIT 100000",
+            "columns": [{"name": "number", "type": "UInt64"}],
+            "rows": [{"number": 1}],
+            "row_count": 100_000,
+            "truncated": False,
+            "tables": [],
+        }
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT number FROM numbers(100000) LIMIT 100000"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert seen["result_max_rows"] == 100_001
+
+
+def test_export_without_limit_can_return_more_than_default_query_rows(tmp_path: Path) -> None:
+    class RowsExecutor:
+        sql = ""
+        max_rows = None
+
+        def run(self, credential, sql, timeout_seconds, max_rows=None):
+            self.sql = sql
+            self.max_rows = max_rows
+            rows = [{"number": number} for number in range(1001)]
+            return QueryResult(
+                status=Status.SUCCESS,
+                query_id="q_no_limit_export",
+                datasource=credential.datasource,
+                sql=sql,
+                columns=[ColumnMeta(name="number", type="UInt64")],
+                rows=rows,
+                row_count=len(rows),
+                truncated=False,
+            )
+
+    settings = Settings(
+        METADATA_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE=Path("examples/credentials.example.json"),
+        REQUIRE_PARTITION_FILTER=False,
+        DATA_MCP_EXPORT_MAX_ROWS=100_000,
+        DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+    )
+    executor = RowsExecutor()
+    service = DataMcpService(replace(build_container(settings), executor=executor))
+    sql = "SELECT arrayJoin(range(1001)) AS number"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["file"]["row_count"] == 1001
+    assert executor.sql.endswith("LIMIT 100001")
+    assert executor.max_rows == 100_001
+
+
+def test_export_rejects_one_row_over_configured_limit_before_truncation(monkeypatch) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(METADATA_PROVIDER="memory", DATA_MCP_EXPORT_MAX_ROWS=100_000)
+        )
+    )
+    seen = {}
+
+    def fake_execute(*args, **kwargs):
+        seen.update(kwargs)
+        return {
+            "status": Status.SUCCESS,
+            "query_id": "q_over_limit",
+            "datasource": "tchouse-c",
+            "sql": "SELECT number FROM numbers(100001) LIMIT 100001",
+            "columns": [{"name": "number", "type": "UInt64"}],
+            "rows": [{"number": 1}],
+            "row_count": 100_001,
+            "truncated": True,
+            "tables": [],
+        }
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT number FROM numbers(100001) LIMIT 100001"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        max_export_rows=200_000,
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "export_row_limit_exceeded"
+    assert "100000" in result["message"]
+    assert seen["result_max_rows"] == 100_001
+
+
+def test_plain_query_does_not_receive_export_row_override(monkeypatch) -> None:
+    service = DataMcpService(build_container(Settings(METADATA_PROVIDER="memory")))
+    seen = {}
+
+    def fake_execute(*args, **kwargs):
+        seen.update(kwargs)
+        return {
+            "status": Status.SUCCESS,
+            "query_id": "q_plain",
+            "datasource": "tchouse-c",
+            "sql": "SELECT 1",
+            "columns": [{"name": "1", "type": "UInt8"}],
+            "rows": [{"1": 1}],
+            "row_count": 1,
+            "truncated": False,
+            "tables": [],
+        }
+
+    monkeypatch.setattr(service, "_execute_sql_for_user", fake_execute)
+    sql = "SELECT 1"
+
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert "result_max_rows" not in seen
 
 
 def test_export_query_to_excel_file_does_not_create_file_for_plain_query(monkeypatch) -> None:

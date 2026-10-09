@@ -69,6 +69,27 @@ def test_tchouse_c_executor_converts_json_response(monkeypatch) -> None:
     assert seen_settings["result_overflow_mode"] == "throw"
 
 
+def test_tchouse_c_executor_uses_per_call_export_row_limit(monkeypatch) -> None:
+    seen_settings = {}
+
+    def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
+        seen_settings.update(query_settings or {})
+        return {
+            "meta": [{"name": "number", "type": "UInt64"}],
+            "data": [{"number": 1}],
+            "rows": 1,
+        }
+
+    monkeypatch.setattr(query_executor, "execute_clickhouse_json", fake_execute_clickhouse_json)
+    executor = TChouseCQueryExecutor(Settings(MAX_ROWS=1000))
+
+    result = executor.run(_credential(), "SELECT 1 AS number", 30, max_rows=100001)
+
+    assert result.status == Status.SUCCESS
+    assert not result.truncated
+    assert seen_settings["max_result_rows"] == "100001"
+
+
 def test_tchouse_c_executor_rejects_other_datasource() -> None:
     executor = TChouseCQueryExecutor(Settings())
 

@@ -123,9 +123,13 @@ class SqlGuard:
         datasource: str = "tchouse-c",
         credential: CredentialRef | None = None,
         max_rows: int | None = None,
+        max_rows_ceiling: int | None = None,
+        default_rows: int | None = None,
     ) -> SqlValidationResult:
         issues: list[ValidationIssue] = []
-        effective_max_rows = min(max_rows or self.settings.max_rows, self.settings.max_rows)
+        service_ceiling = max_rows_ceiling or self.settings.max_rows
+        effective_max_rows = min(max_rows or service_ceiling, service_ceiling)
+        effective_default_rows = min(default_rows or self.settings.default_limit, effective_max_rows)
         datasource = datasource.lower()
         if datasource != SUPPORTED_DATASOURCE:
             issues.append(
@@ -272,7 +276,7 @@ class SqlGuard:
             issues.extend(self._partition_issues(expression, datasource, tables, table_metas))
 
         normalized_sql, limit_was_injected, limit_was_capped = self._bounded_sql(
-            expression, effective_max_rows
+            expression, effective_max_rows, effective_default_rows
         )
         if limit_was_injected:
             issues.append(
@@ -281,7 +285,7 @@ class SqlGuard:
                     severity="warning",
                     message=(
                         "SQL 未显式限制返回行数，服务将追加 LIMIT "
-                        f"{min(self.settings.default_limit, effective_max_rows)}"
+                        f"{effective_default_rows}"
                     ),
                 )
             )
@@ -434,13 +438,12 @@ class SqlGuard:
         )
 
     def _bounded_sql(
-        self, expression: exp.Expression, max_rows: int
+        self, expression: exp.Expression, max_rows: int, default_rows: int
     ) -> tuple[str, bool, bool]:
         bounded = expression.copy()
         root_limit = bounded.args.get("limit")
         if root_limit is None:
-            output_limit = min(self.settings.default_limit, max_rows)
-            bounded.set("limit", exp.Limit(expression=exp.Literal.number(output_limit)))
+            bounded.set("limit", exp.Limit(expression=exp.Literal.number(default_rows)))
             return self._normalize_sql(bounded), True, False
 
         limit_expression = root_limit.args.get("expression")
