@@ -58,6 +58,7 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
     }
     assert payload["http_identity"]["dev_insecure_override"] is False
     assert payload["http_identity"]["dev_insecure_override_supported"] is False
+    assert payload["http_identity"]["auth"] == "x-internal-auth"
     serialized = str(payload)
     for hidden in (
         "accepted_argument_aliases",
@@ -70,9 +71,13 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
         assert hidden not in serialized
 
 
-def test_http_identity_endpoint_is_disabled_without_internal_auth(monkeypatch) -> None:
+@pytest.mark.parametrize("serving_unix_socket", [False, True])
+def test_http_identity_endpoint_is_disabled_without_internal_auth(
+    monkeypatch, serving_unix_socket: bool
+) -> None:
     monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
     monkeypatch.delenv(REMOVED_INSECURE_ENV, raising=False)
+    monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", serving_unix_socket)
 
     response = TestClient(app).post(
         "/agent/validate-sql",
@@ -83,12 +88,16 @@ def test_http_identity_endpoint_is_disabled_without_internal_auth(monkeypatch) -
     )
 
     assert response.status_code == 503
-    assert "HTTP identity endpoints disabled" in response.text
+    assert "Internal identity endpoints disabled" in response.text
 
 
-def test_http_identity_endpoint_rejects_wrong_internal_auth(monkeypatch) -> None:
+@pytest.mark.parametrize("serving_unix_socket", [False, True])
+def test_http_identity_endpoint_rejects_wrong_internal_auth(
+    monkeypatch, serving_unix_socket: bool
+) -> None:
     monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "expected-token")
     monkeypatch.delenv(REMOVED_INSECURE_ENV, raising=False)
+    monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", serving_unix_socket)
 
     response = TestClient(app).post(
         "/agent/run-query",
@@ -100,6 +109,26 @@ def test_http_identity_endpoint_rejects_wrong_internal_auth(monkeypatch) -> None
     )
 
     assert response.status_code == 401
+
+
+def test_unix_socket_identity_endpoint_accepts_correct_internal_auth(monkeypatch) -> None:
+    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "expected-token")
+    monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", True)
+    captured: dict[str, Any] = {}
+
+    def fake_validate(*args, **kwargs):
+        captured["args"] = args
+        return {"status": "success"}
+
+    monkeypatch.setattr(api_module.service, "validate_sql_for_user", fake_validate)
+    response = TestClient(app).post(
+        "/agent/validate-sql",
+        headers={"X-Internal-Auth": "expected-token"},
+        json={"request_user_union_id": "on_user", "sql": "SELECT 1"},
+    )
+
+    assert response.status_code == 200
+    assert captured["args"][0] == "on_user"
 
 
 @pytest.mark.parametrize("max_export_rows", [0, -1])

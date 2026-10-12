@@ -110,15 +110,13 @@ def require_internal_http_auth(
     request: Request,
     x_internal_auth: str | None = Header(default=None, alias=INTERNAL_AUTH_HEADER),
 ) -> None:
-    """HTTP identity endpoints are not the production agent trust boundary."""
-    if _SERVING_UNIX_SOCKET:
-        return
+    """Require a host-only shared secret on every identity-bearing endpoint."""
     expected = os.getenv(INTERNAL_AUTH_ENV)
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "HTTP identity endpoints disabled: set DATA_MCP_INTERNAL_AUTH_TOKEN "
+                "Internal identity endpoints disabled: set DATA_MCP_INTERNAL_AUTH_TOKEN "
                 "for service-to-service use"
             ),
         )
@@ -146,7 +144,7 @@ def health() -> dict[str, Any]:
             "transport": "tcp" if _tcp_bind_enabled() else "unix_socket",
             "socket_path_configured": bool(_socket_path()),
             "enabled": _tcp_bind_enabled() or bool(_socket_path()),
-            "auth": "unix-socket-permission" if not _tcp_bind_enabled() else "x-internal-auth",
+            "auth": "x-internal-auth",
             "dev_insecure_override": False,
             "dev_insecure_override_supported": False,
         },

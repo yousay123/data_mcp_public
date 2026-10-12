@@ -1209,9 +1209,9 @@ try {
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
           const parsed = JSON.parse(body || '{}');
-          if (req.headers['x-internal-auth']) {
-            res.writeHead(400, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: 'shared_token_used' }] }));
+          if (req.headers['x-internal-auth'] !== 'socket-test-token') {
+            res.writeHead(401, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: 'invalid_internal_auth' }] }));
             return;
           }
           if (req.url === '/agent/search-metadata-snapshot') {
@@ -1443,7 +1443,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
-          DATA_MCP_INTERNAL_AUTH_TOKEN: 'token-that-must-not-be-sent-over-uds',
+          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
         },
       });
       if (socketProbe.status !== 0) fail(`template MCP Unix socket probe failed: ${socketProbe.stderr}`);
@@ -1454,7 +1454,7 @@ try {
         .map(line => JSON.parse(line));
       const socketText = socketResponses.find(response => response.id === 13)?.result?.content?.[0]?.text ?? '';
       if (!socketText.includes('"transport": "unix_socket"')) {
-        fail('MCP server must call Data MCP service over Unix socket without forwarding a shared token');
+        fail('MCP server must authenticate Data MCP service calls over Unix socket');
       }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
       if (!searchText.includes('/agent/search-metadata-snapshot')) {
@@ -1536,6 +1536,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
+          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
         },
       });
       if (executionProbe.status !== 0) {
@@ -1576,6 +1577,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
+          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
         },
       });
       if (precedenceProbe.status !== 0) {

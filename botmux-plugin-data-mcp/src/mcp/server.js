@@ -491,7 +491,7 @@ function postJsonOverUnixSocket(socketPath, path, payload) {
       path,
       method: 'POST',
       headers: {
-        'content-type': 'application/json',
+        ...serviceHeaders(),
         'content-length': Buffer.byteLength(body),
       },
     }, (res) => {

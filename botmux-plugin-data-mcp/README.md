@@ -125,7 +125,8 @@ Environment contract:
 - `DATA_MCP_QUERY_ENDPOINT`
   - Backward-compatible alias for `DATA_MCP_RUN_QUERY_ENDPOINT`.
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
-  - Optional service-to-service token sent as `X-Internal-Auth`.
+  - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
+  - Keep it in host-only configuration; never expose it to an agent sandbox or model-visible arguments.
 
 For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. For `frozen_query_raw`, Botmux
