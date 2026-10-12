@@ -285,6 +285,8 @@ def test_runtime_diagnostics_is_not_agent_visible_and_health_hides_aliases() -> 
 def test_standalone_stdio_refuses_to_start_without_opt_in() -> None:
     env = os.environ.copy()
     env.pop("KSHER_AGENT_DATA_MCP_ENABLE_STANDALONE_STDIO", None)
+    env.pop("DATA_MCP_INTERNAL_AUTH_TOKEN", None)
+    env.pop("TCHOUSE_D_PASSWORD", None)
 
     proc = subprocess.run(
         [sys.executable, "-m", "ksher_agent_data_mcp.server"],
@@ -330,6 +332,8 @@ def test_tool_call_missing_identity_does_not_disclose_field_names() -> None:
 def test_imported_mcp_run_refuses_without_opt_in() -> None:
     env = os.environ.copy()
     env.pop("KSHER_AGENT_DATA_MCP_ENABLE_STANDALONE_STDIO", None)
+    env.pop("DATA_MCP_INTERNAL_AUTH_TOKEN", None)
+    env.pop("TCHOUSE_D_PASSWORD", None)
 
     proc = subprocess.run(
         [

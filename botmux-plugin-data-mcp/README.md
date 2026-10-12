@@ -126,7 +126,13 @@ Environment contract:
   - Backward-compatible alias for `DATA_MCP_RUN_QUERY_ENDPOINT`.
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
-  - Keep it in host-only configuration; never expose it to an agent sandbox or model-visible arguments.
+  - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
+
+The service runner passes only an allowlisted non-sensitive environment to the
+Python API. The API loads private configuration directly from the host-only file
+into its settings object. This is intentional: on supported macOS hosts, file
+isolation does not imply that another same-UID process cannot inspect a process
+environment.
 
 For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. For `frozen_query_raw`, Botmux

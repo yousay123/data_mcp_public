@@ -5,7 +5,8 @@
 ## 安全模型
 
 - 运行时身份必须由可信网关注入，不能接受模型或普通消息自行声明的用户身份。
-- 数据库连接、凭证解析 SQL、元数据来源表等部署参数只通过本机环境或密钥管理系统提供。
+- 数据库连接、凭证解析 SQL、元数据来源表等部署参数只通过 host-only
+  配置文件或密钥管理系统提供。数据库密码和内部鉴权令牌不得放进进程环境或启动参数。
 - 默认只允许只读查询，并限制行数、扫描量、内存、并发与超时。
 - Excel 导出目录会原子写入 `receipt.json` sidecar，记录可信调用身份、请求/执行 SQL
   哈希、查询与文件摘要及数据版本状态。当前默认数据版本提供方为 `unavailable`，
@@ -30,13 +31,12 @@ pytest
 
 ```bash
 cp .env.example .env
-set -a
-. ./.env
-set +a
-ksher-agent-data-mcp
+KSHER_AGENT_DATA_MCP_ENV_FILE="$PWD/.env" ksher-agent-data-mcp
 ```
 
-`.env` 已被 Git 忽略。真实环境建议由部署平台直接注入变量，不要把凭证落入源码目录。
+`.env` 已被 Git 忽略。本地命令只把配置文件路径放进环境；不要 `source` 该文件，
+否则密码和内部令牌会被复制进进程环境。生产配置应放在模型沙盒不可读的
+host-only 路径（默认 `~/.config/ksher-agent-data-mcp/env`），不要把凭证落入源码目录。
 
 ## 私有配置
 

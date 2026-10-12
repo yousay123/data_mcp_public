@@ -19,9 +19,6 @@ service = DataMcpService(build_container(settings))
 app = FastAPI(title=settings.server_name, version=__version__)
 
 INTERNAL_AUTH_HEADER = "X-Internal-Auth"
-INTERNAL_AUTH_ENV = "DATA_MCP_INTERNAL_AUTH_TOKEN"
-SOCKET_PATH_ENV = "DATA_MCP_HTTP_SOCKET_PATH"
-TCP_BIND_ENV = "DATA_MCP_HTTP_BIND_TCP"
 _SERVING_UNIX_SOCKET = False
 
 
@@ -111,7 +108,11 @@ def require_internal_http_auth(
     x_internal_auth: str | None = Header(default=None, alias=INTERNAL_AUTH_HEADER),
 ) -> None:
     """Require a host-only shared secret on every identity-bearing endpoint."""
-    expected = os.getenv(INTERNAL_AUTH_ENV)
+    expected = (
+        settings.internal_auth_token.get_secret_value()
+        if settings.internal_auth_token
+        else None
+    )
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -179,13 +180,11 @@ def health() -> dict[str, Any]:
 
 
 def _socket_path() -> str:
-    return os.getenv(SOCKET_PATH_ENV) or str(
-        Path.home() / ".cache" / "ksher-agent-data-mcp" / "run" / "api.sock"
-    )
+    return str(settings.http_socket_path)
 
 
 def _tcp_bind_enabled() -> bool:
-    return os.getenv(TCP_BIND_ENV) in {"1", "true", "TRUE", "yes", "YES"}
+    return settings.http_bind_tcp
 
 
 def _prepare_socket_path(path: str) -> None:

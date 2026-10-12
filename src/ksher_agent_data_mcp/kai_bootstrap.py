@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+from ksher_agent_data_mcp.config import PRIVATE_ENV_FILE_ENV
+
 
 MIN_PYTHON = (3, 11)
 DEFAULT_ENV_FILE = "~/.config/ksher-agent-data-mcp/env"
@@ -22,35 +24,15 @@ PRODUCTION_DEFAULT_ENV = {
 }
 
 
-def _strip_quotes(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
-def _load_env_file(path: Path) -> None:
-    if not path.is_file():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or not key.replace("_", "").isalnum() or key[0].isdigit():
-            continue
-        os.environ[key] = _strip_quotes(value.strip())
-
-
 def _apply_runtime_defaults() -> None:
     for key, value in PRODUCTION_DEFAULT_ENV.items():
         os.environ.setdefault(key, value)
+
+
+def _configure_private_env_file() -> Path:
+    env_file = Path(os.environ.get(PRIVATE_ENV_FILE_ENV, DEFAULT_ENV_FILE)).expanduser()
+    os.environ[PRIVATE_ENV_FILE_ENV] = str(env_file)
+    return env_file
 
 
 def _ensure_supported_python() -> None:
@@ -64,8 +46,7 @@ def _ensure_supported_python() -> None:
 
 def main() -> None:
     _ensure_supported_python()
-    env_file = Path(os.environ.get("KSHER_AGENT_DATA_MCP_ENV_FILE", DEFAULT_ENV_FILE)).expanduser()
-    _load_env_file(env_file)
+    _configure_private_env_file()
     _apply_runtime_defaults()
 
     from ksher_agent_data_mcp.server import main as server_main

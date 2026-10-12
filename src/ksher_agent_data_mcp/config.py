@@ -1,8 +1,16 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PRIVATE_ENV_FILE_ENV = "KSHER_AGENT_DATA_MCP_ENV_FILE"
+SENSITIVE_PROCESS_ENV_KEYS = (
+    "DATA_MCP_INTERNAL_AUTH_TOKEN",
+    "TCHOUSE_D_PASSWORD",
+)
 
 
 class Settings(BaseSettings):
@@ -11,6 +19,15 @@ class Settings(BaseSettings):
     server_name: str = Field(default="ksher-agent-data-mcp", alias="MCP_SERVER_NAME")
     env: str = Field(default="dev", alias="MCP_ENV")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    internal_auth_token: SecretStr | None = Field(
+        default=None,
+        alias="DATA_MCP_INTERNAL_AUTH_TOKEN",
+    )
+    http_socket_path: Path = Field(
+        default=Path.home() / ".cache" / "ksher-agent-data-mcp" / "run" / "api.sock",
+        alias="DATA_MCP_HTTP_SOCKET_PATH",
+    )
+    http_bind_tcp: bool = Field(default=False, alias="DATA_MCP_HTTP_BIND_TCP")
 
     max_rows: int = Field(default=1000, alias="MAX_ROWS", ge=1)
     default_limit: int = Field(default=200, alias="DEFAULT_LIMIT", ge=1)
@@ -137,4 +154,14 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    leaked_keys = [key for key in SENSITIVE_PROCESS_ENV_KEYS if key in os.environ]
+    if leaked_keys:
+        raise RuntimeError(
+            "Data MCP refuses to start with secrets in its process environment; "
+            f"load private configuration through {PRIVATE_ENV_FILE_ENV}"
+        )
+
+    env_file = os.environ.get(PRIVATE_ENV_FILE_ENV)
+    if not env_file:
+        return Settings()
+    return Settings(_env_file=Path(env_file).expanduser(), _env_file_encoding="utf-8")

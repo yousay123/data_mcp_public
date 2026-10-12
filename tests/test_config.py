@@ -1,6 +1,8 @@
+import os
+
 import pytest
 
-from ksher_agent_data_mcp.config import Settings
+from ksher_agent_data_mcp.config import PRIVATE_ENV_FILE_ENV, Settings, get_settings
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.models.contracts import CredentialRef
 
@@ -23,6 +25,61 @@ def test_settings_do_not_read_dotenv_file(tmp_path, monkeypatch) -> None:
 
     assert settings.tchouse_d_username is None
     assert settings.metadata_provider == "tchouse_c"
+
+
+def test_get_settings_reads_explicit_private_env_without_copying_secrets_to_environ(
+    tmp_path, monkeypatch
+) -> None:
+    env_file = tmp_path / "private-env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "DATA_MCP_INTERNAL_AUTH_TOKEN='internal-canary'",
+                "TCHOUSE_D_PASSWORD='database-canary'",
+                "QUERY_TIMEOUT_SECONDS='37'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(PRIVATE_ENV_FILE_ENV, str(env_file))
+    monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("TCHOUSE_D_PASSWORD", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        settings = get_settings()
+        assert settings.internal_auth_token is not None
+        assert settings.internal_auth_token.get_secret_value() == "internal-canary"
+        assert settings.tchouse_d_password is not None
+        assert settings.tchouse_d_password.get_secret_value() == "database-canary"
+        assert settings.query_timeout_seconds == 37
+        assert "DATA_MCP_INTERNAL_AUTH_TOKEN" not in os.environ
+        assert "TCHOUSE_D_PASSWORD" not in os.environ
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "sensitive_key",
+    ["DATA_MCP_INTERNAL_AUTH_TOKEN", "TCHOUSE_D_PASSWORD"],
+)
+def test_get_settings_rejects_secrets_in_process_environment(
+    tmp_path, monkeypatch, sensitive_key: str
+) -> None:
+    env_file = tmp_path / "private-env"
+    env_file.write_text("QUERY_TIMEOUT_SECONDS='37'\n", encoding="utf-8")
+    monkeypatch.setenv(PRIVATE_ENV_FILE_ENV, str(env_file))
+    monkeypatch.setenv(sensitive_key, "process-env-canary")
+    get_settings.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match="refuses to start with secrets") as exc_info:
+            get_settings()
+        assert "process-env-canary" not in str(exc_info.value)
+        assert sensitive_key not in str(exc_info.value)
+    finally:
+        get_settings.cache_clear()
 
 
 def test_settings_do_not_default_warehouse_endpoints(monkeypatch) -> None:

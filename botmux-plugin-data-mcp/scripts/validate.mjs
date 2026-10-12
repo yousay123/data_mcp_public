@@ -238,6 +238,14 @@ try {
       () => validateServiceDefinition(leakedSecret, pkg.botmux),
       'plugin_service_pm2_env_key_not_allowed:data-mcp:DATA_MCP_PASSWORD',
     );
+    for (const sensitiveKey of ['DATA_MCP_INTERNAL_AUTH_TOKEN', 'TCHOUSE_D_PASSWORD']) {
+      const leakedSensitiveKey = structuredClone(serviceDefinition);
+      leakedSensitiveKey.pm2.env[sensitiveKey] = 'process-env-canary';
+      expectFailure(
+        () => validateServiceDefinition(leakedSensitiveKey, pkg.botmux),
+        `plugin_service_pm2_env_key_not_allowed:data-mcp:${sensitiveKey}`,
+      );
+    }
 
     if (serviceDefinition.mode !== 'auto' || pkg.botmux.service?.mode !== 'auto') {
       fail('Data MCP service definition and manifest must both use auto mode');
@@ -270,9 +278,19 @@ try {
       );
       writeFileSync(fakeApi, `#!${process.execPath}
         const http = require('node:http');
-        const { chmodSync, writeFileSync } = require('node:fs');
-        const mode = process.env.FAKE_API_MODE;
-        if (process.env.FAKE_CHILD_PID_FILE) writeFileSync(process.env.FAKE_CHILD_PID_FILE, String(process.pid));
+        const { chmodSync, readFileSync, writeFileSync } = require('node:fs');
+        const privateConfig = {};
+        for (const line of readFileSync(process.env.KSHER_AGENT_DATA_MCP_ENV_FILE, 'utf8').split(/\\r?\\n/)) {
+          const match = line.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)='([^']*)'$/);
+          if (match) privateConfig[match[1]] = match[2];
+        }
+        const mode = privateConfig.FAKE_API_MODE;
+        if (privateConfig.FAKE_CHILD_PID_FILE) writeFileSync(privateConfig.FAKE_CHILD_PID_FILE, String(process.pid));
+        const sensitiveKeys = ['DATA_MCP_INTERNAL_AUTH_TOKEN', 'TCHOUSE_D_PASSWORD'];
+        writeFileSync(
+          process.env.KSHER_AGENT_DATA_MCP_ENV_FILE + '.child-env-report',
+          JSON.stringify(sensitiveKeys.filter(key => Object.hasOwn(process.env, key))),
+        );
         if (mode === 'exit') process.exit(0);
         let server;
         if (mode === 'healthy' || mode === 'hung-health') {
@@ -282,13 +300,13 @@ try {
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok', http_identity: { transport: 'unix_socket' } }));
           });
-          server.listen(process.env.DATA_MCP_HTTP_SOCKET_PATH, () => {
-            const socketMode = Number.parseInt(process.env.FAKE_SOCKET_MODE || '600', 8);
-            chmodSync(process.env.DATA_MCP_HTTP_SOCKET_PATH, socketMode);
-            if (process.env.FAKE_READY_FILE) writeFileSync(process.env.FAKE_READY_FILE, 'ready');
+          server.listen(privateConfig.DATA_MCP_HTTP_SOCKET_PATH, () => {
+            const socketMode = Number.parseInt(privateConfig.FAKE_SOCKET_MODE || '600', 8);
+            chmodSync(privateConfig.DATA_MCP_HTTP_SOCKET_PATH, socketMode);
+            if (privateConfig.FAKE_READY_FILE) writeFileSync(privateConfig.FAKE_READY_FILE, 'ready');
           });
           const stop = signal => {
-            if (process.env.FAKE_TERM_FILE) writeFileSync(process.env.FAKE_TERM_FILE, signal);
+            if (privateConfig.FAKE_TERM_FILE) writeFileSync(privateConfig.FAKE_TERM_FILE, signal);
             server.close(() => process.exit(0));
           };
           process.once('SIGTERM', () => stop('SIGTERM'));
@@ -358,6 +376,32 @@ try {
         () => runnerMod.parseEnvFile('BROKEN=unquoted\n'),
         'Data MCP env key BROKEN must use a single-quoted literal',
       );
+      for (const sensitiveKey of ['DATA_MCP_INTERNAL_AUTH_TOKEN', 'TCHOUSE_D_PASSWORD']) {
+        expectFailure(
+          () => runnerMod.assertNoSensitiveProcessEnv({ [sensitiveKey]: 'process-env-canary' }),
+          'Data MCP service runner refuses secrets in its process environment; use KSHER_AGENT_DATA_MCP_ENV_FILE',
+        );
+      }
+      const sanitizedChildEnv = runnerMod.buildApiChildEnv({
+        HOME: runnerRoot,
+        PATH: process.env.PATH ?? '',
+        DATA_MCP_INTERNAL_AUTH_TOKEN: 'internal-canary',
+        TCHOUSE_D_PASSWORD: 'database-canary',
+        UNRELATED_PARENT_SECRET: 'must-not-be-inherited',
+      }, join(runnerRoot, 'private-env'), join(runnerRoot, 'allowed.sock'));
+      const serializedChildEnv = JSON.stringify(sanitizedChildEnv);
+      if (
+        serializedChildEnv.includes('DATA_MCP_INTERNAL_AUTH_TOKEN')
+        || serializedChildEnv.includes('TCHOUSE_D_PASSWORD')
+        || serializedChildEnv.includes('internal-canary')
+        || serializedChildEnv.includes('database-canary')
+        || serializedChildEnv.includes('UNRELATED_PARENT_SECRET')
+      ) {
+        fail('API child environment must be built from a non-sensitive allowlist');
+      }
+      if (sanitizedChildEnv.DATA_MCP_HTTP_SOCKET_PATH !== join(runnerRoot, 'allowed.sock')) {
+        fail('API child environment must keep the runner-resolved non-sensitive socket path');
+      }
       const runtimeResolvedApi = runnerMod.resolveApiExecutable({
         KSHER_AGENT_DATA_MCP_PYTHON: '/usr/bin/python3.11',
         KSHER_AGENT_DATA_MCP_RUNTIME_HOME: runtimeHome,
@@ -416,6 +460,17 @@ try {
       const earlyExitResult = await waitForExit(earlyExit, 15_000, 'early-exit runner');
       if (earlyExitResult.code === 0) {
         fail('API runner must exit non-zero when its child exits before readiness');
+      }
+
+      const childEnvReport = join(runnerRoot, 'env-isolation', 'env.child-env-report');
+      const envIsolation = spawnRunner('env-isolation', 'exit', {
+        DATA_MCP_INTERNAL_AUTH_TOKEN: 'internal-child-canary',
+        TCHOUSE_D_PASSWORD: 'database-child-canary',
+      }).child;
+      await waitForExit(envIsolation, 15_000, 'env-isolation runner');
+      await waitForFile(childEnvReport);
+      if (readFileSync(childEnvReport, 'utf8') !== '[]') {
+        fail('Python API process environment must not contain internal auth or database secrets');
       }
 
       const pm2ImportedEarlyExit = spawnRunner(
@@ -1292,6 +1347,32 @@ try {
     });
     try {
       await waitForFile(socketReadyFile);
+      const socketHostEnvFile = join(cleanRoot, 'socket-probe-private-env');
+      writeFileSync(socketHostEnvFile, "DATA_MCP_INTERNAL_AUTH_TOKEN='socket-test-token'\n");
+      const rejectedProcessSecret = spawnSync(
+        process.execPath,
+        [join(cleanRoot, 'mcp', 'server.js')],
+        {
+          cwd: cleanRoot,
+          input: '',
+          encoding: 'utf-8',
+          timeout: 5000,
+          env: {
+            ...process.env,
+            KSHER_AGENT_DATA_MCP_ENV_FILE: socketHostEnvFile,
+            DATA_MCP_INTERNAL_AUTH_TOKEN: 'plugin-process-env-canary',
+          },
+        },
+      );
+      if (rejectedProcessSecret.status === 0) {
+        fail('MCP server must refuse to start with internal auth in its process environment');
+      }
+      if (
+        rejectedProcessSecret.stderr.includes('plugin-process-env-canary')
+        || rejectedProcessSecret.stderr.includes('DATA_MCP_INTERNAL_AUTH_TOKEN')
+      ) {
+        fail('MCP server startup failure must not echo sensitive process environment details');
+      }
       const socketCall = {
         jsonrpc: '2.0',
         id: 13,
@@ -1443,7 +1524,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
-          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
+          KSHER_AGENT_DATA_MCP_ENV_FILE: socketHostEnvFile,
         },
       });
       if (socketProbe.status !== 0) fail(`template MCP Unix socket probe failed: ${socketProbe.stderr}`);
@@ -1536,7 +1617,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
-          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
+          KSHER_AGENT_DATA_MCP_ENV_FILE: socketHostEnvFile,
         },
       });
       if (executionProbe.status !== 0) {
@@ -1577,7 +1658,7 @@ try {
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
           DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
-          DATA_MCP_INTERNAL_AUTH_TOKEN: 'socket-test-token',
+          KSHER_AGENT_DATA_MCP_ENV_FILE: socketHostEnvFile,
         },
       });
       if (precedenceProbe.status !== 0) {

@@ -9,8 +9,23 @@ const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
 const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-mcp', 'run', 'api.sock');
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
+const SENSITIVE_PROCESS_ENV_KEYS = [
+  'DATA_MCP_INTERNAL_AUTH_TOKEN',
+  'TCHOUSE_D_PASSWORD',
+];
 let hostEnvCache;
 let packageVersionCache;
+
+function assertNoSensitiveProcessEnv(env = process.env) {
+  if (SENSITIVE_PROCESS_ENV_KEYS.some(key => Object.hasOwn(env, key))) {
+    throw new Error(
+      'Data MCP plugin refuses secrets in its process environment; '
+      + 'use KSHER_AGENT_DATA_MCP_ENV_FILE',
+    );
+  }
+}
+
+assertNoSensitiveProcessEnv();
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -476,7 +491,7 @@ function serviceSocketPath() {
 
 function serviceHeaders() {
   const headers = { 'content-type': 'application/json' };
-  const token = configValue('DATA_MCP_INTERNAL_AUTH_TOKEN');
+  const token = hostEnv().DATA_MCP_INTERNAL_AUTH_TOKEN;
   if (token) {
     headers[INTERNAL_AUTH_HEADER] = token;
   }

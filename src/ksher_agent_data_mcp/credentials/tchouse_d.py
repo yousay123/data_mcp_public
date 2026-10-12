@@ -70,7 +70,7 @@ class TChouseDCredentialResolver(CredentialResolver):
             user_email=user.email,
             tchouse_account=username,
             jdbc_url=build_mysql_jdbc_url(tchouse_d_jdbc_url, username, password),
-            password_secret_ref="env://TCHOUSE_D_PASSWORD",
+            password_secret_ref="settings://TCHOUSE_D_PASSWORD",
             datasource="tchouse-d",
             engine="mysql",
         )

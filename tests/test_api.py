@@ -6,12 +6,21 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from ksher_agent_data_mcp import __version__
 from ksher_agent_data_mcp import api as api_module
 from ksher_agent_data_mcp.api import _bind_unix_socket, app, health, settings
 
 REMOVED_INSECURE_ENV = "DATA_MCP_ALLOW" + "_INSECURE" + "_HTTP" + "_IDENTITY"
+
+
+def set_internal_auth(monkeypatch, value: str | None) -> None:
+    monkeypatch.setattr(
+        api_module.settings,
+        "internal_auth_token",
+        SecretStr(value) if value is not None else None,
+    )
 
 
 def test_runtime_version_matches_project_metadata() -> None:
@@ -75,7 +84,7 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
 def test_http_identity_endpoint_is_disabled_without_internal_auth(
     monkeypatch, serving_unix_socket: bool
 ) -> None:
-    monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
+    set_internal_auth(monkeypatch, None)
     monkeypatch.delenv(REMOVED_INSECURE_ENV, raising=False)
     monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", serving_unix_socket)
 
@@ -95,7 +104,7 @@ def test_http_identity_endpoint_is_disabled_without_internal_auth(
 def test_http_identity_endpoint_rejects_wrong_internal_auth(
     monkeypatch, serving_unix_socket: bool
 ) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "expected-token")
+    set_internal_auth(monkeypatch, "expected-token")
     monkeypatch.delenv(REMOVED_INSECURE_ENV, raising=False)
     monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", serving_unix_socket)
 
@@ -112,7 +121,7 @@ def test_http_identity_endpoint_rejects_wrong_internal_auth(
 
 
 def test_unix_socket_identity_endpoint_accepts_correct_internal_auth(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "expected-token")
+    set_internal_auth(monkeypatch, "expected-token")
     monkeypatch.setattr(api_module, "_SERVING_UNIX_SOCKET", True)
     captured: dict[str, Any] = {}
 
@@ -135,7 +144,7 @@ def test_unix_socket_identity_endpoint_accepts_correct_internal_auth(monkeypatch
 def test_export_endpoint_rejects_nonpositive_row_limit(
     monkeypatch, max_export_rows: int
 ) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
 
     response = TestClient(app).post(
         "/agent/export-query-excel-file",
@@ -152,7 +161,7 @@ def test_export_endpoint_rejects_nonpositive_row_limit(
 
 
 def test_export_endpoint_forwards_expected_source_version(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     captured: dict[str, Any] = {}
 
     def fake_export(*args, **kwargs):
@@ -181,7 +190,7 @@ def test_export_endpoint_forwards_expected_source_version(monkeypatch) -> None:
 
 
 def test_http_identity_endpoint_ignores_removed_insecure_override(monkeypatch) -> None:
-    monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
+    set_internal_auth(monkeypatch, None)
     monkeypatch.setenv(REMOVED_INSECURE_ENV, "1")
 
     response = TestClient(app).post(
@@ -197,7 +206,7 @@ def test_http_identity_endpoint_ignores_removed_insecure_override(monkeypatch) -
 
 
 def test_validate_endpoint_forwards_session_and_execution_mode(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     captured: dict[str, Any] = {}
 
     def fake_validate(*args, **kwargs):
@@ -226,7 +235,7 @@ def test_validate_endpoint_forwards_session_and_execution_mode(monkeypatch) -> N
 
 
 def test_validate_endpoint_rejects_caller_defined_run_count_or_invalid_mode(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     client = TestClient(app)
 
     invalid_mode = client.post(
@@ -269,7 +278,7 @@ def test_unix_socket_bind_creates_private_socket_and_parent() -> None:
 
 
 def test_snapshot_search_endpoint_uses_internal_service(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     monkeypatch.setattr(
         api_module.service,
         "search_metadata_snapshot",
@@ -297,7 +306,7 @@ def test_snapshot_search_endpoint_uses_internal_service(monkeypatch) -> None:
 
 
 def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     captured = {}
 
     def fake_refresh(union_id, open_id, app_id, audit_context):
@@ -338,7 +347,7 @@ def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) ->
 
 
 def test_snapshot_refresh_endpoint_rejects_sql_or_table_arguments(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
 
     response = TestClient(app).post(
         "/agent/refresh-metadata-snapshot",
@@ -357,7 +366,7 @@ def test_snapshot_refresh_endpoint_rejects_sql_or_table_arguments(monkeypatch) -
 
 
 def test_removed_cluster_comparison_route_is_not_registered(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     removed_path = "/agent/" + "audit-ck-" + "access-consistency"
 
     response = TestClient(app).post(
@@ -370,7 +379,7 @@ def test_removed_cluster_comparison_route_is_not_registered(monkeypatch) -> None
 
 
 def test_access_inspection_endpoints_forward_explicit_scopes(monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     captured: dict[str, Any] = {}
 
     def fake_subjects(*args, audit_context):
@@ -425,7 +434,7 @@ def test_access_inspection_endpoints_forward_explicit_scopes(monkeypatch) -> Non
     ],
 )
 def test_access_inspection_endpoints_reject_sql(path, scope, monkeypatch) -> None:
-    monkeypatch.setenv("DATA_MCP_INTERNAL_AUTH_TOKEN", "test-token")
+    set_internal_auth(monkeypatch, "test-token")
     response = TestClient(app).post(
         path,
         headers={"X-Internal-Auth": "test-token"},

@@ -3,27 +3,23 @@ import os
 from ksher_agent_data_mcp import kai_bootstrap
 
 
-def test_kai_bootstrap_loads_private_env_file(tmp_path, monkeypatch) -> None:
+def test_kai_bootstrap_passes_only_private_env_file_path(tmp_path, monkeypatch) -> None:
     env_file = tmp_path / "env"
     env_file.write_text(
-        "\n".join(
-            [
-                "TCHOUSE_D_USERNAME='agent_user'",
-                'TCHOUSE_D_PASSWORD="agent_password"',
-                "export QUERY_TIMEOUT_SECONDS=45",
-            ]
-        ),
+        "DATA_MCP_INTERNAL_AUTH_TOKEN='internal-canary'\n"
+        "TCHOUSE_D_PASSWORD='database-canary'\n",
         encoding="utf-8",
     )
+    monkeypatch.setenv("KSHER_AGENT_DATA_MCP_ENV_FILE", str(env_file))
+    monkeypatch.delenv("DATA_MCP_INTERNAL_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("TCHOUSE_D_PASSWORD", raising=False)
 
-    for key in ["TCHOUSE_D_USERNAME", "TCHOUSE_D_PASSWORD", "QUERY_TIMEOUT_SECONDS"]:
-        monkeypatch.delenv(key, raising=False)
+    selected = kai_bootstrap._configure_private_env_file()
 
-    kai_bootstrap._load_env_file(env_file)
-
-    assert os.environ["TCHOUSE_D_USERNAME"] == "agent_user"
-    assert os.environ["TCHOUSE_D_PASSWORD"] == "agent_password"
-    assert os.environ["QUERY_TIMEOUT_SECONDS"] == "45"
+    assert selected == env_file
+    assert os.environ["KSHER_AGENT_DATA_MCP_ENV_FILE"] == str(env_file)
+    assert "DATA_MCP_INTERNAL_AUTH_TOKEN" not in os.environ
+    assert "TCHOUSE_D_PASSWORD" not in os.environ
 
 
 def test_kai_bootstrap_applies_production_defaults_without_overriding() -> None:

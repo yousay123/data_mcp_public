@@ -10,6 +10,47 @@ const DEFAULT_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-mcp', 'r
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const DEFAULT_KILL_GRACE_MS = 8_000;
 const HEALTH_POLL_MS = 100;
+const SENSITIVE_PROCESS_ENV_KEYS = new Set([
+  'DATA_MCP_INTERNAL_AUTH_TOKEN',
+  'TCHOUSE_D_PASSWORD',
+]);
+const API_CHILD_ENV_ALLOWLIST = new Set([
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'PATH',
+  'SHELL',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TZ',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+]);
+
+export function assertNoSensitiveProcessEnv(env) {
+  if ([...SENSITIVE_PROCESS_ENV_KEYS].some(key => Object.hasOwn(env, key))) {
+    throw new Error(
+      'Data MCP service runner refuses secrets in its process environment; '
+      + 'use KSHER_AGENT_DATA_MCP_ENV_FILE',
+    );
+  }
+}
+
+export function buildApiChildEnv(env, envFile, socketPath) {
+  const childEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (API_CHILD_ENV_ALLOWLIST.has(key) && typeof value === 'string') {
+      childEnv[key] = value;
+    }
+  }
+  childEnv.KSHER_AGENT_DATA_MCP_ENV_FILE = envFile;
+  childEnv.DATA_MCP_HTTP_SOCKET_PATH = socketPath;
+  return childEnv;
+}
 
 function parseEnvLine(line, lineNumber) {
   const trimmed = line.trim();
@@ -187,13 +228,16 @@ export function resolveApiExecutable(env) {
 }
 
 export async function runApiService({ env = process.env } = {}) {
+  assertNoSensitiveProcessEnv(env);
   const envFile = env.KSHER_AGENT_DATA_MCP_ENV_FILE || DEFAULT_ENV_FILE;
   const envText = await readFile(envFile, 'utf8');
-  const childEnv = { ...env, ...parseEnvFile(envText), KSHER_AGENT_DATA_MCP_ENV_FILE: envFile };
-  const socketPath = childEnv.DATA_MCP_HTTP_SOCKET_PATH || DEFAULT_SOCKET_PATH;
-  const apiExecutable = resolveApiExecutable(childEnv);
+  const privateConfig = parseEnvFile(envText);
+  const runtimeConfig = { ...env, ...privateConfig };
+  const socketPath = runtimeConfig.DATA_MCP_HTTP_SOCKET_PATH || DEFAULT_SOCKET_PATH;
+  const childEnv = buildApiChildEnv(env, envFile, socketPath);
+  const apiExecutable = resolveApiExecutable(runtimeConfig);
   await access(apiExecutable, fsConstants.X_OK);
-  const { readyTimeoutMs, killGraceMs } = resolveServiceTimeouts(childEnv);
+  const { readyTimeoutMs, killGraceMs } = resolveServiceTimeouts(runtimeConfig);
 
   const child = spawn(apiExecutable, [], {
     env: childEnv,

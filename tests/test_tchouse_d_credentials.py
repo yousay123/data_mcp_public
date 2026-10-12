@@ -84,7 +84,7 @@ def test_resolves_configured_tchouse_d_credential() -> None:
     assert credential.user_union_id == "on_test"
     assert credential.datasource == "tchouse-d"
     assert credential.tchouse_account == "resolver_user"
-    assert credential.password_secret_ref == "env://TCHOUSE_D_PASSWORD"
+    assert credential.password_secret_ref == "settings://TCHOUSE_D_PASSWORD"
 
 
 def test_accepts_configured_credential_sql_aliases(monkeypatch) -> None:
