@@ -18,9 +18,11 @@ environments and enabled only for selected bots.
   - fails closed when Gateway trusted-caller metadata is absent
   - exposes identity-bound tools that forward explicit SQL to the Data MCP
     service side for validation/execution
-  - exposes `frozen_query_raw` for host-approved templates: the plugin owns
-    SQL literal encoding plus byte-exact validate/run, and returns only the service
-    fields `rows`, `columns`, `row_count`, `query_id`, and `error_code`; BotMux owns display
+  - exposes `frozen_query_raw` only as a Botmux host-only tool for approved
+    templates: model-facing Gateways hide and reject it, while the frozen-command
+    host injects `frozen_query_v1` for the direct call; the plugin owns SQL
+    literal encoding plus byte-exact validate/run, and returns only the service
+    fields `rows`, `columns`, `row_count`, `query_id`, and `error_code`
   - exposes signed local snapshot refresh/search over the same private Unix socket
 - CLI:
   - `botmux data-mcp:status`
@@ -53,6 +55,11 @@ turn. A `schedule_creator` caller is accepted only when `turnId` has the form
 `taskId`. Conversely, a `schedule:` turn is rejected unless its trusted caller
 source is `schedule_creator`. This prevents a scheduled input adopted into an
 already-active turn from using that turn's preserved caller identity.
+
+Trusted Excel delivery is one-shot. The plugin stages an atomic outbound file;
+the Botmux host consumes it into bounded memory and removes the staged source
+before any send. Plugin shutdown cleans files still owned by that process, and
+startup removes abandoned Data MCP artifacts older than 15 minutes.
 
 Query plans additionally bind to a host-injected execution context. The wrapper
 prefers a non-empty `BOTMUX_SESSION_ID` and otherwise uses a non-empty
@@ -127,6 +134,19 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
   - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
+- Raw `run_query_for_user` / `export_query_to_excel_file` result responses are
+  always disabled. Business results must use `deliver_query_result_for_user`;
+  this fail-closed boundary cannot be disabled by environment configuration.
+- `DATA_MCP_RESULT_MODEL_ENDPOINT`
+  - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
+- `DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS`
+  - Required comma-separated exact hostname allowlist for the internal result model endpoint.
+- `DATA_MCP_RESULT_MODEL`
+  - Internal model name (for example a company-hosted Qwen deployment).
+- `DATA_MCP_RESULT_MODEL_API_KEY`
+  - Optional internal endpoint credential. Keep it only in the host-only file
+    selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
+    process environment.
 
 The service runner passes only an allowlisted non-sensitive environment to the
 Python API. The API loads private configuration directly from the host-only file
