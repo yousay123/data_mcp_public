@@ -946,6 +946,35 @@ try {
         } },
       },
     };
+    const deliveryWithoutHostCapabilityCall = {
+      jsonrpc: '2.0', id: 40, method: 'tools/call',
+      params: {
+        name: 'deliver_query_result_for_user',
+        arguments: {
+          sql: 'SELECT 1', datasource: 'tchouse-c', query_plan_id: 'qplan_test',
+          output_mode: 'analysis', question: '汇总',
+        },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'om_test',
+        } },
+      },
+    };
+    const frozenWithoutHostCapabilityCall = {
+      jsonrpc: '2.0', id: 41, method: 'tools/call',
+      params: {
+        name: 'frozen_query_raw',
+        arguments: {
+          payload: { sql: 'SELECT 1', datasource: 'tchouse-c' },
+          parameters: [],
+          values: {},
+        },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'om_test',
+        } },
+      },
+    };
     const input = [
       initialize,
       listTools,
@@ -975,6 +1004,8 @@ try {
       missingScheduleTurnCall,
       ...nearPrefixScheduleCalls,
       ...mismatchedScheduleToolCalls,
+      deliveryWithoutHostCapabilityCall,
+      frozenWithoutHostCapabilityCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
@@ -1005,7 +1036,7 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
     }
     if (tools.some(tool => tool.name === 'execute_frozen_query')) {
@@ -1025,7 +1056,9 @@ try {
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
     const visibleFrozenSchema = tools.find(tool => tool.name === 'frozen_query_raw')?.inputSchema;
+    const visibleFrozenTool = tools.find(tool => tool.name === 'frozen_query_raw');
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
+    const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
     if (
       JSON.stringify(visibleFrozenSchema).includes('requestUser')
       || JSON.stringify(visibleFrozenSchema).includes('request_user')
@@ -1033,6 +1066,9 @@ try {
       || JSON.stringify(visibleFrozenSchema).includes('identity')
     ) {
       fail('frozen_query_raw schema must not expose trusted identity arguments');
+    }
+    if (visibleFrozenTool?._meta?.botmuxHostOnly !== true) {
+      fail('frozen_query_raw must be marked host-only for Botmux Gateway filtering');
     }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
@@ -1042,6 +1078,11 @@ try {
     }
     if (!visibleExportSchema?.required?.includes('query_plan_id')) {
       fail('export_query_to_excel_file schema must require query_plan_id');
+    }
+    if (!visibleDeliverySchema?.required?.includes('query_plan_id')
+      || !visibleDeliverySchema?.required?.includes('output_mode')
+      || JSON.stringify(visibleDeliverySchema?.properties?.output_mode?.enum) !== JSON.stringify(['analysis', 'excel'])) {
+      fail('deliver_query_result_for_user must require one explicit isolated output mode and query_plan_id');
     }
     for (const [name, schema] of [
       ['validate_sql_for_user', visibleValidateSchema],
@@ -1171,12 +1212,12 @@ try {
       fail('MCP server must collapse validation responses for non-human callers without schema or permission oracle details');
     }
     const missingRunPlanText = byId.get(12)?.result?.content?.[0]?.text ?? '';
-    if (!missingRunPlanText.includes('query_plan_required')) {
-      fail('run_query_for_user must fail closed when query_plan_id is missing');
+    if (!missingRunPlanText.includes('isolated_delivery_required')) {
+      fail('run_query_for_user must remain closed before any raw result can be returned');
     }
     const missingExportPlanText = byId.get(13)?.result?.content?.[0]?.text ?? '';
-    if (!missingExportPlanText.includes('query_plan_required')) {
-      fail('export_query_to_excel_file must fail closed when query_plan_id is missing');
+    if (!missingExportPlanText.includes('isolated_delivery_required')) {
+      fail('export_query_to_excel_file must remain closed before any raw result can be returned');
     }
     const humanRefreshText = byId.get(14)?.result?.content?.[0]?.text ?? '';
     if (!humanRefreshText.includes('metadata_snapshot_schedule_identity_required')) {
@@ -1208,6 +1249,14 @@ try {
     const invalidDatasourceText = byId.get(21)?.result?.content?.[0]?.text ?? '';
     if (!invalidDatasourceText.includes('unsupported_datasource')) {
       fail('public query tools must reject non-tchouse-c datasource before service access');
+    }
+    const deliveryWithoutCapabilityText = byId.get(40)?.result?.content?.[0]?.text ?? '';
+    if (!deliveryWithoutCapabilityText.includes('trusted_result_delivery_unavailable')) {
+      fail('isolated result delivery must fail before query execution when the host capability is absent');
+    }
+    const frozenWithoutCapabilityText = byId.get(41)?.result?.content?.[0]?.text ?? '';
+    if (!frozenWithoutCapabilityText.includes('trusted_frozen_query_required')) {
+      fail('frozen_query_raw must fail before query execution when the host-only capability is absent');
     }
 
     const missingSessionCall = {
@@ -1462,6 +1511,7 @@ try {
               requestUserUnionId: 'on_socket_user',
               requestLarkAppId: 'cli_test',
               senderType: 'user',
+              hostCapabilities: ['frozen_query_v1'],
             },
           },
         },
@@ -1534,8 +1584,8 @@ try {
         .filter(Boolean)
         .map(line => JSON.parse(line));
       const socketText = socketResponses.find(response => response.id === 13)?.result?.content?.[0]?.text ?? '';
-      if (!socketText.includes('"transport": "unix_socket"')) {
-        fail('MCP server must authenticate Data MCP service calls over Unix socket');
+      if (!socketText.includes('isolated_delivery_required')) {
+        fail('raw query results must stay closed even when the Unix socket service is available');
       }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
       if (!searchText.includes('/agent/search-metadata-snapshot')) {
@@ -1547,7 +1597,7 @@ try {
       }
       const validateText = socketResponses.find(response => response.id === 16)?.result?.content?.[0]?.text ?? '';
       if (!validateText.includes('/agent/validate-sql')) {
-        fail('validate_sql_for_user must forward session binding and compare mode over the shared Unix socket');
+        fail('validate_sql_for_user must use the Unix socket without forwarding a shared token');
       }
       const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
       const frozenPayload = JSON.parse(frozenText);
@@ -1628,14 +1678,15 @@ try {
         .split('\n')
         .filter(Boolean)
         .map(line => JSON.parse(line));
-      for (const responseId of [23, 24]) {
-        const responseText = executionResponses
-          .find(response => response.id === responseId)?.result?.content?.[0]?.text ?? '';
-        if (!responseText.includes('"transport": "unix_socket"')) {
-          fail(
-            `validate and run must forward the same execution id and byte-exact SQL when no session exists: ${responseText}`,
-          );
-        }
+      const executionValidateText = executionResponses
+        .find(response => response.id === 23)?.result?.content?.[0]?.text ?? '';
+      if (!executionValidateText.includes('"transport": "unix_socket"')) {
+        fail(`validate must forward the execution id when no session exists: ${executionValidateText}`);
+      }
+      const executionRunText = executionResponses
+        .find(response => response.id === 24)?.result?.content?.[0]?.text ?? '';
+      if (!executionRunText.includes('isolated_delivery_required')) {
+        fail(`raw run must remain closed when no session exists: ${executionRunText}`);
       }
 
       const precedenceCall = {

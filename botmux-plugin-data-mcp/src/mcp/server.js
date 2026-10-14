@@ -1,9 +1,10 @@
 import { createInterface } from 'node:readline';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -11,8 +12,12 @@ const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
 const SENSITIVE_PROCESS_ENV_KEYS = [
   'DATA_MCP_INTERNAL_AUTH_TOKEN',
+  'DATA_MCP_RESULT_MODEL_API_KEY',
   'TCHOUSE_D_PASSWORD',
 ];
+const OUTBOUND_ARTIFACT_PREFIX = 'data-mcp-';
+const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
+const stagedOutboundArtifacts = new Set();
 let hostEnvCache;
 let packageVersionCache;
 
@@ -26,6 +31,36 @@ function assertNoSensitiveProcessEnv(env = process.env) {
 }
 
 assertNoSensitiveProcessEnv();
+
+function removeStagedOutboundArtifacts() {
+  for (const path of stagedOutboundArtifacts) {
+    try { unlinkSync(path); } catch { /* already consumed or best-effort shutdown cleanup */ }
+  }
+  stagedOutboundArtifacts.clear();
+}
+
+function cleanupStaleOutboundArtifacts(now = Date.now()) {
+  const pluginHome = process.env.BOTMUX_PLUGIN_HOME;
+  if (!pluginHome) return;
+  const outbound = resolve(pluginHome, 'outbound');
+  if (!existsSync(outbound)) return;
+  for (const name of readdirSync(outbound)) {
+    if (!name.startsWith(OUTBOUND_ARTIFACT_PREFIX) && !name.startsWith(`.${OUTBOUND_ARTIFACT_PREFIX}`)) continue;
+    const path = join(outbound, name);
+    try {
+      if (now - statSync(path).mtimeMs >= OUTBOUND_STALE_AFTER_MS) unlinkSync(path);
+    } catch { /* concurrent consumer or unrelated filesystem failure */ }
+  }
+}
+
+cleanupStaleOutboundArtifacts();
+process.once('exit', removeStagedOutboundArtifacts);
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    removeStagedOutboundArtifacts();
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -99,6 +134,9 @@ function normalizeTrustedCaller(caller, source) {
   const dispatchAttempt = Number.isSafeInteger(caller.dispatchAttempt)
     ? caller.dispatchAttempt
     : undefined;
+  const hostCapabilities = Array.isArray(caller.hostCapabilities)
+    ? caller.hostCapabilities.filter(value => typeof value === 'string')
+    : [];
   if (!requestUserOpenId && !requestUserUnionId) return null;
   return {
     source,
@@ -111,6 +149,7 @@ function normalizeTrustedCaller(caller, source) {
     ...(capturedAt ? { capturedAt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    hostCapabilities,
   };
 }
 
@@ -353,6 +392,13 @@ function jsonTool(value) {
   return toolText(JSON.stringify(value, null, 2));
 }
 
+function hostDeliveryTool(delivery) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ status: 'delivery_requested', deliveryId: delivery.deliveryId }) }],
+    _meta: { botmuxHostDelivery: delivery },
+  };
+}
+
 function argsFrom(request) {
   return request.params?.arguments && typeof request.params.arguments === 'object'
     ? request.params.arguments
@@ -555,6 +601,164 @@ function postJsonOverUrl(endpoint, payload) {
     req.on('error', reject);
     req.end(body);
   });
+}
+
+function resultModelConfig() {
+  const endpointValue = configValue('DATA_MCP_RESULT_MODEL_ENDPOINT');
+  const model = configValue('DATA_MCP_RESULT_MODEL');
+  const allowedHosts = new Set((configValue('DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS') || '')
+    .split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
+  if (!endpointValue || !model || allowedHosts.size === 0) {
+    throw new Error('result_model_not_configured');
+  }
+  const endpoint = new URL(endpointValue);
+  if (!['http:', 'https:'].includes(endpoint.protocol)
+    || endpoint.username || endpoint.password
+    || !allowedHosts.has(endpoint.hostname.toLowerCase())) {
+    throw new Error('result_model_endpoint_not_allowed');
+  }
+  return {
+    endpoint,
+    model,
+    apiKey: configValue('DATA_MCP_RESULT_MODEL_API_KEY'),
+  };
+}
+
+function postJsonToResultModel(endpoint, apiKey, payload) {
+  return new Promise((resolvePromise, reject) => {
+    const body = JSON.stringify(payload);
+    const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
+    const headers = {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    };
+    const req = transport(endpoint, { method: 'POST', headers }, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolvePromise({
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        text: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.setTimeout(60_000, () => req.destroy(new Error('result_model_timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+async function analyzeResultWithInternalModel(result, question) {
+  const config = resultModelConfig();
+  const serialized = JSON.stringify(result);
+  if (Buffer.byteLength(serialized) > 5 * 1024 * 1024) throw new Error('result_model_payload_too_large');
+  const response = await postJsonToResultModel(config.endpoint, config.apiKey, {
+    model: config.model,
+    temperature: 0,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          '你是企业内网中的数据结果分析器。只根据给定查询结果回答，不补造事实。',
+          '必须写明时间范围、统计口径、数据缺失/截断和不能推出的结论。',
+          '输出简洁中文 Markdown；不得输出数据库账号、SQL、身份标识或访问凭证。',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `用户问题：${question || '请汇总本次查询结果'}\n查询结果：${serialized}`,
+      },
+    ],
+  });
+  if (!response.ok) throw new Error(`result_model_http_${response.status}`);
+  let body;
+  try { body = JSON.parse(response.text); } catch { throw new Error('result_model_invalid_json'); }
+  const markdown = body?.choices?.[0]?.message?.content;
+  if (typeof markdown !== 'string' || !markdown.trim() || markdown.length > 50_000) {
+    throw new Error('result_model_invalid_content');
+  }
+  return markdown;
+}
+
+function copyExportToPluginOutbound(file) {
+  const pluginHome = process.env.BOTMUX_PLUGIN_HOME;
+  if (!pluginHome || !file || typeof file.path !== 'string') throw new Error('export_artifact_missing');
+  const source = realpathSync(file.path);
+  if (!statSync(source).isFile()) throw new Error('export_artifact_invalid');
+  const outbound = resolve(pluginHome, 'outbound');
+  mkdirSync(outbound, { recursive: true, mode: 0o700 });
+  const safeName = basename(typeof file.filename === 'string' ? file.filename : source)
+    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_');
+  const token = randomUUID();
+  const target = join(outbound, `data-mcp-${token}-${safeName || 'query-result.xlsx'}`);
+  const temporary = join(outbound, `.data-mcp-${token}.partial`);
+  stagedOutboundArtifacts.add(temporary);
+  try {
+    copyFileSync(source, temporary);
+    renameSync(temporary, target);
+    stagedOutboundArtifacts.delete(temporary);
+    stagedOutboundArtifacts.add(target);
+    return target;
+  } catch (error) {
+    stagedOutboundArtifacts.delete(temporary);
+    try { unlinkSync(temporary); } catch { /* best-effort */ }
+    throw error;
+  }
+}
+
+async function deliverQueryResult(caller, args) {
+  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
+    return {
+      error: {
+        status: 'validation_error',
+        error_code: 'trusted_result_delivery_unavailable',
+        message: '当前 Botmux 宿主未启用可信结果直送能力，拒绝执行以避免业务数据进入调用模型上下文',
+      },
+    };
+  }
+  const mode = args.output_mode;
+  if (mode === 'analysis') {
+    const result = await callDataMcpService('run', caller, args);
+    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
+    const markdown = await analyzeResultWithInternalModel(result, args.question);
+    return {
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: `data-result-${randomUUID()}`,
+        markdown,
+        responseKind: 'final',
+      },
+    };
+  }
+  if (mode === 'excel') {
+    const result = await callDataMcpService('export', caller, args);
+    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
+    const path = copyExportToPluginOutbound(result.file);
+    return {
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: `data-result-${randomUUID()}`,
+        markdown: `查询完成，已生成 Excel。\n\n- 行数：${Number(result.file?.row_count ?? 0).toLocaleString('en-US')}\n- 查询编号：${String(result.query_id ?? '未返回')}`,
+        files: [{ path }],
+        responseKind: 'final',
+      },
+    };
+  }
+  return {
+    error: {
+      status: 'validation_error',
+      error_code: 'invalid_delivery_output_mode',
+      message: 'output_mode 仅支持 analysis 或 excel；一次查询只允许一种执行路径',
+    },
+  };
+}
+
+function isolatedDeliveryFailure() {
+  return {
+    status: 'error',
+    error_code: 'isolated_data_operation_failed',
+    message: '数据操作失败；为保护业务数据，未向调用模型返回上游响应详情',
+  };
 }
 
 async function callDataMcpService(kind, caller, args) {
@@ -949,18 +1153,39 @@ async function handleToolCall(request) {
     return;
   }
 
-  if (name === 'run_query_for_user') {
-    ok(request.id, jsonTool(await callDataMcpService('run', caller, argsFrom(request))));
+  if (name === 'run_query_for_user' || name === 'export_query_to_excel_file') {
+    const policyIssue = callerPolicyIssue(caller);
+    ok(request.id, jsonTool({
+      ...(policyIssue ?? {
+        status: 'validation_error',
+        error_code: 'isolated_delivery_required',
+        message: '业务结果必须留在内网投递链路，请改用 deliver_query_result_for_user',
+      }),
+    }));
     return;
   }
 
   if (name === 'frozen_query_raw') {
+    if (!caller.hostCapabilities.includes('frozen_query_v1')) {
+      ok(request.id, jsonTool({
+        status: 'validation_error',
+        error_code: 'trusted_frozen_query_required',
+        message: '固化查询只允许 Botmux 宿主专用通道调用',
+      }));
+      return;
+    }
     ok(request.id, jsonTool(await executeFrozenQuery(caller, argsFrom(request))));
     return;
   }
 
-  if (name === 'export_query_to_excel_file') {
-    ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request))));
+  if (name === 'deliver_query_result_for_user') {
+    let prepared;
+    try {
+      prepared = await deliverQueryResult(caller, argsFrom(request));
+    } catch {
+      prepared = { error: isolatedDeliveryFailure() };
+    }
+    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
     return;
   }
 
@@ -1046,6 +1271,7 @@ function toolSchemas() {
     {
       name: 'frozen_query_raw',
       description: 'Render, validate and run an approved frozen read-only query, returning the raw data result without SQL.',
+      _meta: { botmuxHostOnly: true },
       inputSchema: {
         type: 'object',
         properties: {
@@ -1071,6 +1297,24 @@ function toolSchemas() {
           expected_source_version: { type: 'string', minLength: 1, maxLength: 256 },
         },
         required: ['sql', 'query_plan_id'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'deliver_query_result_for_user',
+      description: 'Execute one approved query and deliver either an internal-model analysis or an Excel artifact through the trusted Botmux host without exposing business data to the calling model.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sql: { type: 'string' },
+          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
+          query_plan_id: { type: 'string' },
+          output_mode: { type: 'string', enum: ['analysis', 'excel'] },
+          question: { type: 'string' },
+          filename: { type: 'string' },
+          max_export_rows: { type: 'integer', minimum: 1 },
+        },
+        required: ['sql', 'query_plan_id', 'output_mode'],
         additionalProperties: false,
       },
     },
