@@ -713,22 +713,6 @@ try {
         } },
       },
     };
-    const mismatchedScheduleFrozenCall = {
-      jsonrpc: '2.0', id: 26, method: 'tools/call',
-      params: {
-        name: 'frozen_query_raw',
-        arguments: {
-          payload: { sql: 'SELECT 1', datasource: 'tchouse-c' },
-          parameters: [],
-          values: {},
-        },
-        _meta: { botmuxTrustedCaller: {
-          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
-          requestLarkAppId: 'cli_test', source: 'schedule_creator',
-          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
-        } },
-      },
-    };
     const missingScheduleTurnCall = {
       jsonrpc: '2.0', id: 27, method: 'tools/call',
       params: {
@@ -960,21 +944,6 @@ try {
         } },
       },
     };
-    const frozenWithoutHostCapabilityCall = {
-      jsonrpc: '2.0', id: 41, method: 'tools/call',
-      params: {
-        name: 'frozen_query_raw',
-        arguments: {
-          payload: { sql: 'SELECT 1', datasource: 'tchouse-c' },
-          parameters: [],
-          values: {},
-        },
-        _meta: { botmuxTrustedCaller: {
-          requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
-          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'om_test',
-        } },
-      },
-    };
     const input = [
       initialize,
       listTools,
@@ -1000,12 +969,10 @@ try {
       mismatchedScheduleRunCall,
       mismatchedScheduleExportCall,
       spoofedScheduleTurnCall,
-      mismatchedScheduleFrozenCall,
       missingScheduleTurnCall,
       ...nearPrefixScheduleCalls,
       ...mismatchedScheduleToolCalls,
       deliveryWithoutHostCapabilityCall,
-      frozenWithoutHostCapabilityCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
@@ -1036,11 +1003,13 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
     }
-    if (tools.some(tool => tool.name === 'execute_frozen_query')) {
-      fail('retired MCP tool execute_frozen_query must not be exposed');
+    for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
+      if (tools.some(tool => tool.name === retiredName)) {
+        fail(`retired raw-result MCP tool must not be exposed: ${retiredName}`);
+      }
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
     if (tools.some(tool => tool.name === removedClusterComparisonTool)) {
@@ -1055,21 +1024,8 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleFrozenSchema = tools.find(tool => tool.name === 'frozen_query_raw')?.inputSchema;
-    const visibleFrozenTool = tools.find(tool => tool.name === 'frozen_query_raw');
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
-    if (
-      JSON.stringify(visibleFrozenSchema).includes('requestUser')
-      || JSON.stringify(visibleFrozenSchema).includes('request_user')
-      || JSON.stringify(visibleFrozenSchema).includes('caller')
-      || JSON.stringify(visibleFrozenSchema).includes('identity')
-    ) {
-      fail('frozen_query_raw schema must not expose trusted identity arguments');
-    }
-    if (visibleFrozenTool?._meta?.botmuxHostOnly !== true) {
-      fail('frozen_query_raw must be marked host-only for Botmux Gateway filtering');
-    }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
     }
@@ -1254,10 +1210,6 @@ try {
     if (!deliveryWithoutCapabilityText.includes('trusted_result_delivery_unavailable')) {
       fail('isolated result delivery must fail before query execution when the host capability is absent');
     }
-    const frozenWithoutCapabilityText = byId.get(41)?.result?.content?.[0]?.text ?? '';
-    if (!frozenWithoutCapabilityText.includes('trusted_frozen_query_required')) {
-      fail('frozen_query_raw must fail before query execution when the host-only capability is absent');
-    }
 
     const missingSessionCall = {
       jsonrpc: '2.0', id: 22, method: 'tools/call',
@@ -1328,7 +1280,6 @@ try {
             res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
             return;
           }
-          const frozenSql = "SELECT '\\\\\\\\'' OR 1=1 --' AS probe";
           const expectedContextId = parsed.sql === '  SELECT execution_context  '
             ? 'execution_socket_probe'
             : parsed.sql === 'SELECT precedence_context'
@@ -1343,26 +1294,21 @@ try {
               ? 'wrong_execution_context'
               : req.url === '/agent/validate-sql'
                 && parsed.execution_mode !== (
-                  parsed.sql === frozenSql
-                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/.test(parsed.sql)
+                  /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/.test(parsed.sql)
                     ? 'single'
                     : 'compare'
                 )
                 ? 'wrong_execution_mode'
-                : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
-                  ? 'wrong_frozen_query_plan'
-                : parsed.sql !== frozenSql && parsed.sql?.includes('OR 1=1')
-                  ? 'frozen_sql_literal_not_escaped'
                 : null;
           if (failureCode) {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: failureCode }] }));
             return;
           }
-          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/)?.[1];
-          if (req.url === '/agent/validate-sql' && frozenFailure) {
+          const validationFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/)?.[1];
+          if (req.url === '/agent/validate-sql' && validationFailure) {
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ status: 'validation_error', error_code: frozenFailure }));
+            res.end(JSON.stringify({ status: 'validation_error', error_code: validationFailure }));
             return;
           }
           if (req.url === '/agent/run-query' && parsed.sql === 'SELECT run_query_timeout') {
@@ -1375,14 +1321,7 @@ try {
             status: 'success',
             transport: 'unix_socket',
             endpoint: req.url,
-            ...(req.url === '/agent/validate-sql' ? { query_plan_id: parsed.sql === frozenSql ? 'qplan_frozen' : 'qplan_socket' } : {}),
-            ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
-              ? {
-                  query_id: 'q_frozen',
-                  rows: [{ probe: '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_' }],
-                  row_count: 1,
-                }
-              : {}),
+            ...(req.url === '/agent/validate-sql' ? { query_plan_id: 'qplan_socket' } : {}),
           }));
         });
       });
@@ -1493,66 +1432,6 @@ try {
           },
         },
       };
-      const frozenQueryCall = {
-        jsonrpc: '2.0',
-        id: 17,
-        method: 'tools/call',
-        params: {
-          name: 'frozen_query_raw',
-          arguments: {
-            payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
-            parameters: [{ name: 'value', type: 'string' }],
-            values: { value: "\\' OR 1=1 --" },
-            requestUserUnionId: 'on_forged_argument',
-          },
-          _meta: {
-            botmuxTrustedCaller: {
-              requestUserOpenId: 'ou_socket_user',
-              requestUserUnionId: 'on_socket_user',
-              requestLarkAppId: 'cli_test',
-              senderType: 'user',
-              hostCapabilities: ['frozen_query_v1'],
-            },
-          },
-        },
-      };
-      const frozenInvalidValuesCall = {
-        ...frozenQueryCall,
-        id: 19,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            ...frozenQueryCall.params.arguments,
-            values: { sql: 'not-a-command-parameter' },
-          },
-        },
-      };
-      const frozenErrorCalls = [
-        ['query_timeout', 'timeout', 20],
-        ['datasource_unreachable', 'temporarily_unavailable', 21],
-        ['http_403', 'permission_denied', 22],
-        ['run_query_timeout', 'timeout', 23],
-        ['missing_union_id', 'permission_denied', 24],
-        ['trusted_human_or_schedule_required', 'permission_denied', 25],
-        ['account_mapping_unavailable', 'permission_denied', 26],
-        ['account_mismatch', 'permission_denied', 27],
-        ['query_concurrency_limit', 'execution_failed', 28],
-        ['restricted_access_metadata', 'permission_denied', 29],
-        ['restricted_system_columns', 'permission_denied', 30],
-        ['unknown_table', 'not_found', 31],
-      ].map(([serviceCode, expectedCode, id]) => ({
-        ...frozenQueryCall,
-        id,
-        expectedCode,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            payload: { sql: `SELECT ${serviceCode}`, datasource: 'tchouse-c' },
-            parameters: [],
-            values: {},
-          },
-        },
-      }));
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
         input: [
@@ -1561,9 +1440,6 @@ try {
           socketSearchCall,
           socketRefreshCall,
           socketValidateCall,
-          frozenQueryCall,
-          frozenInvalidValuesCall,
-          ...frozenErrorCalls.map(({ expectedCode: _expectedCode, ...call }) => call),
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
@@ -1599,45 +1475,6 @@ try {
       if (!validateText.includes('/agent/validate-sql')) {
         fail('validate_sql_for_user must use the Unix socket without forwarding a shared token');
       }
-      const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
-      const frozenPayload = JSON.parse(frozenText);
-      if (
-        frozenPayload.query_id !== 'q_frozen'
-        || frozenPayload.row_count !== 1
-        || !Array.isArray(frozenPayload.rows)
-        || frozenPayload.rows[0]?.probe !== '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_'
-        || !Array.isArray(frozenPayload.columns)
-        || frozenPayload.error_code !== null
-        || frozenText.includes('OR 1=1')
-        || frozenText.includes('on_forged_argument')
-        || frozenText.includes('contractVersion')
-        || frozenText.includes('blocks')
-        || frozenText.includes('fallbackText')
-      ) {
-        fail(`frozen_query_raw must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
-      }
-      const frozenInvalidValuesPayload = JSON.parse(
-        socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
-      );
-      if (
-        frozenInvalidValuesPayload.error_code !== 'invalid_request'
-        || frozenInvalidValuesPayload.row_count !== 0
-        || frozenInvalidValuesPayload.query_id !== null
-        || !Array.isArray(frozenInvalidValuesPayload.rows)
-        || !Array.isArray(frozenInvalidValuesPayload.columns)
-        || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
-      ) {
-        fail(`frozen_query_raw must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
-      }
-      for (const { id, expectedCode } of frozenErrorCalls) {
-        const payload = JSON.parse(
-          socketResponses.find(response => response.id === id)?.result?.content?.[0]?.text ?? '{}',
-        );
-        if (payload.error_code !== expectedCode) {
-          fail(`frozen_query_raw must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
-        }
-      }
-
       const executionValidateCall = {
         ...socketValidateCall,
         id: 23,

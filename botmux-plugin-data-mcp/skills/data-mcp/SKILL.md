@@ -99,9 +99,6 @@ The plugin MCP server exposes:
 
 - `data_mcp_identity_probe`: diagnostic only, returns the trusted identity source visible to the plugin (`gateway_meta` or `trusted_turn_fallback`) without trusting model arguments.
 - `data_mcp_query_plan`: plan-only helper; does not execute database access.
-- `frozen_query_raw`: host-only frozen-command executor. Model-facing Botmux
-  Gateways must hide it; the plugin rejects calls without the host-injected
-  `frozen_query_v1` capability before any data-service access.
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
 - `run_query_for_user`: model-visible raw execution is fail-closed; callers must use trusted result delivery.
 - `export_query_to_excel_file`: model-visible raw export is fail-closed; callers must use trusted result delivery.
