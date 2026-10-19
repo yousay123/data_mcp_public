@@ -466,9 +466,13 @@ try {
       const envIsolation = spawnRunner('env-isolation', 'exit', {
         DATA_MCP_INTERNAL_AUTH_TOKEN: 'internal-child-canary',
         TCHOUSE_D_PASSWORD: 'database-child-canary',
-      }).child;
-      await waitForExit(envIsolation, 15_000, 'env-isolation runner');
-      await waitForFile(childEnvReport);
+      });
+      await waitForExit(envIsolation.child, 15_000, 'env-isolation runner');
+      try {
+        await waitForFile(childEnvReport);
+      } catch (error) {
+        throw new Error(`${error.message}; runner stderr: ${JSON.stringify(envIsolation.stderr())}`);
+      }
       if (readFileSync(childEnvReport, 'utf8') !== '[]') {
         fail('Python API process environment must not contain internal auth or database secrets');
       }
@@ -1003,7 +1007,7 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
     }
     for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
@@ -1026,6 +1030,7 @@ try {
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
+    const visibleFollowupSchema = tools.find(tool => tool.name === 'continue_query_result_for_user')?.inputSchema;
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
     }
@@ -1039,6 +1044,15 @@ try {
       || !visibleDeliverySchema?.required?.includes('output_mode')
       || JSON.stringify(visibleDeliverySchema?.properties?.output_mode?.enum) !== JSON.stringify(['analysis', 'excel'])) {
       fail('deliver_query_result_for_user must require one explicit isolated output mode and query_plan_id');
+    }
+    const followupSchemaText = JSON.stringify(visibleFollowupSchema ?? {});
+    if (!visibleFollowupSchema?.required?.includes('question')) {
+      fail('continue_query_result_for_user schema must require question');
+    }
+    for (const forbidden of ['result_id', 'session_id', 'union_id', 'app_id', 'identity']) {
+      if (followupSchemaText.includes(forbidden)) {
+        fail(`continue_query_result_for_user schema must not expose ${forbidden}`);
+      }
     }
     for (const [name, schema] of [
       ['validate_sql_for_user', visibleValidateSchema],
@@ -1112,7 +1126,7 @@ try {
     if (!scheduleCreatorText.includes('"status":"success"') && !scheduleCreatorText.includes('"status": "success"')) {
       fail('MCP server must allow schedule_creator callers when taskId is present');
     }
-    for (const id of [22, 23, 24, 26]) {
+    for (const id of [22, 23, 24]) {
       const mismatchText = byId.get(id)?.result?.content?.[0]?.text ?? '';
       if (
         !mismatchText.includes('schedule_turn_identity_mismatch')
@@ -1277,7 +1291,13 @@ try {
               return;
             }
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
+            res.end(JSON.stringify({
+              status: 'success', transport: 'unix_socket', endpoint: req.url,
+              results: [{
+                table_name: 'synthetic_table', column_name: 'synthetic_column',
+                example_value: 'SYNTHETIC_VALUE_MUST_NOT_ESCAPE', sample: 'SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE',
+              }],
+            }));
             return;
           }
           const expectedContextId = parsed.sql === '  SELECT execution_context  '
@@ -1464,16 +1484,22 @@ try {
         fail('raw query results must stay closed even when the Unix socket service is available');
       }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
-      if (!searchText.includes('/agent/search-metadata-snapshot')) {
-        fail('search_metadata_snapshot must forward local query controls over the shared Unix socket');
+      if (
+        !searchText.includes('synthetic_table')
+        || !searchText.includes('synthetic_column')
+        || searchText.includes('SYNTHETIC_VALUE_MUST_NOT_ESCAPE')
+        || searchText.includes('SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE')
+        || searchText.includes('/agent/search-metadata-snapshot')
+      ) {
+        fail('search_metadata_snapshot must project safe metadata fields and drop sample values');
       }
       const refreshText = socketResponses.find(response => response.id === 15)?.result?.content?.[0]?.text ?? '';
       if (!refreshText.includes('/agent/refresh-metadata-snapshot')) {
         fail('refresh_metadata_snapshot must forward host-injected schedule identity over the shared Unix socket');
       }
       const validateText = socketResponses.find(response => response.id === 16)?.result?.content?.[0]?.text ?? '';
-      if (!validateText.includes('/agent/validate-sql')) {
-        fail('validate_sql_for_user must use the Unix socket without forwarding a shared token');
+      if (!validateText.includes('qplan_socket') || validateText.includes('/agent/validate-sql')) {
+        fail('validate_sql_for_user must return the safe projection from the Unix-socket response');
       }
       const executionValidateCall = {
         ...socketValidateCall,
@@ -1517,7 +1543,7 @@ try {
         .map(line => JSON.parse(line));
       const executionValidateText = executionResponses
         .find(response => response.id === 23)?.result?.content?.[0]?.text ?? '';
-      if (!executionValidateText.includes('"transport": "unix_socket"')) {
+      if (!executionValidateText.includes('qplan_socket')) {
         fail(`validate must forward the execution id when no session exists: ${executionValidateText}`);
       }
       const executionRunText = executionResponses
@@ -1558,7 +1584,7 @@ try {
         .filter(Boolean)
         .map(line => JSON.parse(line))
         .find(response => response.id === 25)?.result?.content?.[0]?.text ?? '';
-      if (!precedenceText.includes('"transport": "unix_socket"')) {
+      if (!precedenceText.includes('qplan_socket')) {
         fail(
           `BOTMUX_SESSION_ID must take precedence when both execution contexts are present: ${precedenceText}`,
         );

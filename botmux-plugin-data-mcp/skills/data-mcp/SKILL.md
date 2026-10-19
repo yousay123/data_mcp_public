@@ -103,8 +103,14 @@ The plugin MCP server exposes:
 - `run_query_for_user`: model-visible raw execution is fail-closed; callers must use trusted result delivery.
 - `export_query_to_excel_file`: model-visible raw export is fail-closed; callers must use trusted result delivery.
 - `deliver_query_result_for_user`: consumes one validated plan and sends either
-  an internal-Qwen analysis or an Excel artifact through Botmux's trusted host;
+  an approved internal-model analysis or an Excel artifact through Botmux's trusted host;
   the calling model receives only a delivery receipt and never the business result.
+- `continue_query_result_for_user`: use for an unambiguous follow-up about the
+  current caller-bound result. Pass only the user's follow-up text; choose
+  `excel` only when the user explicitly asks for a file. Never invent or pass a
+  result id, user identity, app id, or session id. If it returns a fixed
+  no-active-result status, treat the request as a new query. If the request is
+  ambiguous, ask the user once and default to the new-query workflow.
 - `refresh_metadata_snapshot`: accepts no model arguments and forwards only a host-injected `schedule_creator` owner/task/app identity to refresh the fixed dictionary snapshot.
 - `search_metadata_snapshot`: searches the verified signed current snapshot for candidate tables, fields, partitions, and definitions; snapshot failures stop the workflow and never fall back online.
 - `inspect_ck_subjects_by_table`: returns bounded access holders for explicit tables from the caller's configured entry point.

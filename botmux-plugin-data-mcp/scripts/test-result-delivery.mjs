@@ -20,7 +20,7 @@ const modelServer = createServer((req, res) => {
     modelSawSentinel = body.includes(sentinel);
     modelSawAuth = req.headers.authorization === 'Bearer internal-test-key';
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ choices: [{ message: { content: '内网分析结果：1 行。' } }] }));
+    res.end(JSON.stringify({ choices: [{ message: { content: '受控分析结果：合成记录。' } }] }));
   });
 });
 await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve));
@@ -29,8 +29,9 @@ if (!address || typeof address === 'string') throw new Error('model test server 
 writeFileSync(hostEnvFile, [
   `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${address.port}/v1/chat/completions`,
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
-  'DATA_MCP_RESULT_MODEL=qwen-test',
+  'DATA_MCP_RESULT_MODEL=internal-test-model',
   'DATA_MCP_RESULT_MODEL_API_KEY=internal-test-key',
+  'DATA_MCP_RESULT_BINDING_HMAC_KEY=0123456789abcdef0123456789abcdef',
 ].join('\n') + '\n', { mode: 0o600 });
 
 const runResult = {
@@ -91,7 +92,7 @@ const responses = stdout.trim().split('\n').filter(Boolean).map(line => JSON.par
 const response = responses.find(item => item.id === 1);
 const visible = JSON.stringify(response.result?.content ?? []);
 if (visible.includes(sentinel)) throw new Error('business row leaked into calling model content');
-if (response.result?._meta?.botmuxHostDelivery?.markdown !== '内网分析结果：1 行。') {
+if (response.result?._meta?.botmuxHostDelivery?.markdown !== '受控分析结果：合成记录。') {
   throw new Error('internal model analysis was not wrapped for trusted host delivery');
 }
 if (!modelSawSentinel || !modelSawAuth) {
@@ -116,6 +117,7 @@ const excelChild = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'ser
     BOTMUX_PLUGIN_HOME: pluginHome,
     DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
     DATA_MCP_EXPORT_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(excelResult))}`,
+    KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
   },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -182,6 +184,7 @@ const interruptChild = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 
     BOTMUX_PLUGIN_HOME: pluginHome,
     DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
     DATA_MCP_EXPORT_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(excelResult))}`,
+    KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
   },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -243,6 +246,7 @@ const failedChild = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'se
     DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
     DATA_MCP_RUN_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(failedUpstream))}`,
     DATA_MCP_EXPORT_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(failedUpstream))}`,
+    KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
   },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
@@ -307,6 +311,7 @@ async function runThrowingDeliveryFixture(id, env, arguments_) {
       BOTMUX_SESSION_ID: `session_throw_${id}`,
       BOTMUX_PLUGIN_HOME: pluginHome,
       DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
+      KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
       ...env,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -338,7 +343,8 @@ const refusedModelEnv = join(pluginHome, 'refused-model.env');
 writeFileSync(refusedModelEnv, [
   `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:1/${endpointSentinel}`,
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
-  'DATA_MCP_RESULT_MODEL=qwen-test',
+  'DATA_MCP_RESULT_MODEL=internal-test-model',
+  'DATA_MCP_RESULT_BINDING_HMAC_KEY=0123456789abcdef0123456789abcdef',
 ].join('\n') + '\n', { mode: 0o600 });
 const refusedModel = await runThrowingDeliveryFixture(8, {
   KSHER_AGENT_DATA_MCP_ENV_FILE: refusedModelEnv,

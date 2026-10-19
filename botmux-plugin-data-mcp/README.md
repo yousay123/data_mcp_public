@@ -136,12 +136,24 @@ Environment contract:
   - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
 - `DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS`
   - Required comma-separated exact hostname allowlist for the internal result model endpoint.
+  - Every request also resolves and pins the endpoint to loopback, RFC1918, or
+    IPv6 ULA. Redirects and `198.18.0.0/15` proxy fake-IP addresses are rejected.
+    Deployments using split DNS must configure a direct route that resolves to
+    the real private address; never weaken the address check to accommodate a proxy.
 - `DATA_MCP_RESULT_MODEL`
-  - Internal model name (for example a company-hosted Qwen deployment).
+  - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`
   - Optional internal endpoint credential. Keep it only in the host-only file
     selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
     process environment.
+- `DATA_MCP_RESULT_BINDING_HMAC_KEY`
+  - Required, host-only secret of at least 32 characters for interactive result
+    bindings. Missing keys fail closed. Keep it in the same host-only env file.
+- `DATA_MCP_RESULT_IDLE_TTL_MS` / `DATA_MCP_RESULT_ABSOLUTE_TTL_MS`
+  - Optional positive integer overrides. Defaults are 24 hours idle and 7 days absolute.
+- `DATA_MCP_RESULT_MAX_BYTES` / `DATA_MCP_RESULT_MAX_OWNER_BYTES` /
+  `DATA_MCP_RESULT_MAX_TOTAL_BYTES`
+  - Optional positive byte quotas for one result, one owner, and the store.
 
 The service runner passes only an allowlisted non-sensitive environment to the
 Python API. The API loads private configuration directly from the host-only file
@@ -153,6 +165,47 @@ For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. SQL validation, permission checks,
 account mapping, execution, export limits, and audit remain on the Data MCP
 side. No model-visible tool may return raw query rows.
+
+Interactive results are bound to the host-authenticated union id and app id,
+plus `BOTMUX_SESSION_ID`, which Botmux freezes in the plugin process environment
+and the model cannot supply as a tool argument. The result handle is never
+model-visible. When Botmux adds a signed session id to per-turn metadata, the
+plugin should migrate from the process environment to that value.
+
+`continue_query_result_for_user` accepts only the user's follow-up text and an
+output mode. Analysis uses the stored result. Excel follow-ups deliberately
+revalidate permissions and rerun the original SQL; therefore the spreadsheet
+may differ from the earlier analysis snapshot. Its controlled page states that
+it is a fresh query and includes the generation time. Per trusted turn id, only
+one follow-up call is accepted. Internal-model text, rows, filenames, and paths
+are sent only through trusted host delivery; normal MCP content contains a
+fixed status and random receipt id.
+
+Known host limitation: a busy shared topic can expose the most recently
+captured human identity to a tool call. Binding mismatches fail closed, so this
+can interrupt a response but cannot return rows to the calling model. Deploy
+the internal model without tools or general outbound network access, and do not
+write its prompts or responses to ordinary logs.
+
+### Model-visible tool boundary
+
+| Tool | Success visible to the calling model | Failure visible to the calling model |
+| --- | --- | --- |
+| `data_mcp_identity_probe` | Trusted-identity diagnostics only; no query data | Fixed identity error |
+| `data_mcp_query_plan` | Planning guidance only; does not execute SQL | Fixed planning error |
+| `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
+| `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
+| `export_query_to_excel_file` | Always `isolated_delivery_required`; file metadata is closed | Fixed isolated-operation error |
+| `deliver_query_result_for_user` | `delivery_requested` plus a random receipt; rows, analysis, filenames, and paths use trusted host delivery | Fixed isolated-operation error |
+| `continue_query_result_for_user` | `delivery_requested` plus a random receipt; active-result handles are not arguments | Fixed deterministic state code only |
+| `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |
+| `search_metadata_snapshot` | Allowlisted dictionary fields only; example and sample values are removed | Fixed snapshot status code |
+| `audit_ck_default_role_baseline` | Access-control audit metadata; schedule-only | Policy/service status without query rows |
+| `inspect_ck_subjects_by_table` | Bounded access-holder metadata for explicit tables | Policy/service status without query rows |
+| `inspect_ck_resources_by_subject` | Bounded access metadata for explicit subjects | Policy/service status without query rows |
+
+There is no model-visible raw-result tool or handler route. Database service
+errors must not be relayed verbatim when they can echo literals from a query.
 
 Metadata discovery calls `search_metadata_snapshot`; refresh accepts only a
 host-injected `schedule_creator` identity with task/app/owner binding and never

@@ -1,10 +1,13 @@
 import { createInterface } from 'node:readline';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
+import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import { ResultStore } from './result-store.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -13,6 +16,7 @@ const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
 const SENSITIVE_PROCESS_ENV_KEYS = [
   'DATA_MCP_INTERNAL_AUTH_TOKEN',
   'DATA_MCP_RESULT_MODEL_API_KEY',
+  'DATA_MCP_RESULT_BINDING_HMAC_KEY',
   'TCHOUSE_D_PASSWORD',
 ];
 const OUTBOUND_ARTIFACT_PREFIX = 'data-mcp-';
@@ -227,6 +231,42 @@ function nonBlankProcessEnv(name) {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function resultStoreFor(caller) {
+  const pluginHome = nonBlankProcessEnv('BOTMUX_PLUGIN_HOME');
+  const secret = hostEnv().DATA_MCP_RESULT_BINDING_HMAC_KEY;
+  if (!pluginHome || typeof secret !== 'string' || secret.length < 32) {
+    throw new Error('result_store_not_configured');
+  }
+  return new ResultStore({
+    pluginHome,
+    secret,
+    config: {
+      idleTtlMs: configValue('DATA_MCP_RESULT_IDLE_TTL_MS'),
+      absoluteTtlMs: configValue('DATA_MCP_RESULT_ABSOLUTE_TTL_MS'),
+      maxResultBytes: configValue('DATA_MCP_RESULT_MAX_BYTES'),
+      maxTotalBytes: configValue('DATA_MCP_RESULT_MAX_TOTAL_BYTES'),
+      maxOwnerBytes: configValue('DATA_MCP_RESULT_MAX_OWNER_BYTES'),
+    },
+  });
+}
+
+function activeResultIdentity(caller) {
+  const sessionId = nonBlankProcessEnv('BOTMUX_SESSION_ID');
+  if (
+    caller.senderType !== 'user'
+    || !caller.requestUserUnionId
+    || !caller.requestLarkAppId
+    || !sessionId
+  ) {
+    throw new Error('followup_identity_required');
+  }
+  return {
+    unionId: caller.requestUserUnionId,
+    appId: caller.requestLarkAppId,
+    sessionId,
+  };
+}
+
 function trustedQueryPlanContext() {
   const sessionId = nonBlankProcessEnv('BOTMUX_SESSION_ID');
   if (sessionId) return { id: sessionId, source: 'session' };
@@ -363,6 +403,48 @@ function collapsedValidationDetail(caller) {
     }],
     audit_context: auditContext(caller),
   };
+}
+
+function sanitizeValidationResult(body) {
+  if (!body || body.status !== 'success') {
+    return {
+      status: 'validation_error',
+      error_code: 'sql_validation_failed',
+      message: 'sql_validation_failed',
+    };
+  }
+  const result = {
+    status: 'success',
+    datasource: typeof body.datasource === 'string' ? body.datasource : 'tchouse-c',
+    tables: Array.isArray(body.tables) ? body.tables.filter(value => typeof value === 'string') : [],
+    columns: Array.isArray(body.columns) ? body.columns.filter(value => typeof value === 'string') : [],
+  };
+  if (typeof body.normalized_sql === 'string') result.normalized_sql = body.normalized_sql;
+  if (typeof body.query_plan_id === 'string') result.query_plan_id = body.query_plan_id;
+  if (typeof body.execution_mode === 'string') result.execution_mode = body.execution_mode;
+  return result;
+}
+
+const SAFE_METADATA_FIELDS = new Set([
+  'priority', 'full_path', 'backend_name', 'type_classify', 'source_type',
+  'biz_domain', 'database_name', 'table_name', 'table_comment', 'column_name',
+  'column_comment', 'biz_definition', 'sensitive_level', 'ds',
+]);
+
+function sanitizeMetadataSearchResult(body) {
+  if (!body || body.status !== 'success') {
+    return {
+      status: body?.status === 'not_found' ? 'not_found' : 'error',
+      error_code: body?.status === 'not_found' ? 'metadata_snapshot_no_match' : 'metadata_snapshot_unavailable',
+    };
+  }
+  const results = Array.isArray(body.results)
+    ? body.results.map(row => Object.fromEntries(
+      Object.entries(row && typeof row === 'object' ? row : {})
+        .filter(([key, value]) => SAFE_METADATA_FIELDS.has(key) && ['string', 'number', 'boolean'].includes(typeof value)),
+    ))
+    : [];
+  return { status: 'success', results };
 }
 
 function redactHttpErrorDetail(kind, caller) {
@@ -535,7 +617,32 @@ function resultModelConfig() {
   };
 }
 
-function postJsonToResultModel(endpoint, apiKey, payload) {
+function isPrivateModelAddress(address) {
+  const family = isIP(address);
+  if (family === 4) {
+    const octets = address.split('.').map(Number);
+    return octets[0] === 127
+      || octets[0] === 10
+      || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+      || (octets[0] === 192 && octets[1] === 168);
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd');
+  }
+  return false;
+}
+
+async function resolvePrivateModelAddress(hostname) {
+  const results = await dnsLookup(hostname, { all: true, verbatim: true });
+  if (!results.length || results.some(result => !isPrivateModelAddress(result.address))) {
+    throw new Error('result_model_network_not_private');
+  }
+  return results[0];
+}
+
+async function postJsonToResultModel(endpoint, apiKey, payload) {
+  const pinned = await resolvePrivateModelAddress(endpoint.hostname);
   return new Promise((resolvePromise, reject) => {
     const body = JSON.stringify(payload);
     const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -544,7 +651,12 @@ function postJsonToResultModel(endpoint, apiKey, payload) {
       'content-length': Buffer.byteLength(body),
       ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     };
-    const req = transport(endpoint, { method: 'POST', headers }, (res) => {
+    const req = transport(endpoint, {
+      method: 'POST',
+      headers,
+      lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
+      ...(endpoint.protocol === 'https:' ? { servername: endpoint.hostname } : {}),
+    }, (res) => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => resolvePromise({
@@ -617,6 +729,64 @@ function copyExportToPluginOutbound(file) {
   }
 }
 
+function discardStagedOutboundArtifact(path) {
+  if (!path) return;
+  stagedOutboundArtifacts.delete(path);
+  try { unlinkSync(path); } catch { /* already consumed or absent */ }
+}
+
+function sanitizedExcelFilename(value) {
+  const leaf = basename(String(value || 'query-result').replace(/\\/g, '/'))
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_')
+    .replace(/\.xlsx$/i, '')
+    .slice(0, 100)
+    .replace(/^\.+/, '');
+  return `${leaf || 'query-result'}.xlsx`;
+}
+
+function storableQueryResult(result) {
+  return {
+    status: 'success',
+    datasource: typeof result.datasource === 'string' ? result.datasource : 'tchouse-c',
+    columns: Array.isArray(result.columns) ? result.columns : [],
+    rows: Array.isArray(result.rows) ? result.rows : Array.isArray(result.data) ? result.data : [],
+    row_count: Number.isSafeInteger(result.row_count) ? result.row_count : 0,
+    truncated: result.truncated === true,
+    quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],
+  };
+}
+
+function storedPayload(args, result) {
+  return {
+    query: {
+      sql: args.sql,
+      datasource: typeof args.datasource === 'string' ? args.datasource : 'tchouse-c',
+    },
+    result: result ? storableQueryResult(result) : null,
+  };
+}
+
+async function freshPlan(caller, query) {
+  const validation = await callDataMcpService('validate', caller, {
+    sql: query.sql,
+    datasource: query.datasource,
+    execution_mode: 'single',
+  });
+  if (validation?.status !== 'success' || typeof validation.query_plan_id !== 'string') {
+    throw new Error('followup_revalidation_failed');
+  }
+  return validation.query_plan_id;
+}
+
+function fixedFollowupResult(code) {
+  return {
+    status: code,
+    error_code: code,
+    message: code,
+  };
+}
+
 async function deliverQueryResult(caller, args) {
   if (!caller.hostCapabilities.includes('result_delivery_v1')) {
     return {
@@ -627,11 +797,18 @@ async function deliverQueryResult(caller, args) {
       },
     };
   }
+  let identity;
+  let store;
+  if (caller.senderType === 'user') {
+    identity = activeResultIdentity(caller);
+    store = resultStoreFor(caller);
+  }
   const mode = args.output_mode;
   if (mode === 'analysis') {
     const result = await callDataMcpService('run', caller, args);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
     const markdown = await analyzeResultWithInternalModel(result, args.question);
+    if (store) store.put(identity, storedPayload(args, result));
     return {
       delivery: {
         schemaVersion: 1,
@@ -642,9 +819,16 @@ async function deliverQueryResult(caller, args) {
     };
   }
   if (mode === 'excel') {
-    const result = await callDataMcpService('export', caller, args);
+    const safeArgs = { ...args, filename: sanitizedExcelFilename(args.filename) };
+    const result = await callDataMcpService('export', caller, safeArgs);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
     const path = copyExportToPluginOutbound(result.file);
+    try {
+      if (store) store.put(identity, storedPayload(safeArgs, null));
+    } catch (error) {
+      discardStagedOutboundArtifact(path);
+      throw error;
+    }
     return {
       delivery: {
         schemaVersion: 1,
@@ -662,6 +846,98 @@ async function deliverQueryResult(caller, args) {
       message: 'output_mode 仅支持 analysis 或 excel；一次查询只允许一种执行路径',
     },
   };
+}
+
+async function continueQueryResult(caller, args) {
+  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
+    return { error: fixedFollowupResult('trusted_result_delivery_unavailable') };
+  }
+  let identity;
+  let store;
+  try {
+    identity = activeResultIdentity(caller);
+    store = resultStoreFor(caller);
+  } catch {
+    return { error: fixedFollowupResult('identity_rejected') };
+  }
+  const question = typeof args.question === 'string' ? args.question.trim() : '';
+  if (!question || question.length > 4000 || !caller.turnId) {
+    return { error: fixedFollowupResult('invalid_followup_request') };
+  }
+  const active = store.read(identity);
+  if (active.status !== 'active') {
+    store.audit(identity, caller.turnId, question, null, active.status);
+    return { error: fixedFollowupResult(active.status) };
+  }
+  if (!store.reserveTurn(identity, caller.turnId)) {
+    store.audit(identity, caller.turnId, question, active.record.version, 'rate_limited');
+    return { error: fixedFollowupResult('rate_limited') };
+  }
+  const expectedVersion = active.record.version;
+  const payload = active.record.payload;
+  const mode = args.output_mode === 'excel' ? 'excel' : 'analysis';
+  try {
+    if (mode === 'analysis') {
+      let result = payload.result;
+      let finalVersion = expectedVersion;
+      if (!result) {
+        const queryPlanId = await freshPlan(caller, payload.query);
+        const rerun = await callDataMcpService('run', caller, {
+          ...payload.query,
+          query_plan_id: queryPlanId,
+        });
+        if (rerun?.status !== 'success') throw new Error('followup_query_failed');
+        result = storableQueryResult(rerun);
+        const updated = store.replaceIfVersion(identity, expectedVersion, {
+          ...payload,
+          result,
+        });
+        finalVersion = updated.version;
+      }
+      const markdown = await analyzeResultWithInternalModel(result, question);
+      store.assertVersion(identity, finalVersion);
+      store.touch(identity, finalVersion);
+      store.audit(identity, caller.turnId, question, finalVersion, 'delivery_requested');
+      return {
+        delivery: {
+          schemaVersion: 1,
+          deliveryId: `data-followup-${randomUUID()}`,
+          markdown,
+          responseKind: 'final',
+        },
+      };
+    }
+
+    const queryPlanId = await freshPlan(caller, payload.query);
+    const exported = await callDataMcpService('export', caller, {
+      ...payload.query,
+      query_plan_id: queryPlanId,
+      filename: sanitizedExcelFilename(args.filename),
+    });
+    if (exported?.status !== 'success') throw new Error('followup_export_failed');
+    store.assertVersion(identity, expectedVersion);
+    const path = copyExportToPluginOutbound(exported.file);
+    try {
+      store.assertVersion(identity, expectedVersion);
+    } catch (error) {
+      discardStagedOutboundArtifact(path);
+      throw error;
+    }
+    store.touch(identity, expectedVersion);
+    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
+    return {
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: `data-followup-${randomUUID()}`,
+        markdown: `Excel 为重新查询结果。\n\n生成时间：${new Date().toISOString()}`,
+        files: [{ path }],
+        responseKind: 'final',
+      },
+    };
+  } catch {
+    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed');
+    return { error: fixedFollowupResult('delivery_failed') };
+  }
 }
 
 function isolatedDeliveryFailure() {
@@ -955,7 +1231,12 @@ async function callDataMcpService(kind, caller, args) {
       detail: redactHttpErrorDetail(kind, caller),
     };
   }
-  return kind === 'validate' ? redactSchemaDetailsForUntrustedCaller(body, caller) : body;
+  if (kind === 'validate') {
+    return isTrustedHumanOrSchedule(caller)
+      ? sanitizeValidationResult(body)
+      : redactSchemaDetailsForUntrustedCaller(body, caller);
+  }
+  return body;
 }
 
 function trustedCallerPayload(caller) {
@@ -1007,7 +1288,7 @@ async function callSnapshotService(kind, caller, payload) {
       audit_context: auditContext(caller),
     };
   }
-  return body;
+  return kind === 'searchSnapshot' ? sanitizeMetadataSearchResult(body) : body;
 }
 
 async function handleToolCall(request) {
@@ -1082,6 +1363,17 @@ async function handleToolCall(request) {
       prepared = await deliverQueryResult(caller, argsFrom(request));
     } catch {
       prepared = { error: isolatedDeliveryFailure() };
+    }
+    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+    return;
+  }
+
+  if (name === 'continue_query_result_for_user') {
+    let prepared;
+    try {
+      prepared = await continueQueryResult(caller, argsFrom(request));
+    } catch {
+      prepared = { error: fixedFollowupResult('delivery_failed') };
     }
     ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
     return;
@@ -1198,6 +1490,20 @@ function toolSchemas() {
           max_export_rows: { type: 'integer', minimum: 1 },
         },
         required: ['sql', 'query_plan_id', 'output_mode'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'continue_query_result_for_user',
+      description: 'Continue analysis of the caller-bound active result and deliver the answer through the trusted Botmux host without exposing result data to the calling model.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', minLength: 1, maxLength: 4000 },
+          output_mode: { type: 'string', enum: ['analysis', 'excel'], default: 'analysis' },
+          filename: { type: 'string', maxLength: 200 },
+        },
+        required: ['question'],
         additionalProperties: false,
       },
     },
