@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isPrivateModelAddress, resolvePrivateModelAddress } from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -179,6 +180,15 @@ for (const forbidden of ['result_id', 'session_id', 'union_id', 'app_id', 'ident
   if (schemaText.includes(forbidden)) throw new Error(`follow-up schema exposes ${forbidden}`);
 }
 
+const callsBeforeMissingCapability = modelCalls;
+const missingCapability = await plugin.call('continue_query_result_for_user', {
+  question: 'host capability is absent',
+}, { ...callerA, turnId: 'turn-no-capability', hostCapabilities: [] });
+if (!JSON.stringify(missingCapability).includes('trusted_result_delivery_unavailable')
+  || modelCalls !== callsBeforeMissingCapability) {
+  throw new Error('follow-up did not fail before model access when trusted delivery was unavailable');
+}
+
 const initial = await plugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-initial-plan', output_mode: 'analysis', question: 'initial',
@@ -255,6 +265,32 @@ if (modelPayloads.length < 2) throw new Error('internal model was not called for
 
 await plugin.close();
 
+const lowQuotaFile = join(root, 'low-quota.env');
+writeFileSync(lowQuotaFile, [
+  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
+  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
+  'DATA_MCP_RESULT_MODEL=internal-test-model',
+  `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
+  'DATA_MCP_RESULT_MAX_BYTES=256',
+].join('\n') + '\n', { mode: 0o600 });
+const lowQuota = spawnPlugin('session-synthetic-a', lowQuotaFile);
+const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
+}, { ...callerA, turnId: 'turn-low-quota-initial' });
+if (lowQuotaInitial.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) {
+  throw new Error('result-store quota failure broke first-turn delivery');
+}
+const callsAfterLowQuotaInitial = modelCalls;
+const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {
+  question: 'must not use the previous active result',
+}, { ...callerA, turnId: 'turn-low-quota-followup' });
+if (!JSON.stringify(lowQuotaFollowup).includes('no_active_result')
+  || modelCalls !== callsAfterLowQuotaInitial) {
+  throw new Error('result-store quota failure left a stale active result');
+}
+await lowQuota.close();
+
 const otherSession = spawnPlugin('session-synthetic-other');
 const crossSession = await otherSession.call('continue_query_result_for_user', { question: 'cross session' }, {
   ...callerA, turnId: 'turn-other-session',
@@ -269,6 +305,13 @@ writeFileSync(missingKeyFile, [
   'DATA_MCP_RESULT_MODEL=internal-test-model',
 ].join('\n') + '\n', { mode: 0o600 });
 const missingKey = spawnPlugin('session-missing-key', missingKeyFile);
+const missingKeyInitial = await missingKey.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
+}, { ...callerA, turnId: 'turn-missing-key-initial' });
+if (missingKeyInitial.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) {
+  throw new Error('missing result-store HMAC key broke first-turn delivery');
+}
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
   ...callerA, turnId: 'turn-missing-key',
 });
@@ -288,13 +331,38 @@ if (mode !== 0o600) throw new Error(`result file mode was ${mode.toString(8)}`);
 if (!store.reserveTurn(identity, 'turn-unit', 100) || store.reserveTurn(identity, 'turn-unit', 100)) {
   throw new Error('turn reservation was not one-shot');
 }
-store.put(identity, { result: { rows: [] } }, 101);
+const replacement = store.put(identity, { result: { rows: [] } }, 101);
+if (replacement.createdAt !== 101 || replacement.absoluteExpiresAt !== 201) {
+  throw new Error('new query result inherited the previous absolute TTL');
+}
 let casFailed = false;
 try { store.assertVersion(identity, first.version, 101); } catch { casFailed = true; }
 if (!casFailed) throw new Error('stale result version did not fail closed');
 if (store.read(identity, 112).status !== 'expired') throw new Error('idle expiry failed');
 if (store.put(identity, { result: { rows: [] } }, 113).version !== 1) {
   throw new Error('expired result was not replaced as a fresh active result');
+}
+
+for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '::1', 'fd00::1']) {
+  if (!isPrivateModelAddress(address)) throw new Error(`private model address was rejected: ${address}`);
+}
+for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::ffff:8.8.8.8', '2001:4860:4860::8888']) {
+  if (isPrivateModelAddress(address)) throw new Error(`non-private model address was accepted: ${address}`);
+}
+const privateResolution = await resolvePrivateModelAddress('synthetic.internal', async () => [
+  { address: '10.2.3.4', family: 4 },
+  { address: 'fd00::2', family: 6 },
+]);
+if (privateResolution.address !== '10.2.3.4') throw new Error('private DNS resolution did not return a pinned address');
+for (const answers of [
+  [{ address: '198.18.0.1', family: 4 }],
+  [{ address: '10.2.3.4', family: 4 }, { address: '8.8.8.8', family: 4 }],
+  [],
+]) {
+  let rejected = false;
+  try { await resolvePrivateModelAddress('synthetic.internal', async () => answers); }
+  catch { rejected = true; }
+  if (!rejected) throw new Error(`unsafe DNS answers were accepted: ${JSON.stringify(answers)}`);
 }
 
 const publicEndpointFile = join(root, 'public-endpoint.env');

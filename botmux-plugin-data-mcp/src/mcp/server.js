@@ -1,13 +1,12 @@
 import { createInterface } from 'node:readline';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { ResultStore } from './result-store.js';
+import { clearAllStoredResults, ResultStore } from './result-store.js';
+import { resolvePrivateModelAddress } from './private-network.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -617,30 +616,6 @@ function resultModelConfig() {
   };
 }
 
-function isPrivateModelAddress(address) {
-  const family = isIP(address);
-  if (family === 4) {
-    const octets = address.split('.').map(Number);
-    return octets[0] === 127
-      || octets[0] === 10
-      || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
-      || (octets[0] === 192 && octets[1] === 168);
-  }
-  if (family === 6) {
-    const normalized = address.toLowerCase();
-    return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd');
-  }
-  return false;
-}
-
-async function resolvePrivateModelAddress(hostname) {
-  const results = await dnsLookup(hostname, { all: true, verbatim: true });
-  if (!results.length || results.some(result => !isPrivateModelAddress(result.address))) {
-    throw new Error('result_model_network_not_private');
-  }
-  return results[0];
-}
-
 async function postJsonToResultModel(endpoint, apiKey, payload) {
   const pinned = await resolvePrivateModelAddress(endpoint.hostname);
   return new Promise((resolvePromise, reject) => {
@@ -800,15 +775,33 @@ async function deliverQueryResult(caller, args) {
   let identity;
   let store;
   if (caller.senderType === 'user') {
-    identity = activeResultIdentity(caller);
-    store = resultStoreFor(caller);
+    try {
+      identity = activeResultIdentity(caller);
+      store = resultStoreFor(caller);
+      // A new first-turn query invalidates the old active result before any
+      // work starts. If the new snapshot cannot be stored, follow-ups must see
+      // no result rather than silently using data from the previous query.
+      store.clear(identity);
+    } catch {
+      try { clearAllStoredResults(nonBlankProcessEnv('BOTMUX_PLUGIN_HOME')); }
+      catch { /* fail safe: follow-up store creation still remains unavailable */ }
+      identity = undefined;
+      store = undefined;
+    }
   }
   const mode = args.output_mode;
   if (mode === 'analysis') {
     const result = await callDataMcpService('run', caller, args);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
     const markdown = await analyzeResultWithInternalModel(result, args.question);
-    if (store) store.put(identity, storedPayload(args, result));
+    if (store) {
+      try { store.put(identity, storedPayload(args, result)); }
+      catch {
+        store.clear(identity);
+        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
+        catch { /* best-effort non-sensitive audit */ }
+      }
+    }
     return {
       delivery: {
         schemaVersion: 1,
@@ -823,11 +816,13 @@ async function deliverQueryResult(caller, args) {
     const result = await callDataMcpService('export', caller, safeArgs);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
     const path = copyExportToPluginOutbound(result.file);
-    try {
-      if (store) store.put(identity, storedPayload(safeArgs, null));
-    } catch (error) {
-      discardStagedOutboundArtifact(path);
-      throw error;
+    if (store) {
+      try { store.put(identity, storedPayload(safeArgs, null)); }
+      catch {
+        store.clear(identity);
+        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
+        catch { /* best-effort non-sensitive audit */ }
+      }
     }
     return {
       delivery: {

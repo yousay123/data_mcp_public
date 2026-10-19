@@ -39,6 +39,17 @@ function safeUnlink(path) {
   try { unlinkSync(path); } catch { /* already removed */ }
 }
 
+export function clearAllStoredResults(pluginHome) {
+  if (typeof pluginHome !== 'string' || !pluginHome.trim()) return;
+  const records = resolve(pluginHome, 'active-results-v1', 'records');
+  if (!existsSync(records)) return;
+  const stat = lstatSync(records);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('result_store_unsafe_directory');
+  for (const name of readdirSync(records)) {
+    if (/^[a-f0-9]{64}\.json$/.test(name)) safeUnlink(join(records, name));
+  }
+}
+
 export class ResultStore {
   constructor({ pluginHome, secret, config = {} }) {
     if (typeof pluginHome !== 'string' || !pluginHome.trim()) throw new Error('result_store_home_required');
@@ -116,7 +127,7 @@ export class ResultStore {
     const path = this.recordPath(bindingKey);
     this.cleanup(now);
     const previous = this.readRecord(path);
-    const createdAt = previous?.createdAt ?? now;
+    const createdAt = now;
     const record = {
       schemaVersion: SCHEMA_VERSION,
       bindingKey,
@@ -141,7 +152,25 @@ export class ResultStore {
     if (current.status !== 'active' || current.record.version !== expectedVersion) {
       throw new Error('result_store_version_changed');
     }
-    return this.put(identity, payload, now);
+    const record = {
+      ...current.record,
+      version: current.record.version + 1,
+      updatedAt: now,
+      idleExpiresAt: Math.min(current.record.absoluteExpiresAt, now + this.idleTtlMs),
+      payload,
+    };
+    const serialized = `${JSON.stringify(record)}\n`;
+    const bytes = Buffer.byteLength(serialized);
+    if (bytes > this.maxResultBytes) throw new Error('result_store_result_too_large');
+    const path = this.recordPath(current.record.bindingKey);
+    this.enforceQuota(current.record.ownerKey, bytes, statSync(path).size);
+    this.atomicWrite(path, serialized);
+    return record;
+  }
+
+  clear(identity) {
+    const { bindingKey } = this.binding(identity);
+    safeUnlink(this.recordPath(bindingKey));
   }
 
   assertVersion(identity, expectedVersion, now = Date.now()) {
