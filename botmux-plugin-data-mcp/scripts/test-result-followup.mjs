@@ -440,15 +440,18 @@ for (const scenario of [
     now: Date.UTC(2099, 10, 30),
   },
 ]) {
-  let rejected = false;
+  let exceptionUsed = false;
+  let rejection;
   try {
     await resolvePrivateModelAddress(scenario.hostname, async () => scenario.answers, {
       testException: scenario.exception,
       now: scenario.now,
-      onTestExceptionUsed: () => { throw new Error('unsafe exception reached audit callback'); },
+      onTestExceptionUsed: () => { exceptionUsed = true; },
     });
-  } catch { rejected = true; }
-  if (!rejected) throw new Error(`${scenario.label} test endpoint exception was accepted`);
+  } catch (error) { rejection = error; }
+  if (exceptionUsed || rejection?.message !== 'result_model_network_not_private') {
+    throw new Error(`${scenario.label} test endpoint exception was accepted or rejected incorrectly`);
+  }
 }
 
 for (const invalid of [
@@ -463,6 +466,19 @@ for (const invalid of [
   if (parseResultModelTestException(invalid, Date.UTC(2099, 10, 30))) {
     throw new Error(`invalid test endpoint exception was accepted: ${invalid}`);
   }
+}
+if (parseResultModelTestException(
+  'host=synthetic.example;ip=203.0.113.10;expires=2099-12-31',
+  Date.UTC(2099, 0, 1),
+)) {
+  throw new Error('test endpoint exception longer than 60 days was accepted');
+}
+
+const serverSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'server.js'), 'utf8');
+if (!serverSource.includes(
+  "testException: configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
+)) {
+  throw new Error('result model test exception is not wired from host configuration');
 }
 
 const warningEnvFile = join(root, 'test-exception-warning.env');

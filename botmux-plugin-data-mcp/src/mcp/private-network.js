@@ -2,6 +2,8 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
 const TEST_EXCEPTION_PATTERN = /^host=([^;]+);ip=([^;]+);expires=(\d{4}-\d{2}-\d{2})$/;
+const MAX_TEST_EXCEPTION_DAYS = 60;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function isPrivateModelAddress(address) {
   const family = isIP(address);
@@ -43,9 +45,19 @@ export function parseResultModelTestException(value, now = Date.now()) {
     return null;
   }
   const [year, month, day] = expires.split('-').map(Number);
-  const expiresAt = Date.UTC(year, month - 1, day + 1);
-  const normalized = new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10);
-  if (normalized !== expires || !Number.isFinite(expiresAt) || now >= expiresAt) return null;
+  const expiryDay = Date.UTC(year, month - 1, day);
+  const expiresAt = expiryDay + DAY_MS;
+  const current = new Date(now);
+  const currentDay = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate());
+  const normalized = new Date(expiryDay).toISOString().slice(0, 10);
+  if (
+    normalized !== expires
+    || !Number.isFinite(expiresAt)
+    || now >= expiresAt
+    || expiryDay - currentDay > MAX_TEST_EXCEPTION_DAYS * DAY_MS
+  ) {
+    return null;
+  }
   return { hostname, address, expiresAt };
 }
 

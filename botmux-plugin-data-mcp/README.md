@@ -145,7 +145,8 @@ Environment contract:
     as `host=exact.example;ip=203.0.113.10;expires=YYYY-MM-DD`. Wildcards, CIDR
     ranges, multiple records, private/loopback addresses, and `198.18.0.0/15`
     proxy fake-IP addresses are rejected. The hostname and its sole DNS answer
-    must exactly match, and the exception expires automatically after the stated
+    must exactly match. The expiry may be at most 60 calendar days from the
+    current UTC date, and the exception expires automatically after the stated
     UTC date.
   - Every use writes a `model_endpoint_exception_used` audit event containing
     only a host fingerprint. This exception is only for synthetic data or
