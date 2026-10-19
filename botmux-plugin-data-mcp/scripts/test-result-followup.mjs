@@ -476,7 +476,7 @@ if (parseResultModelTestException(
 
 const serverSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'server.js'), 'utf8');
 if (!serverSource.includes(
-  "testException: configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
+  "testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
 )) {
   throw new Error('result model test exception is not wired from host configuration');
 }
