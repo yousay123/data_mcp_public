@@ -6,7 +6,7 @@ import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
-import { resolvePrivateModelAddress } from './private-network.js';
+import { pinnedModelLookup, resolvePrivateModelAddress } from './private-network.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -657,7 +657,7 @@ async function postJsonToResultModel(endpoint, apiKey, payload, runtimeConfig) {
     const req = transport(endpoint, {
       method: 'POST',
       headers,
-      lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
+      lookup: pinnedModelLookup(pinned.address, pinned.family),
       ...(endpoint.protocol === 'https:' ? { servername: endpoint.hostname } : {}),
     }, (res) => {
       const chunks = [];

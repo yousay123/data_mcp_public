@@ -8,6 +8,7 @@ import {
   isPrivateModelAddress,
   isProxyFakeIpAddress,
   parseResultModelTestException,
+  pinnedModelLookup,
   resolvePrivateModelAddress,
 } from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
@@ -362,6 +363,28 @@ const privateResolution = await resolvePrivateModelAddress('synthetic.internal',
   { address: 'fd00::2', family: 6 },
 ]);
 if (privateResolution.address !== '10.2.3.4') throw new Error('private DNS resolution did not return a pinned address');
+const pinnedLookup = pinnedModelLookup('10.2.3.4', 4);
+const allLookupResult = await new Promise((resolve, reject) => {
+  pinnedLookup('synthetic.internal', { all: true }, (error, addresses) => {
+    if (error) reject(error);
+    else resolve(addresses);
+  });
+});
+if (!Array.isArray(allLookupResult)
+  || allLookupResult.length !== 1
+  || allLookupResult[0].address !== '10.2.3.4'
+  || allLookupResult[0].family !== 4) {
+  throw new Error('pinned model lookup did not honor the Node all=true callback contract');
+}
+const singleLookupResult = await new Promise((resolve, reject) => {
+  pinnedLookup('synthetic.internal', {}, (error, address, family) => {
+    if (error) reject(error);
+    else resolve({ address, family });
+  });
+});
+if (singleLookupResult.address !== '10.2.3.4' || singleLookupResult.family !== 4) {
+  throw new Error('pinned model lookup did not honor the single-address callback contract');
+}
 for (const answers of [
   [{ address: '198.18.0.1', family: 4 }],
   [{ address: '10.2.3.4', family: 4 }, { address: '8.8.8.8', family: 4 }],

@@ -80,3 +80,13 @@ export async function resolvePrivateModelAddress(hostname, lookup = dnsLookup, o
   }
   throw new Error('result_model_network_not_private');
 }
+
+export function pinnedModelLookup(address, family) {
+  return (_hostname, options, callback) => {
+    if (options && typeof options === 'object' && options.all === true) {
+      callback(null, [{ address, family }]);
+      return;
+    }
+    callback(null, address, family);
+  };
+}
