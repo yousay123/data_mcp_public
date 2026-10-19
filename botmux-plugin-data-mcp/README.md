@@ -170,9 +170,12 @@ Environment contract:
     the selected app and never fall back to the default profile.
   - The test profile may override only the dedicated service socket and result
     model endpoint, exact-host allowlist, model, API key, and endpoint test
-    exception. HMAC keys, caller/session identity, service authentication, and
-    all other settings are ignored even if present in the file. The cache is
-    isolated by signed app id, absolute file path, and mtime.
+    exception. Socket, model endpoint, exact-host allowlist, and model are all
+    required; the socket cannot be `disabled`. A selected profile is a closed
+    configuration group: omitted optional keys remain absent and never inherit
+    their default-profile values. HMAC keys, caller/session identity, service
+    authentication, and all other settings are ignored even if present in the
+    file. The cache is isolated by signed app id, absolute file path, and mtime.
   - Configure this only for a dedicated integration-test bot. Remove both
     selector variables and the public-endpoint exception after moving the model
     to the Tencent Cloud private network. While enabled, use only synthetic data

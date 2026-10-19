@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
 import { resolvePrivateModelAddress } from './private-network.js';
-import { resolveSignedAppTestProfile } from './signed-app-profile.js';
+import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -235,8 +235,11 @@ function runtimeConfigForCaller(caller) {
   return Object.freeze({
     testProfileSelected: profile !== undefined,
     value(name) {
-      const override = profile?.[name];
-      return typeof override === 'string' && override ? override : configValue(name);
+      if (profile && TEST_PROFILE_ALLOWED_KEYS.has(name)) {
+        const override = profile[name];
+        return typeof override === 'string' && override ? override : undefined;
+      }
+      return configValue(name);
     },
   });
 }

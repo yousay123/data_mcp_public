@@ -9,6 +9,12 @@ export const TEST_PROFILE_ALLOWED_KEYS = new Set([
   'DATA_MCP_RESULT_MODEL_API_KEY',
   'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION',
 ]);
+const TEST_PROFILE_REQUIRED_KEYS = [
+  'DATA_MCP_SERVICE_SOCKET_PATH',
+  'DATA_MCP_RESULT_MODEL_ENDPOINT',
+  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS',
+  'DATA_MCP_RESULT_MODEL',
+];
 
 const profileCache = new Map();
 
@@ -55,6 +61,10 @@ function readWhitelistedProfile(path) {
     const entry = parseLine(line);
     if (entry && TEST_PROFILE_ALLOWED_KEYS.has(entry[0])) values[entry[0]] = entry[1];
   }
+  if (TEST_PROFILE_REQUIRED_KEYS.some(key => typeof values[key] !== 'string' || !values[key].trim())) {
+    invalidProfile();
+  }
+  if (values.DATA_MCP_SERVICE_SOCKET_PATH.trim().toLowerCase() === 'disabled') invalidProfile();
   return Object.freeze(values);
 }
 

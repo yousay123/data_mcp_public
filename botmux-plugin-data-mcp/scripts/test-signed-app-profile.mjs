@@ -28,6 +28,7 @@ const rowSentinel = 'SIGNED_PROFILE_ROW_SENTINEL';
 const modelSentinel = 'SIGNED_PROFILE_MODEL_SENTINEL';
 let modelCalls = 0;
 let modelAuthorization;
+let defaultServiceHits = 0;
 
 function jsonResponse(res, value, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -84,23 +85,48 @@ await new Promise(resolvePromise => model.listen(0, '127.0.0.1', resolvePromise)
 const modelAddress = model.address();
 if (!modelAddress || typeof modelAddress === 'string') throw new Error('model fixture did not bind');
 
+const defaultService = createServer((_req, res) => {
+  defaultServiceHits += 1;
+  jsonResponse(res, { status: 'error' }, 503);
+});
+await new Promise(resolvePromise => defaultService.listen(0, '127.0.0.1', resolvePromise));
+const defaultServiceAddress = defaultService.address();
+if (!defaultServiceAddress || typeof defaultServiceAddress === 'string') {
+  throw new Error('default service fixture did not bind');
+}
+
+function completeProfileLines(overrides = {}) {
+  return {
+    DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
+    DATA_MCP_RESULT_MODEL_ENDPOINT: `http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
+    DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS: '127.0.0.1',
+    DATA_MCP_RESULT_MODEL: 'signed-profile-model',
+    DATA_MCP_RESULT_MODEL_API_KEY: 'synthetic-profile-api-key',
+    ...overrides,
+  };
+}
+
+function writeProfile(path, values, mode = 0o600) {
+  writeFileSync(path, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode });
+}
+
 const defaultEnvFile = join(root, 'default.env');
 writeFileSync(defaultEnvFile, [
   `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
-  'DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:1/default-validate',
-  'DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:1/default-run',
-  'DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:1/default-export',
+  `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
+  `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
+  `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
+  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
+  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
+  'DATA_MCP_RESULT_MODEL=default-model',
+  'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
+  'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
 ].join('\n') + '\n', { mode: 0o600 });
 const profileFile = join(root, 'test-profile.env');
-writeFileSync(profileFile, [
-  `DATA_MCP_SERVICE_SOCKET_PATH=${socketPath}`,
-  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
-  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
-  'DATA_MCP_RESULT_MODEL=signed-profile-model',
-  'DATA_MCP_RESULT_MODEL_API_KEY=synthetic-profile-api-key',
-  `DATA_MCP_RESULT_BINDING_HMAC_KEY=${evilBindingSecret}`,
-  'BOTMUX_SESSION_ID=forbidden-profile-session',
-].join('\n') + '\n', { mode: 0o600 });
+writeProfile(profileFile, completeProfileLines({
+  DATA_MCP_RESULT_BINDING_HMAC_KEY: evilBindingSecret,
+  BOTMUX_SESSION_ID: 'forbidden-profile-session',
+}));
 
 function childEnvironment(extra = {}) {
   const env = { ...process.env };
@@ -183,6 +209,7 @@ const selectedValidation = await plugin.call('validate_sql_for_user', {
 if (!JSON.stringify(selectedValidation).includes('signed-profile-plan')) {
   throw new Error('signed matching app did not use the selected service profile');
 }
+if (defaultServiceHits !== 0) throw new Error('selected profile leaked into the default service');
 
 for (const [label, signedCaller, arguments_] of [
   ['other app', caller(otherAppId, 'other-turn'), {}],
@@ -192,10 +219,11 @@ for (const [label, signedCaller, arguments_] of [
   const response = await plugin.call('validate_sql_for_user', {
     sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c', ...arguments_,
   }, signedCaller);
-  if (!JSON.stringify(response).includes('data_mcp_service_unreachable')) {
+  if (JSON.stringify(response).includes('signed-profile-plan')) {
     throw new Error(`${label} incorrectly received the selected service profile`);
   }
 }
+if (defaultServiceHits !== 3) throw new Error('non-selected callers did not remain on the default profile');
 
 const initial = await plugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -222,6 +250,51 @@ if (!Array.isArray(exported.result?._meta?.botmuxHostDelivery?.files)) {
 }
 await plugin.close();
 
+for (const [label, mutate] of [
+  ['missing socket', values => { delete values.DATA_MCP_SERVICE_SOCKET_PATH; }],
+  ['missing model endpoint', values => { delete values.DATA_MCP_RESULT_MODEL_ENDPOINT; }],
+  ['missing allowed hosts', values => { delete values.DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS; }],
+  ['missing model', values => { delete values.DATA_MCP_RESULT_MODEL; }],
+  ['disabled socket', values => { values.DATA_MCP_SERVICE_SOCKET_PATH = 'disabled'; }],
+]) {
+  const invalidPath = join(root, `${label.replaceAll(' ', '-')}.env`);
+  const values = completeProfileLines();
+  mutate(values);
+  writeProfile(invalidPath, values);
+  const hitsBefore = defaultServiceHits;
+  const invalidProfilePlugin = spawnPlugin({
+    BOTMUX_SESSION_ID: `invalid-${label.replaceAll(' ', '-')}`,
+    DATA_MCP_TEST_PROFILE_ENV_FILE: invalidPath,
+  });
+  const response = await invalidProfilePlugin.call('validate_sql_for_user', {
+    sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  }, caller(selectedAppId, `invalid-${label.replaceAll(' ', '-')}-turn`));
+  if (!JSON.stringify(response).includes('test_profile_config_invalid')
+    || defaultServiceHits !== hitsBefore) {
+    throw new Error(`${label} profile fell back to the default service`);
+  }
+  await invalidProfilePlugin.close();
+}
+
+const noOptionalProfile = join(root, 'no-optional.env');
+const noOptionalValues = completeProfileLines();
+delete noOptionalValues.DATA_MCP_RESULT_MODEL_API_KEY;
+writeProfile(noOptionalProfile, noOptionalValues);
+modelAuthorization = 'not-called';
+const noOptionalPlugin = spawnPlugin({
+  BOTMUX_SESSION_ID: 'no-optional-session',
+  DATA_MCP_TEST_PROFILE_ENV_FILE: noOptionalProfile,
+});
+const noOptionalResult = await noOptionalPlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'no optional key',
+}, caller(selectedAppId, 'no-optional-turn'));
+if (noOptionalResult.result?._meta?.botmuxHostDelivery?.markdown !== modelSentinel
+  || modelAuthorization !== undefined) {
+  throw new Error('missing optional profile key fell back to the default profile');
+}
+await noOptionalPlugin.close();
+
 clearSignedAppTestProfileCacheForTests();
 const direct = resolveSignedAppTestProfile({ requestLarkAppId: selectedAppId }, childEnvironment());
 if (direct.DATA_MCP_SERVICE_SOCKET_PATH !== socketPath
@@ -235,7 +308,9 @@ if (resolveSignedAppTestProfile({ requestLarkAppId: otherAppId }, childEnvironme
 }
 
 const secondProfile = join(root, 'second-profile.env');
-writeFileSync(secondProfile, 'DATA_MCP_SERVICE_SOCKET_PATH=/synthetic/second.sock\n', { mode: 0o600 });
+writeProfile(secondProfile, completeProfileLines({
+  DATA_MCP_SERVICE_SOCKET_PATH: '/synthetic/second.sock',
+}));
 const fixedTime = new Date('2026-10-19T00:00:00.000Z');
 utimesSync(profileFile, fixedTime, fixedTime);
 utimesSync(secondProfile, fixedTime, fixedTime);
@@ -247,7 +322,9 @@ if (second.DATA_MCP_SERVICE_SOCKET_PATH !== '/synthetic/second.sock'
   || direct.DATA_MCP_SERVICE_SOCKET_PATH === second.DATA_MCP_SERVICE_SOCKET_PATH) {
   throw new Error('profile cache crossed app or file boundaries');
 }
-writeFileSync(secondProfile, 'DATA_MCP_SERVICE_SOCKET_PATH=/synthetic/reloaded.sock\n', { mode: 0o600 });
+writeProfile(secondProfile, completeProfileLines({
+  DATA_MCP_SERVICE_SOCKET_PATH: '/synthetic/reloaded.sock',
+}));
 const laterTime = new Date(fixedTime.getTime() + 1000);
 utimesSync(secondProfile, laterTime, laterTime);
 const reloaded = resolveSignedAppTestProfile(
@@ -258,8 +335,11 @@ if (reloaded.DATA_MCP_SERVICE_SOCKET_PATH !== '/synthetic/reloaded.sock') {
   throw new Error('profile cache did not reload after mtime changed');
 }
 
+const relativeProfileName = `.signed-profile-relative-${process.pid}.env`;
+const relativeProfilePath = join(pluginRoot, relativeProfileName);
+writeProfile(relativeProfilePath, completeProfileLines());
 for (const [label, pathValue] of [
-  ['relative path', 'relative.env'],
+  ['relative path', relativeProfileName],
   ['missing path', join(root, 'missing.env')],
 ]) {
   let rejected = false;
@@ -271,9 +351,12 @@ for (const [label, pathValue] of [
   } catch (error) { rejected = error?.message === 'test_profile_config_invalid'; }
   if (!rejected) throw new Error(`${label} did not fail closed`);
 }
+rmSync(relativeProfilePath, { force: true });
 
 const looseProfile = join(root, 'loose.env');
-writeFileSync(looseProfile, 'DATA_MCP_SERVICE_SOCKET_PATH=/synthetic/loose.sock\n', { mode: 0o644 });
+writeProfile(looseProfile, completeProfileLines({
+  DATA_MCP_SERVICE_SOCKET_PATH: '/synthetic/loose.sock',
+}), 0o644);
 const linkedProfile = join(root, 'linked.env');
 symlinkSync(secondProfile, linkedProfile);
 for (const [label, pathValue] of [['loose permissions', looseProfile], ['symlink', linkedProfile]]) {
@@ -313,5 +396,6 @@ await invalidPlugin.close();
 chmodSync(looseProfile, 0o600);
 service.close();
 model.close();
+defaultService.close();
 rmSync(root, { recursive: true, force: true });
 process.stdout.write('signed app test profile validation passed\n');
