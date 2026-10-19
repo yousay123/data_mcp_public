@@ -4,7 +4,12 @@ import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isPrivateModelAddress, resolvePrivateModelAddress } from '../src/mcp/private-network.js';
+import {
+  isPrivateModelAddress,
+  isProxyFakeIpAddress,
+  parseResultModelTestException,
+  resolvePrivateModelAddress,
+} from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -349,6 +354,9 @@ for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.254', 
 for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::ffff:8.8.8.8', '2001:4860:4860::8888']) {
   if (isPrivateModelAddress(address)) throw new Error(`non-private model address was accepted: ${address}`);
 }
+for (const address of ['198.18.0.1', '198.19.255.254']) {
+  if (!isProxyFakeIpAddress(address)) throw new Error(`proxy fake IP was not recognized: ${address}`);
+}
 const privateResolution = await resolvePrivateModelAddress('synthetic.internal', async () => [
   { address: '10.2.3.4', family: 4 },
   { address: 'fd00::2', family: 6 },
@@ -363,6 +371,112 @@ for (const answers of [
   try { await resolvePrivateModelAddress('synthetic.internal', async () => answers); }
   catch { rejected = true; }
   if (!rejected) throw new Error(`unsafe DNS answers were accepted: ${JSON.stringify(answers)}`);
+}
+
+const exceptionHost = 'synthetic-external.example';
+const exceptionAddress = '203.0.113.10';
+const exceptionValue = `host=${exceptionHost};ip=${exceptionAddress};expires=2099-12-31`;
+let exceptionAuditCalls = 0;
+const exceptionResolution = await resolvePrivateModelAddress(exceptionHost, async () => [
+  { address: exceptionAddress, family: 4 },
+], {
+  testException: exceptionValue,
+  now: Date.UTC(2099, 10, 30),
+  onTestExceptionUsed: async (hostname) => {
+    exceptionAuditCalls += 1;
+    store.auditModelEndpointException(hostname, Date.UTC(2099, 10, 30));
+  },
+});
+if (!exceptionResolution.testExceptionUsed || exceptionResolution.address !== exceptionAddress
+  || exceptionAuditCalls !== 1) {
+  throw new Error('exact test endpoint exception was not used and audited');
+}
+const exceptionAuditText = readFileSync(join(storeHome, 'active-results-v1', 'audit.jsonl'), 'utf8');
+if (!exceptionAuditText.includes('model_endpoint_exception_used')
+  || exceptionAuditText.includes(exceptionHost)
+  || exceptionAuditText.includes(exceptionAddress)
+  || exceptionAuditText.includes(rowSentinel)
+  || exceptionAuditText.includes(modelSentinel)) {
+  throw new Error('test endpoint exception audit leaked host, IP, or result data');
+}
+
+for (const scenario of [
+  {
+    label: 'hostname mismatch',
+    hostname: 'other.example',
+    answers: [{ address: exceptionAddress, family: 4 }],
+    exception: exceptionValue,
+    now: Date.UTC(2099, 10, 30),
+  },
+  {
+    label: 'IP mismatch',
+    hostname: exceptionHost,
+    answers: [{ address: '203.0.113.11', family: 4 }],
+    exception: exceptionValue,
+    now: Date.UTC(2099, 10, 30),
+  },
+  {
+    label: 'multiple DNS answers',
+    hostname: exceptionHost,
+    answers: [
+      { address: exceptionAddress, family: 4 },
+      { address: '203.0.113.11', family: 4 },
+    ],
+    exception: exceptionValue,
+    now: Date.UTC(2099, 10, 30),
+  },
+  {
+    label: 'expired exception',
+    hostname: exceptionHost,
+    answers: [{ address: exceptionAddress, family: 4 }],
+    exception: `host=${exceptionHost};ip=${exceptionAddress};expires=2026-10-18`,
+    now: Date.UTC(2026, 9, 19),
+  },
+  {
+    label: 'missing exception',
+    hostname: exceptionHost,
+    answers: [{ address: exceptionAddress, family: 4 }],
+    exception: undefined,
+    now: Date.UTC(2099, 10, 30),
+  },
+]) {
+  let rejected = false;
+  try {
+    await resolvePrivateModelAddress(scenario.hostname, async () => scenario.answers, {
+      testException: scenario.exception,
+      now: scenario.now,
+      onTestExceptionUsed: () => { throw new Error('unsafe exception reached audit callback'); },
+    });
+  } catch { rejected = true; }
+  if (!rejected) throw new Error(`${scenario.label} test endpoint exception was accepted`);
+}
+
+for (const invalid of [
+  'host=*.example;ip=203.0.113.10;expires=2099-12-31',
+  'host=synthetic.example;ip=203.0.113.0/24;expires=2099-12-31',
+  'host=synthetic.example;ip=198.18.0.1;expires=2099-12-31',
+  'host=synthetic.example;ip=127.0.0.1;expires=2099-12-31',
+  'host=synthetic.example;ip=10.0.0.1;expires=2099-12-31',
+  'host=203.0.113.10;ip=203.0.113.10;expires=2099-12-31',
+  'host=one.example;ip=203.0.113.10;expires=2099-12-31;host=two.example',
+]) {
+  if (parseResultModelTestException(invalid, Date.UTC(2099, 10, 30))) {
+    throw new Error(`invalid test endpoint exception was accepted: ${invalid}`);
+  }
+}
+
+const warningEnvFile = join(root, 'test-exception-warning.env');
+writeFileSync(warningEnvFile, [
+  `DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=${exceptionValue}`,
+  `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
+].join('\n') + '\n', { mode: 0o600 });
+const warningPlugin = spawnPlugin('session-test-exception-warning', warningEnvFile);
+await warningPlugin.list();
+await warningPlugin.close();
+if (!warningPlugin.stderr().includes('WARN test-only result model endpoint exception is configured')
+  || warningPlugin.stderr().includes(exceptionHost)
+  || warningPlugin.stderr().includes(exceptionAddress)) {
+  throw new Error('test endpoint exception startup warning was missing or exposed endpoint details');
 }
 
 const publicEndpointFile = join(root, 'public-endpoint.env');

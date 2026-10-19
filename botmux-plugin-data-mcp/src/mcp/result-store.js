@@ -221,6 +221,19 @@ export class ResultStore {
     chmodSync(this.auditPath, 0o600);
   }
 
+  auditModelEndpointException(hostname, now = Date.now()) {
+    if (typeof hostname !== 'string' || !hostname.trim()) {
+      throw new Error('result_model_exception_host_required');
+    }
+    const event = {
+      at: new Date(now).toISOString(),
+      host: this.digest('model-endpoint-host-v1', [hostname]).slice(0, 16),
+      status: 'model_endpoint_exception_used',
+    };
+    appendFileSync(this.auditPath, `${JSON.stringify(event)}\n`, { encoding: 'utf8', mode: 0o600 });
+    chmodSync(this.auditPath, 0o600);
+  }
+
   enforceQuota(ownerKey, incomingBytes, replacedBytes) {
     let total = 0;
     let ownerTotal = 0;

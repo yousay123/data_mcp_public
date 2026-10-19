@@ -140,6 +140,18 @@ Environment contract:
     IPv6 ULA. Redirects and `198.18.0.0/15` proxy fake-IP addresses are rejected.
     Deployments using split DNS must configure a direct route that resolves to
     the real private address; never weaken the address check to accommodate a proxy.
+- `DATA_MCP_RESULT_MODEL_TEST_EXCEPTION`
+  - Test-only, default-disabled exception for exactly one public endpoint, formatted
+    as `host=exact.example;ip=203.0.113.10;expires=YYYY-MM-DD`. Wildcards, CIDR
+    ranges, multiple records, private/loopback addresses, and `198.18.0.0/15`
+    proxy fake-IP addresses are rejected. The hostname and its sole DNS answer
+    must exactly match, and the exception expires automatically after the stated
+    UTC date.
+  - Every use writes a `model_endpoint_exception_used` audit event containing
+    only a host fingerprint. This exception is only for synthetic data or
+    non-sensitive aggregate queries during integration testing. Remove it when
+    the model moves to the Tencent Cloud private network; never use it as a
+    production deployment substitute.
 - `DATA_MCP_RESULT_MODEL`
   - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`

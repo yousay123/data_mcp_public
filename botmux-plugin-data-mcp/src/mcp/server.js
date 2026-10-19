@@ -222,6 +222,10 @@ function configValue(name) {
   return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
 }
 
+if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
+  console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
+}
+
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
   // process environment. Do not replace this with configValue(), whose local
@@ -617,7 +621,10 @@ function resultModelConfig() {
 }
 
 async function postJsonToResultModel(endpoint, apiKey, payload) {
-  const pinned = await resolvePrivateModelAddress(endpoint.hostname);
+  const pinned = await resolvePrivateModelAddress(endpoint.hostname, undefined, {
+    testException: configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
+    onTestExceptionUsed: (hostname) => resultStoreFor().auditModelEndpointException(hostname),
+  });
   return new Promise((resolvePromise, reject) => {
     const body = JSON.stringify(payload);
     const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
