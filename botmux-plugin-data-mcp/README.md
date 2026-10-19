@@ -162,6 +162,21 @@ Environment contract:
 - `DATA_MCP_RESULT_BINDING_HMAC_KEY`
   - Required, host-only secret of at least 32 characters for interactive result
     bindings. Missing keys fail closed. Keep it in the same host-only env file.
+- `DATA_MCP_TEST_PROFILE_APP_ID` / `DATA_MCP_TEST_PROFILE_ENV_FILE`
+  - Optional test-only selector. When the host-signed per-call
+    `requestLarkAppId` exactly matches the configured app id, the plugin loads
+    the absolute env-file path as that call's test profile. Missing, malformed,
+    symlinked, non-regular, or permissions broader than `0600` fail closed for
+    the selected app and never fall back to the default profile.
+  - The test profile may override only the dedicated service socket and result
+    model endpoint, exact-host allowlist, model, API key, and endpoint test
+    exception. HMAC keys, caller/session identity, service authentication, and
+    all other settings are ignored even if present in the file. The cache is
+    isolated by signed app id, absolute file path, and mtime.
+  - Configure this only for a dedicated integration-test bot. Remove both
+    selector variables and the public-endpoint exception after moving the model
+    to the Tencent Cloud private network. While enabled, use only synthetic data
+    or explicitly approved non-sensitive aggregates.
 - `DATA_MCP_RESULT_IDLE_TTL_MS` / `DATA_MCP_RESULT_ABSOLUTE_TTL_MS`
   - Optional positive integer overrides. Defaults are 24 hours idle and 7 days absolute.
 - `DATA_MCP_RESULT_MAX_BYTES` / `DATA_MCP_RESULT_MAX_OWNER_BYTES` /

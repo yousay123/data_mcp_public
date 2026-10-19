@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
 import { resolvePrivateModelAddress } from './private-network.js';
+import { resolveSignedAppTestProfile } from './signed-app-profile.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -224,6 +225,20 @@ function configValue(name) {
 
 if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
   console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
+}
+if (process.env.DATA_MCP_TEST_PROFILE_APP_ID || process.env.DATA_MCP_TEST_PROFILE_ENV_FILE) {
+  console.error('[data-mcp] WARN signed-app test profile selection is configured');
+}
+
+function runtimeConfigForCaller(caller) {
+  const profile = resolveSignedAppTestProfile(caller);
+  return Object.freeze({
+    testProfileSelected: profile !== undefined,
+    value(name) {
+      const override = profile?.[name];
+      return typeof override === 'string' && override ? override : configValue(name);
+    },
+  });
 }
 
 function nonBlankProcessEnv(name) {
@@ -490,17 +505,20 @@ function argsFrom(request) {
     : {};
 }
 
-function serviceBaseUrl() {
-  return (configValue('DATA_MCP_SERVICE_BASE_URL') || DEFAULT_SERVICE_BASE_URL).replace(/\/+$/, '');
+function serviceBaseUrl(runtimeConfig) {
+  return (runtimeConfig.value('DATA_MCP_SERVICE_BASE_URL') || DEFAULT_SERVICE_BASE_URL).replace(/\/+$/, '');
 }
 
-function explicitServiceEndpoint(kind) {
+function explicitServiceEndpoint(kind, runtimeConfig) {
+  // A selected profile's dedicated Unix socket is the complete service
+  // boundary. Never let a default-profile per-tool URL bypass it.
+  if (runtimeConfig.testProfileSelected) return undefined;
   if (kind === 'validate') {
-    return configValue('DATA_MCP_VALIDATE_SQL_ENDPOINT');
+    return runtimeConfig.value('DATA_MCP_VALIDATE_SQL_ENDPOINT');
   } else if (kind === 'export') {
-    return configValue('DATA_MCP_EXPORT_QUERY_ENDPOINT') || configValue('DATA_MCP_EXPORT_ENDPOINT');
+    return runtimeConfig.value('DATA_MCP_EXPORT_QUERY_ENDPOINT') || runtimeConfig.value('DATA_MCP_EXPORT_ENDPOINT');
   } else if (kind === 'run') {
-    return configValue('DATA_MCP_RUN_QUERY_ENDPOINT') || configValue('DATA_MCP_QUERY_ENDPOINT');
+    return runtimeConfig.value('DATA_MCP_RUN_QUERY_ENDPOINT') || runtimeConfig.value('DATA_MCP_QUERY_ENDPOINT');
   }
   // Snapshot endpoints deliberately have no per-tool environment override.
   // They must use the same private Unix-socket service boundary as the other tools.
@@ -519,14 +537,14 @@ function servicePath(kind) {
   throw new Error(`unsupported_service_kind:${String(kind)}`);
 }
 
-function serviceEndpoint(kind) {
-  const explicit = explicitServiceEndpoint(kind);
+function serviceEndpoint(kind, runtimeConfig) {
+  const explicit = explicitServiceEndpoint(kind, runtimeConfig);
   if (explicit) return explicit;
-  return `${serviceBaseUrl()}${servicePath(kind)}`;
+  return `${serviceBaseUrl(runtimeConfig)}${servicePath(kind)}`;
 }
 
-function serviceSocketPath() {
-  const socketPath = configValue('DATA_MCP_SERVICE_SOCKET_PATH');
+function serviceSocketPath(runtimeConfig) {
+  const socketPath = runtimeConfig.value('DATA_MCP_SERVICE_SOCKET_PATH');
   if (socketPath === 'disabled') return undefined;
   return socketPath || DEFAULT_SERVICE_SOCKET_PATH;
 }
@@ -599,10 +617,10 @@ function postJsonOverUrl(endpoint, payload) {
   });
 }
 
-function resultModelConfig() {
-  const endpointValue = configValue('DATA_MCP_RESULT_MODEL_ENDPOINT');
-  const model = configValue('DATA_MCP_RESULT_MODEL');
-  const allowedHosts = new Set((configValue('DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS') || '')
+function resultModelConfig(runtimeConfig) {
+  const endpointValue = runtimeConfig.value('DATA_MCP_RESULT_MODEL_ENDPOINT');
+  const model = runtimeConfig.value('DATA_MCP_RESULT_MODEL');
+  const allowedHosts = new Set((runtimeConfig.value('DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS') || '')
     .split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
   if (!endpointValue || !model || allowedHosts.size === 0) {
     throw new Error('result_model_not_configured');
@@ -616,13 +634,13 @@ function resultModelConfig() {
   return {
     endpoint,
     model,
-    apiKey: configValue('DATA_MCP_RESULT_MODEL_API_KEY'),
+    apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY'),
   };
 }
 
-async function postJsonToResultModel(endpoint, apiKey, payload) {
+async function postJsonToResultModel(endpoint, apiKey, payload, runtimeConfig) {
   const pinned = await resolvePrivateModelAddress(endpoint.hostname, undefined, {
-    testException: configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
+    testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
     onTestExceptionUsed: (hostname) => resultStoreFor().auditModelEndpointException(hostname),
   });
   return new Promise((resolvePromise, reject) => {
@@ -653,8 +671,8 @@ async function postJsonToResultModel(endpoint, apiKey, payload) {
   });
 }
 
-async function analyzeResultWithInternalModel(result, question) {
-  const config = resultModelConfig();
+async function analyzeResultWithInternalModel(result, question, runtimeConfig) {
+  const config = resultModelConfig(runtimeConfig);
   const serialized = JSON.stringify(result);
   if (Buffer.byteLength(serialized) > 5 * 1024 * 1024) throw new Error('result_model_payload_too_large');
   const response = await postJsonToResultModel(config.endpoint, config.apiKey, {
@@ -674,7 +692,7 @@ async function analyzeResultWithInternalModel(result, question) {
         content: `用户问题：${question || '请汇总本次查询结果'}\n查询结果：${serialized}`,
       },
     ],
-  });
+  }, runtimeConfig);
   if (!response.ok) throw new Error(`result_model_http_${response.status}`);
   let body;
   try { body = JSON.parse(response.text); } catch { throw new Error('result_model_invalid_json'); }
@@ -759,12 +777,12 @@ function storedPayload(args, result) {
   };
 }
 
-async function freshPlan(caller, query) {
+async function freshPlan(caller, query, runtimeConfig) {
   const validation = await callDataMcpService('validate', caller, {
     sql: query.sql,
     datasource: query.datasource,
     execution_mode: 'single',
-  });
+  }, runtimeConfig);
   if (validation?.status !== 'success' || typeof validation.query_plan_id !== 'string') {
     throw new Error('followup_revalidation_failed');
   }
@@ -779,7 +797,7 @@ function fixedFollowupResult(code) {
   };
 }
 
-async function deliverQueryResult(caller, args) {
+async function deliverQueryResult(caller, args, runtimeConfig) {
   if (!caller.hostCapabilities.includes('result_delivery_v1')) {
     return {
       error: {
@@ -808,9 +826,9 @@ async function deliverQueryResult(caller, args) {
   }
   const mode = args.output_mode;
   if (mode === 'analysis') {
-    const result = await callDataMcpService('run', caller, args);
+    const result = await callDataMcpService('run', caller, args, runtimeConfig);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-    const markdown = await analyzeResultWithInternalModel(result, args.question);
+    const markdown = await analyzeResultWithInternalModel(result, args.question, runtimeConfig);
     if (store) {
       try { store.put(identity, storedPayload(args, result)); }
       catch {
@@ -830,7 +848,7 @@ async function deliverQueryResult(caller, args) {
   }
   if (mode === 'excel') {
     const safeArgs = { ...args, filename: sanitizedExcelFilename(args.filename) };
-    const result = await callDataMcpService('export', caller, safeArgs);
+    const result = await callDataMcpService('export', caller, safeArgs, runtimeConfig);
     if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
     const path = copyExportToPluginOutbound(result.file);
     if (store) {
@@ -866,7 +884,7 @@ async function deliverQueryResult(caller, args) {
   };
 }
 
-async function continueQueryResult(caller, args) {
+async function continueQueryResult(caller, args, runtimeConfig) {
   if (!caller.hostCapabilities.includes('result_delivery_v1')) {
     return { error: fixedFollowupResult('trusted_result_delivery_unavailable') };
   }
@@ -899,11 +917,11 @@ async function continueQueryResult(caller, args) {
       let result = payload.result;
       let finalVersion = expectedVersion;
       if (!result) {
-        const queryPlanId = await freshPlan(caller, payload.query);
+        const queryPlanId = await freshPlan(caller, payload.query, runtimeConfig);
         const rerun = await callDataMcpService('run', caller, {
           ...payload.query,
           query_plan_id: queryPlanId,
-        });
+        }, runtimeConfig);
         if (rerun?.status !== 'success') throw new Error('followup_query_failed');
         result = storableQueryResult(rerun);
         const updated = store.replaceIfVersion(identity, expectedVersion, {
@@ -912,7 +930,7 @@ async function continueQueryResult(caller, args) {
         });
         finalVersion = updated.version;
       }
-      const markdown = await analyzeResultWithInternalModel(result, question);
+      const markdown = await analyzeResultWithInternalModel(result, question, runtimeConfig);
       store.assertVersion(identity, finalVersion);
       store.touch(identity, finalVersion);
       store.audit(identity, caller.turnId, question, finalVersion, 'delivery_requested');
@@ -926,12 +944,12 @@ async function continueQueryResult(caller, args) {
       };
     }
 
-    const queryPlanId = await freshPlan(caller, payload.query);
+    const queryPlanId = await freshPlan(caller, payload.query, runtimeConfig);
     const exported = await callDataMcpService('export', caller, {
       ...payload.query,
       query_plan_id: queryPlanId,
       filename: sanitizedExcelFilename(args.filename),
-    });
+    }, runtimeConfig);
     if (exported?.status !== 'success') throw new Error('followup_export_failed');
     store.assertVersion(identity, expectedVersion);
     const path = copyExportToPluginOutbound(exported.file);
@@ -966,7 +984,7 @@ function isolatedDeliveryFailure() {
   };
 }
 
-async function callDataMcpService(kind, caller, args) {
+async function callDataMcpService(kind, caller, args, runtimeConfig) {
   if (!caller.requestUserUnionId) {
     return {
       status: 'validation_error',
@@ -1045,16 +1063,16 @@ async function callDataMcpService(kind, caller, args) {
     if (typeof args.priority === 'string' && args.priority.trim()) {
       payload.priority = args.priority.trim();
     }
-    return callSnapshotService(kind, caller, payload);
+    return callSnapshotService(kind, caller, payload, runtimeConfig);
   }
 
   if (kind === 'refreshSnapshot') {
     const payload = trustedCallerPayload(caller);
-    return callSnapshotService(kind, caller, payload);
+    return callSnapshotService(kind, caller, payload, runtimeConfig);
   }
 
   if (kind === 'defaultRoleBaseline') {
-    return callSnapshotService(kind, caller, trustedCallerPayload(caller));
+    return callSnapshotService(kind, caller, trustedCallerPayload(caller), runtimeConfig);
   }
 
   if (kind === 'subjectsByTable') {
@@ -1077,7 +1095,7 @@ async function callDataMcpService(kind, caller, args) {
     }
     return callSnapshotService(kind, caller, {
       ...trustedCallerPayload(caller), target_tables: targetTables,
-    });
+    }, runtimeConfig);
   }
 
   if (kind === 'resourcesBySubject') {
@@ -1111,7 +1129,7 @@ async function callDataMcpService(kind, caller, args) {
       ...trustedCallerPayload(caller),
       target_accounts: targetAccounts,
       target_roles: targetRoles,
-    });
+    }, runtimeConfig);
   }
 
   const sql = typeof args.sql === 'string' ? args.sql : '';
@@ -1217,10 +1235,10 @@ async function callDataMcpService(kind, caller, args) {
 
   let response;
   try {
-    const explicit = explicitServiceEndpoint(kind);
-    const socketPath = serviceSocketPath();
+    const explicit = explicitServiceEndpoint(kind, runtimeConfig);
+    const socketPath = serviceSocketPath(runtimeConfig);
     response = explicit || !socketPath
-      ? await postJsonOverUrl(explicit || serviceEndpoint(kind), payload)
+      ? await postJsonOverUrl(explicit || serviceEndpoint(kind, runtimeConfig), payload)
       : await postJsonOverUnixSocket(socketPath, servicePath(kind), payload);
   } catch (err) {
     return {
@@ -1270,16 +1288,16 @@ function trustedCallerPayload(caller) {
   };
 }
 
-async function callSnapshotService(kind, caller, payload) {
+async function callSnapshotService(kind, caller, payload, runtimeConfig) {
   const isAudit = [
     'defaultRoleBaseline', 'subjectsByTable', 'resourcesBySubject',
   ].includes(kind);
   let response;
   try {
-    const socketPath = serviceSocketPath();
+    const socketPath = serviceSocketPath(runtimeConfig);
     response = socketPath
       ? await postJsonOverUnixSocket(socketPath, servicePath(kind), payload)
-      : await postJsonOverUrl(serviceEndpoint(kind), payload);
+      : await postJsonOverUrl(serviceEndpoint(kind, runtimeConfig), payload);
   } catch (err) {
     return {
       status: 'error',
@@ -1321,6 +1339,18 @@ async function handleToolCall(request) {
     return;
   }
 
+  let runtimeConfig;
+  try {
+    runtimeConfig = runtimeConfigForCaller(caller);
+  } catch {
+    ok(request.id, jsonTool({
+      status: 'error',
+      error_code: 'test_profile_config_invalid',
+      message: 'test_profile_config_invalid',
+    }));
+    return;
+  }
+
   const name = request.params?.name;
   if (name === 'data_mcp_identity_probe') {
     ok(request.id, jsonTool({
@@ -1359,7 +1389,7 @@ async function handleToolCall(request) {
   }
 
   if (name === 'validate_sql_for_user') {
-    ok(request.id, jsonTool(await callDataMcpService('validate', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('validate', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
@@ -1378,7 +1408,7 @@ async function handleToolCall(request) {
   if (name === 'deliver_query_result_for_user') {
     let prepared;
     try {
-      prepared = await deliverQueryResult(caller, argsFrom(request));
+      prepared = await deliverQueryResult(caller, argsFrom(request), runtimeConfig);
     } catch {
       prepared = { error: isolatedDeliveryFailure() };
     }
@@ -1389,7 +1419,7 @@ async function handleToolCall(request) {
   if (name === 'continue_query_result_for_user') {
     let prepared;
     try {
-      prepared = await continueQueryResult(caller, argsFrom(request));
+      prepared = await continueQueryResult(caller, argsFrom(request), runtimeConfig);
     } catch {
       prepared = { error: fixedFollowupResult('delivery_failed') };
     }
@@ -1398,27 +1428,27 @@ async function handleToolCall(request) {
   }
 
   if (name === 'refresh_metadata_snapshot') {
-    ok(request.id, jsonTool(await callDataMcpService('refreshSnapshot', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('refreshSnapshot', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
   if (name === 'search_metadata_snapshot') {
-    ok(request.id, jsonTool(await callDataMcpService('searchSnapshot', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('searchSnapshot', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
   if (name === 'inspect_ck_subjects_by_table') {
-    ok(request.id, jsonTool(await callDataMcpService('subjectsByTable', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('subjectsByTable', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
   if (name === 'inspect_ck_resources_by_subject') {
-    ok(request.id, jsonTool(await callDataMcpService('resourcesBySubject', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('resourcesBySubject', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
   if (name === 'audit_ck_default_role_baseline') {
-    ok(request.id, jsonTool(await callDataMcpService('defaultRoleBaseline', caller, argsFrom(request))));
+    ok(request.id, jsonTool(await callDataMcpService('defaultRoleBaseline', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
