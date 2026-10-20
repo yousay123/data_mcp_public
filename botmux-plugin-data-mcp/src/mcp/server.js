@@ -740,6 +740,7 @@ function storableQueryResult(result) {
     effective_limit: Number.isSafeInteger(result.effective_limit) ? result.effective_limit : null,
     truncated: result.truncated === true,
     truncation_uncertain: result.truncation_uncertain === true,
+    user_limit_reached: result.user_limit_reached === true,
     limit_injected: result.limit_injected === true,
     limit_capped: result.limit_capped === true,
     quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],

@@ -136,19 +136,18 @@ def test_tchouse_c_executor_uses_per_call_export_row_limit(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("returned_rows", "rows_before_limit", "expected_truncated"),
+    ("returned_rows", "rows_before_limit"),
     [
-        (20, 20, False),
-        (20, 66, True),
-        (200, 200, False),
-        (200, 201, True),
+        (20, 20),
+        (20, 66),
+        (200, 200),
+        (200, 201),
     ],
 )
-def test_tchouse_c_executor_uses_clickhouse_limit_metadata_for_truncation_detection(
+def test_tchouse_c_executor_exposes_limit_metadata_without_interpreting_sql_policy(
     monkeypatch,
     returned_rows: int,
     rows_before_limit: int,
-    expected_truncated: bool,
 ) -> None:
     def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
         return {
@@ -165,7 +164,7 @@ def test_tchouse_c_executor_uses_clickhouse_limit_metadata_for_truncation_detect
     )
 
     assert result.status == Status.SUCCESS
-    assert result.truncated is expected_truncated
+    assert result.truncated is False
     assert result.rows_before_limit_at_least == rows_before_limit
 
 

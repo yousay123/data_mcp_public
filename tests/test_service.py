@@ -192,7 +192,7 @@ def test_run_query_reports_limit_policy_flags(
         (199, None, False, False, False),
         (200, None, False, True, True),
         (200, 200, False, True, True),
-        (200, 201, True, True, False),
+        (200, 201, False, True, False),
     ],
 )
 def test_run_query_fails_closed_when_limit_metadata_cannot_prove_completeness(
@@ -245,6 +245,143 @@ def test_run_query_fails_closed_when_limit_metadata_cannot_prove_completeness(
     assert select_event.detail["effective_limit"] == 200
     assert select_event.detail["truncated"] is expected_truncated
     assert select_event.detail["truncation_uncertain"] is expected_uncertain
+
+
+def test_run_query_preserves_user_top_n_semantics(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_" + "2" * 32,
+            datasource=credential.datasource,
+            sql=sql,
+            row_count=10,
+            rows_before_limit_at_least=1000,
+        )
+
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1 AS number ORDER BY number LIMIT 10"
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["effective_limit"] == 10
+    assert result["limit_injected"] is False
+    assert result["limit_capped"] is False
+    assert result["truncated"] is False
+    assert result["truncation_uncertain"] is False
+    assert result["user_limit_reached"] is True
+    select_event = next(event for event in events if event.event_type == "select")
+    assert select_event.detail["user_limit_reached"] is True
+
+
+def test_run_query_marks_user_limit_capped_by_service_as_truncated(monkeypatch) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_" + "4" * 32,
+            datasource=credential.datasource,
+            sql=sql,
+            row_count=1000,
+            rows_before_limit_at_least=5000,
+        )
+
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1 LIMIT 5000"
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["effective_limit"] == 1000
+    assert result["limit_injected"] is False
+    assert result["limit_capped"] is True
+    assert result["truncated"] is True
+    assert result["truncation_uncertain"] is False
+    assert result["user_limit_reached"] is False
+
+
+def test_amber_trial_caps_user_limit_and_marks_service_truncation(monkeypatch) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_" + "3" * 32,
+            datasource=credential.datasource,
+            sql=sql,
+            row_count=20,
+            rows_before_limit_at_least=100,
+        )
+
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1 LIMIT 100"
+    audit_context = {
+        "caller_source": "amber",
+        "sender_type": "user",
+        "session_id": "amber:run_trial",
+        "turn_id": "run_trial",
+        "trust_domain": "test-host:service-user:amber",
+        "query_max_rows": "20",
+    }
+    validation = service.validate_sql_for_user(
+        "on_example_user", None, sql, audit_context=audit_context
+    )
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id=None,
+        sql=sql,
+        query_plan_id=validation["query_plan_id"],
+        audit_context=audit_context,
+    )
+
+    assert result["effective_limit"] == 20
+    assert result["limit_injected"] is False
+    assert result["limit_capped"] is True
+    assert result["truncated"] is True
+    assert result["truncation_uncertain"] is False
+    assert result["user_limit_reached"] is False
 
 
 def test_amber_trial_query_reports_injected_twenty_row_limit() -> None:

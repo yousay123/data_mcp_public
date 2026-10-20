@@ -49,6 +49,7 @@ const service = createServer((req, res) => {
         status: 'success', datasource: 'tchouse-c', row_count: 1,
         rows_before_limit_at_least: 1, truncated: false,
         effective_limit: 200, truncation_uncertain: true,
+        user_limit_reached: false,
         limit_injected: true, limit_capped: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
@@ -275,6 +276,7 @@ for (const expected of [
   '\\"rows_before_limit_at_least\\":1',
   '\\"effective_limit\\":200',
   '\\"truncation_uncertain\\":true',
+  '\\"user_limit_reached\\":false',
   '\\"limit_injected\\":true',
   '\\"limit_capped\\":false',
 ]) {

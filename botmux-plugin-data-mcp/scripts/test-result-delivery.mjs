@@ -23,6 +23,7 @@ const modelServer = createServer((req, res) => {
     modelSawLimitEvidence = body.includes('\\"rows_before_limit_at_least\\":1')
       && body.includes('\\"effective_limit\\":200')
       && body.includes('\\"truncation_uncertain\\":true')
+      && body.includes('\\"user_limit_reached\\":false')
       && body.includes('\\"limit_injected\\":true')
       && body.includes('\\"limit_capped\\":false');
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -44,6 +45,7 @@ const runResult = {
   status: 'success', query_id: 'q_internal', row_count: 1,
   rows_before_limit_at_least: 1, truncated: false,
   effective_limit: 200, truncation_uncertain: true,
+  user_limit_reached: false,
   limit_injected: true, limit_capped: false,
   columns: [{ name: 'amount' }], rows: [{ amount: sentinel }],
 };

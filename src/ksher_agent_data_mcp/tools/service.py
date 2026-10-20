@@ -1181,22 +1181,28 @@ class DataMcpService:
         result.limit_injected = "limit_injected" in issue_codes
         result.limit_capped = "limit_capped" in issue_codes
         result.effective_limit = validation.effective_limit
-        if (
-            result.status == Status.SUCCESS
-            and validation.effective_limit is not None
-            and result.row_count >= validation.effective_limit
-            and not result.truncated
-        ):
-            # rows_before_limit_at_least is a lower bound and can equal the
-            # returned row count when ClickHouse stops reading at LIMIT. Treat
-            # an at-limit result as possibly truncated instead of claiming it
-            # is complete. We deliberately avoid exact_rows_before_limit=1:
-            # it can force a full scan and violate the service read budget.
-            result.truncated = True
-            result.truncation_uncertain = True
-            result.quality_warnings.append(
-                "返回行数达到有效 LIMIT，ClickHouse 未提供足够证据证明结果完整"
+        if result.status == Status.SUCCESS and validation.effective_limit is not None:
+            service_limited = result.limit_injected or result.limit_capped
+            result.user_limit_reached = (
+                not service_limited and result.row_count >= validation.effective_limit
             )
+            if service_limited and not result.truncated:
+                if (
+                    result.rows_before_limit_at_least is not None
+                    and result.rows_before_limit_at_least > result.row_count
+                ):
+                    result.truncated = True
+                    result.quality_warnings.append("返回结果被服务行数上限截断")
+                elif result.row_count >= validation.effective_limit:
+                    # rows_before_limit_at_least is a lower bound and can equal
+                    # the returned row count when ClickHouse stops at LIMIT.
+                    # Fail closed without exact_rows_before_limit=1, which can
+                    # force a full scan and exceed read or timeout budgets.
+                    result.truncated = True
+                    result.truncation_uncertain = True
+                    result.quality_warnings.append(
+                        "返回行数达到服务上限，ClickHouse 未提供足够证据证明结果完整"
+                    )
         audit_logger.emit(
             AuditEvent(
                 event_type="select",
@@ -1217,6 +1223,7 @@ class DataMcpService:
                     "read_bytes": result.read_bytes,
                     "truncated": result.truncated,
                     "truncation_uncertain": result.truncation_uncertain,
+                    "user_limit_reached": result.user_limit_reached,
                     "limit_injected": result.limit_injected,
                     "limit_capped": result.limit_capped,
                     "execution_ms": result.execution_ms,

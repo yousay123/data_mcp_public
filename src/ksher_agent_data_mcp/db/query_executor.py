@@ -212,16 +212,10 @@ class TChouseCQueryExecutor(QueryExecutor):
             payload.get("rows_before_limit_at_least")
         )
         statistics = payload.get("statistics") or {}
-        # Equality with a configured LIMIT is ambiguous: an exact-limit result
-        # can still be complete. ClickHouse's pre-LIMIT count is the evidence
-        # that distinguishes that case from a result with additional rows.
-        truncated = (
-            len(rows) < row_count
-            or (
-                rows_before_limit_at_least is not None
-                and rows_before_limit_at_least > len(rows)
-            )
-        )
+        # This layer only detects an incomplete response payload. Whether a SQL
+        # LIMIT is a user-requested Top-N or a service-enforced safety bound is
+        # policy context owned by DataMcpService.
+        truncated = len(rows) < row_count
         warnings = []
         if truncated:
             warnings.append("返回结果可能被 LIMIT 或服务最大行数限制截断")

@@ -779,6 +779,51 @@ def test_export_without_limit_can_return_more_than_default_query_rows(tmp_path: 
     assert executor.max_rows == 100_001
 
 
+def test_export_preserves_user_top_n_limit(tmp_path: Path) -> None:
+    class TopNExecutor:
+        def run(self, credential, sql, timeout_seconds, max_rows=None):
+            rows = [{"number": number} for number in range(10)]
+            return QueryResult(
+                status=Status.SUCCESS,
+                query_id="q_top_n_export",
+                datasource=credential.datasource,
+                sql=sql,
+                columns=[ColumnMeta(name="number", type="UInt64")],
+                rows=rows,
+                row_count=10,
+                rows_before_limit_at_least=1000,
+            )
+
+    settings = Settings(
+        METADATA_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE=Path("examples/credentials.example.json"),
+        REQUIRE_PARTITION_FILTER=False,
+        DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+    )
+    service = DataMcpService(
+        replace(build_container(settings), executor=TopNExecutor())
+    )
+    sql = "SELECT arrayJoin(range(1000)) AS number ORDER BY number LIMIT 10"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["file"]["row_count"] == 10
+
+
 def test_export_rejects_one_row_over_configured_limit_before_truncation(monkeypatch) -> None:
     service = DataMcpService(
         build_container(
