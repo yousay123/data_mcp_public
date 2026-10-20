@@ -40,8 +40,8 @@ When the user describes a metric, topic, or business object instead of a table:
    definition is ambiguous.
 4. Generate SQL only after the table and口径 are clear.
 5. Call `validate_sql_for_user` first.
-6. Execute only read-only queries after validation succeeds. When the host exposes
-   trusted result delivery, use `deliver_query_result_for_user` so rows, analysis,
+6. Execute only read-only queries after validation succeeds. Use
+   `deliver_query_result_for_user` so rows, analysis,
    and exported files never return to the calling model context. Raw run/export
    responses are always disabled.
 7. Pass the same byte-exact SQL string to validate and run. Use trimming only to
@@ -66,23 +66,23 @@ When the user names a table directly:
 3. If a result exceeds the configured export row limit, ask the user to narrow
    the query or have an operator raise `DATA_MCP_EXPORT_MAX_ROWS` through the
    controlled runtime configuration.
-4. Exported files must be scoped to the trusted caller. Do not expose files to
-   unrelated group members by default.
+4. Results are replied to the original trusted Feishu conversation. In a group
+   or topic, all members of that conversation can see the result and it remains
+   in chat history; use an appropriately restricted conversation for sensitive data.
 5. Excel exports should contain header + data rows only, with readable column
    widths and frozen header row.
 6. When the user explicitly asks for an Excel file, call
-   `deliver_query_result_for_user` with `output_mode=excel`. The host-only
-   delivery envelope carries the staged artifact to Botmux; the calling model
-   receives only a redacted receipt.
+   `deliver_query_result_for_user` with `output_mode=excel`. The plugin sends the
+   staged artifact through the bound Botmux session; the calling model receives
+   only a redacted receipt.
 7. When the user does not ask for a file/export/Excel attachment, do not call the
    export tool. Normal query responses must not include a `file` key.
-8. Botmux must validate the full delivery envelope and consume the staged file
-   into bounded memory before any card or upload side effect. It removes the
-   staged source before sending and serializes delivery until the daemon returns
-   a final receipt.
+8. The plugin must validate that the staged file is a regular non-symlink below
+   its own outbound directory, then delegate upload/routing/idempotency to the
+   exact bound Botmux session.
 9. Treat `expires_at` as best-effort local retention metadata. Data MCP cleans
-   expired export directories before later exports, but BotMux should still
-   delete the local file after confirmed delivery.
+   expired export directories before later exports, but the plugin still deletes
+   the staged local file after each delivery attempt.
 
 ## Safety Rules
 
@@ -102,8 +102,8 @@ The plugin MCP server exposes:
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
 - `run_query_for_user`: model-visible raw execution is fail-closed; callers must use trusted result delivery.
 - `export_query_to_excel_file`: model-visible raw export is fail-closed; callers must use trusted result delivery.
-- `deliver_query_result_for_user`: consumes one validated plan and sends either
-  an approved internal-model analysis or an Excel artifact through Botmux's trusted host;
+- `deliver_query_result_for_user`: consumes one validated plan and replies either
+  an approved internal-model analysis or an Excel artifact to the signed original Feishu message;
   the calling model receives only a delivery receipt and never the business result.
 - `continue_query_result_for_user`: use for an unambiguous follow-up about the
   current caller-bound result. Pass only the user's follow-up text; choose

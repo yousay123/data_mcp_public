@@ -12,10 +12,13 @@ import {
   resolvePrivateModelAddress,
 } from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
+import { installFakeBotmux } from './test-botmux-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-followup-'));
 const pluginHome = join(root, 'plugin-home');
+const fakeBotmux = installFakeBotmux(root);
+const botmuxLog = join(root, 'botmux.jsonl');
 const rowSentinel = 'SYNTHETIC_ROW_SENTINEL_4821';
 const modelSentinel = 'SYNTHETIC_MODEL_SENTINEL_7734';
 const modelOutput = `${modelSentinel}:${rowSentinel}`;
@@ -106,8 +109,7 @@ writeFileSync(hostEnvFile, [
 function spawnPlugin(sessionId, envFile = hostEnvFile) {
   const child = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'server.js')], {
     cwd: pluginRoot,
-    env: {
-      ...process.env,
+    env: fakeBotmux.env({
       BOTMUX_SESSION_ID: sessionId,
       BOTMUX_PLUGIN_HOME: pluginHome,
       DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
@@ -115,7 +117,8 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
       DATA_MCP_RUN_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/run`,
       DATA_MCP_EXPORT_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/export`,
       KSHER_AGENT_DATA_MCP_ENV_FILE: envFile,
-    },
+      FAKE_BOTMUX_LOG: botmuxLog,
+    }),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let buffered = '';
@@ -170,9 +173,13 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
   };
 }
 
+function toolPayload(response) {
+  return JSON.parse(response?.result?.content?.[0]?.text || '{}');
+}
+
 const callerA = {
   requestUserOpenId: 'ou_synthetic_a', requestUserUnionId: 'on_synthetic_a',
-  requestLarkAppId: 'cli_synthetic', senderType: 'user', turnId: 'turn-initial',
+  requestLarkAppId: 'cli_synthetic', senderType: 'user', turnId: 'om_initial',
   hostCapabilities: ['result_delivery_v1'],
 };
 const plugin = spawnPlugin('session-synthetic-a');
@@ -192,31 +199,22 @@ for (const forbidden of ['result_id', 'session_id', 'union_id', 'app_id', 'ident
   if (schemaText.includes(forbidden)) throw new Error(`follow-up schema exposes ${forbidden}`);
 }
 
-const callsBeforeMissingCapability = modelCalls;
-const missingCapability = await plugin.call('continue_query_result_for_user', {
-  question: 'host capability is absent',
-}, { ...callerA, turnId: 'turn-no-capability', hostCapabilities: [] });
-if (!JSON.stringify(missingCapability).includes('trusted_result_delivery_unavailable')
-  || modelCalls !== callsBeforeMissingCapability) {
-  throw new Error('follow-up did not fail before model access when trusted delivery was unavailable');
-}
-
 const initial = await plugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-initial-plan', output_mode: 'analysis', question: 'initial',
 }, callerA);
 const initialVisible = JSON.stringify(initial.result?.content ?? []);
 if (initialVisible.includes(rowSentinel) || initialVisible.includes(modelSentinel)) throw new Error('initial result leaked');
-if (initial.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) throw new Error('initial host delivery missing');
+if (toolPayload(initial).status !== 'delivered') throw new Error('initial direct delivery missing');
 
-const followupCaller = { ...callerA, turnId: 'turn-followup' };
+const followupCaller = { ...callerA, turnId: 'om_followup' };
 const followup = await plugin.call('continue_query_result_for_user', {
   question: 'continue from the active synthetic result', output_mode: 'analysis',
   result_id: 'model-forged-result', requestUserUnionId: 'on_forged',
 }, followupCaller);
 const followupVisible = JSON.stringify(followup.result?.content ?? []);
 if (followupVisible.includes(rowSentinel) || followupVisible.includes(modelSentinel)) throw new Error('follow-up result leaked');
-if (followup.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) throw new Error('follow-up host delivery missing');
+if (toolPayload(followup).status !== 'delivered') throw new Error('follow-up direct delivery missing');
 const callsAfterFollowup = modelCalls;
 
 const repeated = await plugin.call('continue_query_result_for_user', { question: 'repeat' }, followupCaller);
@@ -237,28 +235,28 @@ mutateActiveResultDuringModelCall = () => {
 };
 const staleFollowup = await plugin.call('continue_query_result_for_user', {
   question: 'CAS_REPLACE_SYNTHETIC', output_mode: 'analysis',
-}, { ...callerA, turnId: 'turn-cas-replace' });
+}, { ...callerA, turnId: 'om_cas_replace' });
 mutateActiveResultDuringModelCall = undefined;
 if (!JSON.stringify(staleFollowup).includes('delivery_failed')
   || staleFollowup.result?._meta?.botmuxHostDelivery) {
   throw new Error('result replacement during follow-up did not fail closed');
 }
 
-const callerB = { ...callerA, requestUserUnionId: 'on_synthetic_b', turnId: 'turn-b' };
+const callerB = { ...callerA, requestUserUnionId: 'on_synthetic_b', turnId: 'om_user_b' };
 const crossUser = await plugin.call('continue_query_result_for_user', { question: 'cross user' }, callerB);
 if (!JSON.stringify(crossUser).includes('no_active_result')) throw new Error('cross-user binding failed');
 const crossApp = await plugin.call('continue_query_result_for_user', { question: 'cross app' }, {
-  ...callerA, requestLarkAppId: 'cli_other', turnId: 'turn-app',
+  ...callerA, requestLarkAppId: 'cli_other', turnId: 'om_app',
 });
 if (!JSON.stringify(crossApp).includes('no_active_result')) throw new Error('cross-app binding failed');
 const botCaller = await plugin.call('continue_query_result_for_user', { question: 'bot caller' }, {
-  ...callerA, senderType: 'bot', turnId: 'turn-bot',
+  ...callerA, senderType: 'bot', turnId: 'om_bot',
 });
 if (!JSON.stringify(botCaller).includes('identity_rejected')) throw new Error('bot follow-up was not rejected');
 
 const excel = await plugin.call('continue_query_result_for_user', {
   question: 'export the active result', output_mode: 'excel', filename: '../..\\\u0001synthetic.csv',
-}, { ...callerA, turnId: 'turn-excel' });
+}, { ...callerA, turnId: 'om_excel' });
 const excelVisible = JSON.stringify(excel.result?.content ?? []);
 if (excelVisible.includes('synthetic.csv') || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
   throw new Error('Excel path or filename leaked into model-visible content');
@@ -304,14 +302,14 @@ const lowQuota = spawnPlugin('session-synthetic-a', lowQuotaFile);
 const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
-}, { ...callerA, turnId: 'turn-low-quota-initial' });
-if (lowQuotaInitial.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) {
+}, { ...callerA, turnId: 'om_low_quota_initial' });
+if (toolPayload(lowQuotaInitial).status !== 'delivered') {
   throw new Error('result-store quota failure broke first-turn delivery');
 }
 const callsAfterLowQuotaInitial = modelCalls;
 const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {
   question: 'must not use the previous active result',
-}, { ...callerA, turnId: 'turn-low-quota-followup' });
+}, { ...callerA, turnId: 'om_low_quota_followup' });
 if (!JSON.stringify(lowQuotaFollowup).includes('no_active_result')
   || modelCalls !== callsAfterLowQuotaInitial) {
   throw new Error('result-store quota failure left a stale active result');
@@ -320,7 +318,7 @@ await lowQuota.close();
 
 const otherSession = spawnPlugin('session-synthetic-other');
 const crossSession = await otherSession.call('continue_query_result_for_user', { question: 'cross session' }, {
-  ...callerA, turnId: 'turn-other-session',
+  ...callerA, turnId: 'om_other_session',
 });
 if (!JSON.stringify(crossSession).includes('no_active_result')) throw new Error('cross-session binding failed');
 await otherSession.close();
@@ -335,12 +333,12 @@ const missingKey = spawnPlugin('session-missing-key', missingKeyFile);
 const missingKeyInitial = await missingKey.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
-}, { ...callerA, turnId: 'turn-missing-key-initial' });
-if (missingKeyInitial.result?._meta?.botmuxHostDelivery?.markdown !== modelOutput) {
+}, { ...callerA, turnId: 'om_missing_key_initial' });
+if (toolPayload(missingKeyInitial).status !== 'delivered') {
   throw new Error('missing result-store HMAC key broke first-turn delivery');
 }
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
-  ...callerA, turnId: 'turn-missing-key',
+  ...callerA, turnId: 'om_missing_key',
 });
 if (!JSON.stringify(missingKeyResponse).includes('identity_rejected')) throw new Error('missing HMAC key did not fail closed');
 await missingKey.close();

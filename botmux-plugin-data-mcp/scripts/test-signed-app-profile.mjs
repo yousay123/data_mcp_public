@@ -15,10 +15,13 @@ import {
   clearSignedAppTestProfileCacheForTests,
   resolveSignedAppTestProfile,
 } from '../src/mcp/signed-app-profile.js';
+import { installFakeBotmux } from './test-botmux-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
 const root = mkdtempSync(join(testTmpRoot, 'data-mcp-signed-profile-'));
+const fakeBotmux = installFakeBotmux(root);
+const botmuxLog = join(root, 'botmux.jsonl');
 const socketPath = join(root, 'test-api.sock');
 const pluginHome = join(root, 'plugin-home');
 const selectedAppId = 'cli_signed_profile_test';
@@ -130,7 +133,7 @@ writeProfile(profileFile, completeProfileLines({
 }));
 
 function childEnvironment(extra = {}) {
-  const env = { ...process.env };
+  const env = fakeBotmux.env();
   for (const key of Object.keys(env)) {
     if (key.startsWith('DATA_MCP_') || key === 'KSHER_AGENT_DATA_MCP_ENV_FILE') delete env[key];
   }
@@ -141,6 +144,8 @@ function childEnvironment(extra = {}) {
     KSHER_AGENT_DATA_MCP_ENV_FILE: defaultEnvFile,
     DATA_MCP_TEST_PROFILE_APP_ID: selectedAppId,
     DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
+    FAKE_BOTMUX_APP_ID: selectedAppId,
+    FAKE_BOTMUX_LOG: botmuxLog,
     ...extra,
   };
 }
@@ -203,6 +208,10 @@ function caller(appId = selectedAppId, turnId = 'signed-profile-turn') {
   };
 }
 
+function toolPayload(response) {
+  return JSON.parse(response?.result?.content?.[0]?.text || '{}');
+}
+
 const plugin = spawnPlugin();
 const selectedValidation = await plugin.call('validate_sql_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -229,24 +238,25 @@ if (defaultServiceHits !== 3) throw new Error('non-selected callers did not rema
 const initial = await plugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'initial',
-}, caller(selectedAppId, 'initial-turn'));
-if (initial.result?._meta?.botmuxHostDelivery?.markdown !== modelSentinel
+}, caller(selectedAppId, 'om_initial'));
+if (toolPayload(initial).status !== 'delivered'
   || JSON.stringify(initial.result?.content).includes(rowSentinel)
+  || JSON.stringify(initial.result?.content).includes(modelSentinel)
   || modelAuthorization !== 'Bearer synthetic-profile-api-key') {
   throw new Error('initial analysis did not use the selected model profile safely');
 }
 
 const followup = await plugin.call('continue_query_result_for_user', {
   question: 'follow up', output_mode: 'analysis',
-}, caller(selectedAppId, 'followup-turn'));
-if (followup.result?._meta?.botmuxHostDelivery?.markdown !== modelSentinel || modelCalls !== 2) {
+}, caller(selectedAppId, 'om_followup'));
+if (toolPayload(followup).status !== 'delivered' || modelCalls !== 2) {
   throw new Error('follow-up did not reuse the selected model profile and base HMAC binding');
 }
 
 const exported = await plugin.call('continue_query_result_for_user', {
   question: 'export', output_mode: 'excel', filename: '../unsafe.xlsx',
-}, caller(selectedAppId, 'export-turn'));
-if (!Array.isArray(exported.result?._meta?.botmuxHostDelivery?.files)) {
+}, caller(selectedAppId, 'om_export'));
+if (toolPayload(exported).attachmentCount !== 1) {
   throw new Error('follow-up export did not use the selected service profile');
 }
 await plugin.close();
@@ -289,8 +299,8 @@ const noOptionalPlugin = spawnPlugin({
 const noOptionalResult = await noOptionalPlugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'no optional key',
-}, caller(selectedAppId, 'no-optional-turn'));
-if (noOptionalResult.result?._meta?.botmuxHostDelivery?.markdown !== modelSentinel
+}, caller(selectedAppId, 'om_no_optional'));
+if (toolPayload(noOptionalResult).status !== 'delivered'
   || modelAuthorization !== undefined) {
   throw new Error('missing optional profile key fell back to the default profile');
 }
