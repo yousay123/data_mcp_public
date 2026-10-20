@@ -3,7 +3,7 @@ import pytest
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.credentials.base import CredentialMappingUnavailable
 from ksher_agent_data_mcp.dependencies import build_container
-from ksher_agent_data_mcp.models.contracts import CredentialRef, Status
+from ksher_agent_data_mcp.models.contracts import CredentialRef, QueryResult, Status
 from ksher_agent_data_mcp.tools import service as service_module
 from ksher_agent_data_mcp.tools.service import DataMcpService
 
@@ -137,6 +137,154 @@ def test_run_query_for_user_uses_supplied_verified_identity() -> None:
     }
     assert "demo_tchouse_user" not in str(result)
     assert "on_example_user" not in str(result["sql_account_binding"])
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_injected", "expected_capped", "expected_limit"),
+    [
+        ("SELECT 1", True, False, 200),
+        ("SELECT 1 LIMIT 50", False, False, 50),
+        ("SELECT 1 LIMIT 5000", False, True, 1000),
+    ],
+)
+def test_run_query_reports_limit_policy_flags(
+    sql: str, expected_injected: bool, expected_capped: bool, expected_limit: int
+) -> None:
+    service = DataMcpService(build_container(Settings(
+        CREDENTIAL_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+        METADATA_PROVIDER="memory",
+        QUERY_EXECUTOR="dry_run",
+    )))
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+    assert result["status"] == Status.SUCCESS
+    assert result["limit_injected"] is expected_injected
+    assert result["limit_capped"] is expected_capped
+    assert result["effective_limit"] == expected_limit
+
+
+@pytest.mark.parametrize(
+    ("row_count", "rows_before", "expected_truncated", "expected_uncertain"),
+    [(199, None, False, False), (200, None, True, True), (200, 200, True, True), (200, 201, True, False)],
+)
+def test_service_limit_never_silently_truncates(
+    monkeypatch, row_count: int, rows_before: int | None,
+    expected_truncated: bool, expected_uncertain: bool,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = DataMcpService(build_container(Settings(
+        CREDENTIAL_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+        METADATA_PROVIDER="memory",
+        QUERY_EXECUTOR="dry_run",
+    )))
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS, query_id="q_" + "1" * 32,
+            datasource=credential.datasource, sql=sql, row_count=row_count,
+            rows_before_limit_at_least=rows_before,
+        )
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1"
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user", request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID, sql=sql, query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+    assert result["truncated"] is expected_truncated
+    assert result["truncation_uncertain"] is expected_uncertain
+    assert bool(result["limit_notice"]) is expected_truncated
+    event = next(item for item in events if item.event_type == "select")
+    assert event.detail["effective_limit"] == 200
+    assert event.detail["limit_notice"] == result["limit_notice"]
+
+
+@pytest.mark.parametrize(("rows_before", "has_notice"), [(10, False), (1000, True)])
+def test_user_top_n_is_not_service_truncation(monkeypatch, rows_before: int, has_notice: bool) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = DataMcpService(build_container(Settings(
+        CREDENTIAL_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+        METADATA_PROVIDER="memory",
+        QUERY_EXECUTOR="dry_run",
+    )))
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS, query_id="q_" + "2" * 32,
+            datasource=credential.datasource, sql=sql, row_count=10,
+            rows_before_limit_at_least=rows_before,
+        )
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1 AS number ORDER BY number LIMIT 10"
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user", request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID, sql=sql, query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+    assert result["truncated"] is False
+    assert result["user_limit_reached"] is True
+    assert bool(result["user_limit_notice"]) is has_notice
+    assert result["limit_notice"] is None
+    event = next(item for item in events if item.event_type == "select")
+    assert event.detail["user_limit_notice"] == result["user_limit_notice"]
+
+
+@pytest.mark.parametrize(
+    ("sql", "audit_context", "expected_limit", "expected_injected"),
+    [
+        ("SELECT 1 LIMIT 5000", HUMAN_AUDIT_CONTEXT, 1000, False),
+        ("SELECT 1 LIMIT 100", {
+            "caller_source": "amber", "sender_type": "user",
+            "session_id": "amber:trial", "turn_id": "trial",
+            "trust_domain": "test-host:service-user:amber", "query_max_rows": "20",
+        }, 20, False),
+        ("SELECT 1", {
+            "caller_source": "amber", "sender_type": "user",
+            "session_id": "amber:trial", "turn_id": "trial",
+            "trust_domain": "test-host:service-user:amber", "query_max_rows": "20",
+        }, 20, True),
+    ],
+)
+def test_service_caps_and_amber_trial_limits_are_reported(
+    monkeypatch, sql: str, audit_context: dict, expected_limit: int, expected_injected: bool
+) -> None:
+    service = DataMcpService(build_container(Settings(
+        CREDENTIAL_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+        METADATA_PROVIDER="memory",
+        QUERY_EXECUTOR="dry_run",
+    )))
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS, query_id="q_" + "3" * 32,
+            datasource=credential.datasource, sql=sql, row_count=expected_limit,
+            rows_before_limit_at_least=expected_limit + 1,
+        )
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    validation = service.validate_sql_for_user(
+        "on_example_user", None, sql, request_lark_app_id=APP_ID,
+        audit_context=audit_context
+    )
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user", request_user_open_id=None,
+        request_lark_app_id=APP_ID, sql=sql,
+        query_plan_id=validation["query_plan_id"], audit_context=audit_context,
+    )
+    assert result["effective_limit"] == expected_limit
+    assert result["limit_injected"] is expected_injected
+    assert result["limit_capped"] is (not expected_injected)
+    assert result["truncated"] is True
+    assert result["user_limit_reached"] is False
+    assert f"上限 {expected_limit} 行" in result["limit_notice"]
 
 
 def test_run_query_for_user_rejects_mismatched_tchouse_account() -> None:

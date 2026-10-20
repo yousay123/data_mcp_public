@@ -518,6 +518,7 @@ def test_user_limit_is_capped_to_service_max_rows() -> None:
     assert result.status == Status.SUCCESS
     assert result.normalized_sql is not None
     assert result.normalized_sql.endswith("LIMIT 1000")
+    assert result.effective_limit == 1000
     assert any(issue.code == "limit_capped" for issue in result.issues)
 
 
@@ -536,6 +537,7 @@ def test_caller_specific_limit_is_stricter_than_service_max_rows() -> None:
     assert result.status == Status.SUCCESS
     assert result.normalized_sql is not None
     assert result.normalized_sql.endswith("LIMIT 20")
+    assert result.effective_limit == 20
 
 
 def test_explicit_service_ceiling_can_raise_only_the_internal_export_limit() -> None:

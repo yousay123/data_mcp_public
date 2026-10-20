@@ -696,12 +696,12 @@ class DataMcpService:
         row_count = int(result.get("row_count") or 0)
         if row_count > limit:
             return export_validation_error(
-                f"导出行数 {row_count} 超过当前上限 {limit}，请缩小范围或由运维调整 DATA_MCP_EXPORT_MAX_ROWS",
+                _row_limit_notice("导出", limit),
                 "export_row_limit_exceeded",
             )
         if result.get("truncated"):
             return export_validation_error(
-                "查询结果已被截断，拒绝导出不完整 Excel；请缩小查询范围或补充更严格过滤条件",
+                _row_limit_notice("导出", limit),
                 "query_result_truncated",
             )
 
@@ -792,6 +792,8 @@ class DataMcpService:
             "query_plan_run_index": result.get("query_plan_run_index"),
             "query_plan_max_runs": result.get("query_plan_max_runs"),
             "sql_account_binding": _export_sql_account_binding(result.get("sql_account_binding")),
+            "user_limit_reached": bool(result.get("user_limit_reached")),
+            "user_limit_notice": result.get("user_limit_notice"),
             "file": {
                 "export_id": export_id,
                 "file_type": "xlsx",
@@ -1177,6 +1179,44 @@ class DataMcpService:
         if result_max_rows is not None:
             executor_kwargs["max_rows"] = result_max_rows
         result = self.container.executor.run(**executor_kwargs)
+        issue_codes = {issue.code for issue in validation.issues}
+        result.limit_injected = "limit_injected" in issue_codes
+        result.limit_capped = "limit_capped" in issue_codes
+        result.effective_limit = validation.effective_limit
+        if result.status == Status.SUCCESS and validation.effective_limit is not None:
+            service_limited = result.limit_injected or result.limit_capped
+            result.user_limit_reached = (
+                not service_limited and result.row_count >= validation.effective_limit
+            )
+            if (
+                result.user_limit_reached
+                and result.rows_before_limit_at_least is not None
+                and result.rows_before_limit_at_least > result.row_count
+            ):
+                result.user_limit_notice = (
+                    f"SQL 自带 LIMIT {validation.effective_limit}，且检测到仍有更多行；"
+                    "当前结果仅代表限定范围，不能用于全量汇总。"
+                )
+            if service_limited and not result.truncated:
+                if (
+                    result.rows_before_limit_at_least is not None
+                    and result.rows_before_limit_at_least > result.row_count
+                ):
+                    result.truncated = True
+                    result.quality_warnings.append("返回结果被服务行数上限截断")
+                elif result.row_count >= validation.effective_limit:
+                    # rows_before_limit_at_least is only a lower bound. When it
+                    # cannot prove completeness, fail closed without forcing an
+                    # exact full scan that may exceed read or timeout budgets.
+                    result.truncated = True
+                    result.truncation_uncertain = True
+                    result.quality_warnings.append(
+                        "返回行数达到服务上限，ClickHouse 未提供足够证据证明结果完整"
+                    )
+            if service_limited and result.truncated:
+                result.limit_notice = _row_limit_notice(
+                    "查询", validation.effective_limit
+                )
         audit_logger.emit(
             AuditEvent(
                 event_type="select",
@@ -1191,9 +1231,17 @@ class DataMcpService:
                     "tables": validation.tables,
                     "datasource": validation.datasource,
                     "row_count": result.row_count,
+                    "rows_before_limit_at_least": result.rows_before_limit_at_least,
+                    "effective_limit": result.effective_limit,
                     "read_rows": result.read_rows,
                     "read_bytes": result.read_bytes,
                     "truncated": result.truncated,
+                    "truncation_uncertain": result.truncation_uncertain,
+                    "user_limit_reached": result.user_limit_reached,
+                    "user_limit_notice": result.user_limit_notice,
+                    "limit_notice": result.limit_notice,
+                    "limit_injected": result.limit_injected,
+                    "limit_capped": result.limit_capped,
                     "execution_ms": result.execution_ms,
                     "result_class": result.result_class,
                     "error_code": result.error_code,
@@ -1713,6 +1761,13 @@ def _safe_export_error_message(error_code: str) -> str:
     }:
         return "Excel 已生成，但写入本机导出目录失败"
     return "Excel 导出失败"
+
+
+def _row_limit_notice(action: str, limit: int) -> str:
+    return (
+        f"{action}结果达到或超出限制（上限 {limit} 行），不能确认当前结果包含完整明细。"
+        "如需完整明细，请向数据部门提需求导出，或先汇总后再导出。"
+    )
 
 
 def _query_plan_audit_ref(query_plan_id: str | None) -> str | None:

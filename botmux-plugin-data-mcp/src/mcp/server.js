@@ -359,95 +359,6 @@ function argsFrom(request) {
     : {};
 }
 
-function frozenQueryError(code) {
-  return {
-    rows: [],
-    columns: [],
-    row_count: 0,
-    query_id: null,
-    error_code: typeof code === 'string' && code ? code : 'execution_failed',
-  };
-}
-
-function frozenQueryServiceError(code) {
-  const value = String(code || '');
-  if (/permission|forbidden|unauthori[sz]ed|access_denied|http_?403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|restricted_access_metadata|restricted_system_columns/i.test(value)) return 'permission_denied';
-  if (/rate.?limit|too_many_requests|http_?429/i.test(value)) return 'rate_limited';
-  if (/timed?_?out|timeout/i.test(value)) return 'timeout';
-  if (/unavailable|unreachable|connection|transport|socket|overload/i.test(value)) return 'temporarily_unavailable';
-  if (/not.?found|http_?404|unknown_table/i.test(value)) return 'not_found';
-  return 'execution_failed';
-}
-
-function sqlLiteral(value, type) {
-  if (type === 'integer') {
-    if (!Number.isSafeInteger(value)) throw new Error('argument_invalid_integer');
-    return String(value);
-  }
-  if (type === 'enum' && typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new Error('argument_invalid_enum');
-    return String(value);
-  }
-  if (!['string', 'enum', 'date'].includes(type)) throw new Error('argument_type_unsupported');
-  if (typeof value !== 'string' || value.includes('\0')) throw new Error('argument_invalid_string');
-  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('argument_invalid_date');
-  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
-}
-
-function renderFrozenQuery(args) {
-  const payload = args.payload;
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('payload_invalid');
-  const template = payload.sql;
-  if (typeof template !== 'string' || !template.trim() || template.length > 200_000) throw new Error('payload_sql_required');
-  const datasource = typeof payload.datasource === 'string' && payload.datasource.trim()
-    ? payload.datasource.trim() : 'tchouse-c';
-  if (datasource !== 'tchouse-c') throw new Error('unsupported_datasource');
-  if (!Array.isArray(args.parameters) || args.parameters.length > 64
-    || !args.values || typeof args.values !== 'object' || Array.isArray(args.values)) {
-    throw new Error('arguments_invalid');
-  }
-  const encoded = new Map();
-  for (const parameter of args.parameters) {
-    if (!parameter || typeof parameter !== 'object' || Array.isArray(parameter)) throw new Error('parameter_invalid');
-    if (typeof parameter.name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(parameter.name)) throw new Error('parameter_name_invalid');
-    if (encoded.has(parameter.name)) throw new Error('parameter_duplicate');
-    if (!Object.hasOwn(args.values, parameter.name)) throw new Error('parameter_required');
-    encoded.set(parameter.name, sqlLiteral(args.values[parameter.name], parameter.type));
-  }
-  for (const key of Object.keys(args.values)) if (!encoded.has(key)) throw new Error('argument_unknown');
-  const referenced = new Set();
-  const sql = template.replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_match, name) => {
-    if (!encoded.has(name)) throw new Error('placeholder_unknown');
-    referenced.add(name);
-    return encoded.get(name);
-  });
-  if (/\{\{|\}\}/.test(sql)) throw new Error('placeholder_invalid');
-  for (const name of encoded.keys()) if (!referenced.has(name)) throw new Error('parameter_unused');
-  return { sql, datasource };
-}
-
-async function executeFrozenQuery(caller, args) {
-  let rendered;
-  try { rendered = renderFrozenQuery(args); }
-  catch { return frozenQueryError('invalid_request'); }
-  const validate = await callDataMcpService('validate', caller, { sql: rendered.sql, datasource: rendered.datasource, execution_mode: 'single' });
-  if (!validate || validate.status !== 'success' || typeof validate.query_plan_id !== 'string') {
-    return frozenQueryError(frozenQueryServiceError(validate?.error_code));
-  }
-  const run = await callDataMcpService('run', caller, { sql: rendered.sql, datasource: rendered.datasource, query_plan_id: validate.query_plan_id });
-  if (!run || run.status === 'error' || run.status === 'validation_error') {
-    return frozenQueryError(frozenQueryServiceError(run?.error_code));
-  }
-  const rows = Array.isArray(run.rows) ? run.rows : Array.isArray(run.data) ? run.data : [];
-  return {
-    rows,
-    columns: Array.isArray(run.columns) ? run.columns : [],
-    row_count: Number.isSafeInteger(run.row_count) ? run.row_count : rows.length,
-    query_id: typeof run.query_id === 'string' ? run.query_id : null,
-    error_code: typeof run.error_code === 'string' && run.error_code ? run.error_code : null,
-  };
-}
-
 function serviceBaseUrl() {
   return (configValue('DATA_MCP_SERVICE_BASE_URL') || DEFAULT_SERVICE_BASE_URL).replace(/\/+$/, '');
 }
@@ -954,11 +865,6 @@ async function handleToolCall(request) {
     return;
   }
 
-  if (name === 'frozen_query_raw') {
-    ok(request.id, jsonTool(await executeFrozenQuery(caller, argsFrom(request))));
-    return;
-  }
-
   if (name === 'export_query_to_excel_file') {
     ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request))));
     return;
@@ -1040,20 +946,6 @@ function toolSchemas() {
           query_plan_id: { type: 'string' },
         },
         required: ['sql', 'query_plan_id'],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'frozen_query_raw',
-      description: 'Render, validate and run an approved frozen read-only query, returning the raw data result without SQL.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          payload: { type: 'object', additionalProperties: true },
-          parameters: { type: 'array', items: { type: 'object', additionalProperties: true } },
-          values: { type: 'object', additionalProperties: true },
-        },
-        required: ['payload', 'parameters', 'values'],
         additionalProperties: false,
       },
     },

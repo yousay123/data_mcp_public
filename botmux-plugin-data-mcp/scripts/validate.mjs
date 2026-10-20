@@ -713,22 +713,6 @@ try {
         } },
       },
     };
-    const mismatchedScheduleFrozenCall = {
-      jsonrpc: '2.0', id: 26, method: 'tools/call',
-      params: {
-        name: 'frozen_query_raw',
-        arguments: {
-          payload: { sql: 'SELECT 1', datasource: 'tchouse-c' },
-          parameters: [],
-          values: {},
-        },
-        _meta: { botmuxTrustedCaller: {
-          requestUserOpenId: 'ou_creator', requestUserUnionId: 'on_creator',
-          requestLarkAppId: 'cli_test', source: 'schedule_creator',
-          taskId: '95677299', turnId: 'schedule:4e177326:3542f551-test',
-        } },
-      },
-    };
     const missingScheduleTurnCall = {
       jsonrpc: '2.0', id: 27, method: 'tools/call',
       params: {
@@ -971,7 +955,6 @@ try {
       mismatchedScheduleRunCall,
       mismatchedScheduleExportCall,
       spoofedScheduleTurnCall,
-      mismatchedScheduleFrozenCall,
       missingScheduleTurnCall,
       ...nearPrefixScheduleCalls,
       ...mismatchedScheduleToolCalls,
@@ -1005,11 +988,13 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'frozen_query_raw', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
     }
-    if (tools.some(tool => tool.name === 'execute_frozen_query')) {
-      fail('retired MCP tool execute_frozen_query must not be exposed');
+    for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
+      if (tools.some(tool => tool.name === retiredName)) {
+        fail(`retired raw-result MCP tool must not be exposed: ${retiredName}`);
+      }
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
     if (tools.some(tool => tool.name === removedClusterComparisonTool)) {
@@ -1024,16 +1009,7 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleFrozenSchema = tools.find(tool => tool.name === 'frozen_query_raw')?.inputSchema;
     const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
-    if (
-      JSON.stringify(visibleFrozenSchema).includes('requestUser')
-      || JSON.stringify(visibleFrozenSchema).includes('request_user')
-      || JSON.stringify(visibleFrozenSchema).includes('caller')
-      || JSON.stringify(visibleFrozenSchema).includes('identity')
-    ) {
-      fail('frozen_query_raw schema must not expose trusted identity arguments');
-    }
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
     }
@@ -1115,7 +1091,7 @@ try {
     if (!scheduleCreatorText.includes('"status":"success"') && !scheduleCreatorText.includes('"status": "success"')) {
       fail('MCP server must allow schedule_creator callers when taskId is present');
     }
-    for (const id of [22, 23, 24, 26]) {
+    for (const id of [22, 23, 24]) {
       const mismatchText = byId.get(id)?.result?.content?.[0]?.text ?? '';
       if (
         !mismatchText.includes('schedule_turn_identity_mismatch')
@@ -1327,6 +1303,21 @@ try {
             transport: 'unix_socket',
             endpoint: req.url,
             ...(req.url === '/agent/validate-sql' ? { query_plan_id: parsed.sql === frozenSql ? 'qplan_frozen' : 'qplan_socket' } : {}),
+            ...(req.url === '/agent/run-query' ? {
+              rows: [{ value: 1 }],
+              row_count: 200,
+              effective_limit: 200,
+              truncated: true,
+              user_limit_reached: false,
+              user_limit_notice: null,
+              limit_notice: '查询结果达到或超出限制（上限 200 行）',
+            } : {}),
+            ...(req.url === '/agent/export-query-excel-file' ? {
+              query_id: 'q_export_probe',
+              user_limit_reached: true,
+              user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
+              file: { path: '/tmp/export-probe.xlsx', row_count: 10 },
+            } : {}),
             ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
               ? {
                   query_id: 'q_frozen',
@@ -1444,65 +1435,19 @@ try {
           },
         },
       };
-      const frozenQueryCall = {
+      const socketExportCall = {
         jsonrpc: '2.0',
-        id: 17,
+        id: 18,
         method: 'tools/call',
         params: {
-          name: 'frozen_query_raw',
-          arguments: {
-            payload: { sql: 'SELECT {{value}} AS probe', datasource: 'tchouse-c' },
-            parameters: [{ name: 'value', type: 'string' }],
-            values: { value: "\\' OR 1=1 --" },
-            requestUserUnionId: 'on_forged_argument',
-          },
-          _meta: {
-            botmuxTrustedCaller: {
-              requestUserOpenId: 'ou_socket_user',
-              requestUserUnionId: 'on_socket_user',
-              requestLarkAppId: 'cli_test',
-              senderType: 'user',
-            },
-          },
+          name: 'export_query_to_excel_file',
+          arguments: { sql: 'SELECT 1 LIMIT 10', datasource: 'tchouse-c', query_plan_id: 'qplan_export' },
+          _meta: { botmuxTrustedCaller: {
+            requestUserOpenId: 'ou_socket_user', requestUserUnionId: 'on_socket_user',
+            requestLarkAppId: 'cli_test', senderType: 'user',
+          } },
         },
       };
-      const frozenInvalidValuesCall = {
-        ...frozenQueryCall,
-        id: 19,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            ...frozenQueryCall.params.arguments,
-            values: { sql: 'not-a-command-parameter' },
-          },
-        },
-      };
-      const frozenErrorCalls = [
-        ['query_timeout', 'timeout', 20],
-        ['datasource_unreachable', 'temporarily_unavailable', 21],
-        ['http_403', 'permission_denied', 22],
-        ['run_query_timeout', 'timeout', 23],
-        ['missing_union_id', 'permission_denied', 24],
-        ['trusted_human_or_schedule_required', 'permission_denied', 25],
-        ['account_mapping_unavailable', 'permission_denied', 26],
-        ['account_mismatch', 'permission_denied', 27],
-        ['query_concurrency_limit', 'execution_failed', 28],
-        ['restricted_access_metadata', 'permission_denied', 29],
-        ['restricted_system_columns', 'permission_denied', 30],
-        ['unknown_table', 'not_found', 31],
-      ].map(([serviceCode, expectedCode, id]) => ({
-        ...frozenQueryCall,
-        id,
-        expectedCode,
-        params: {
-          ...frozenQueryCall.params,
-          arguments: {
-            payload: { sql: `SELECT ${serviceCode}`, datasource: 'tchouse-c' },
-            parameters: [],
-            values: {},
-          },
-        },
-      }));
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
         input: [
@@ -1511,9 +1456,7 @@ try {
           socketSearchCall,
           socketRefreshCall,
           socketValidateCall,
-          frozenQueryCall,
-          frozenInvalidValuesCall,
-          ...frozenErrorCalls.map(({ expectedCode: _expectedCode, ...call }) => call),
+          socketExportCall,
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
@@ -1537,6 +1480,24 @@ try {
       if (!socketText.includes('"transport": "unix_socket"')) {
         fail('MCP server must authenticate Data MCP service calls over Unix socket');
       }
+      const socketPayload = JSON.parse(socketText);
+      if (
+        socketPayload.effective_limit !== 200
+        || socketPayload.truncated !== true
+        || !socketPayload.limit_notice?.includes('上限 200 行')
+        || !Array.isArray(socketPayload.rows)
+      ) {
+        fail(`run_query_for_user must return query rows and limit fields to the model: ${socketText}`);
+      }
+      const exportText = socketResponses.find(response => response.id === 18)?.result?.content?.[0]?.text ?? '';
+      const exportPayload = JSON.parse(exportText);
+      if (
+        exportPayload.file?.row_count !== 10
+        || exportPayload.user_limit_reached !== true
+        || !exportPayload.user_limit_notice?.includes('不能用于全量汇总')
+      ) {
+        fail(`export_query_to_excel_file must return export data and user-limit notice to the model: ${exportText}`);
+      }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
       if (!searchText.includes('/agent/search-metadata-snapshot')) {
         fail('search_metadata_snapshot must forward local query controls over the shared Unix socket');
@@ -1549,45 +1510,6 @@ try {
       if (!validateText.includes('/agent/validate-sql')) {
         fail('validate_sql_for_user must forward session binding and compare mode over the shared Unix socket');
       }
-      const frozenText = socketResponses.find(response => response.id === 17)?.result?.content?.[0]?.text ?? '';
-      const frozenPayload = JSON.parse(frozenText);
-      if (
-        frozenPayload.query_id !== 'q_frozen'
-        || frozenPayload.row_count !== 1
-        || !Array.isArray(frozenPayload.rows)
-        || frozenPayload.rows[0]?.probe !== '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_'
-        || !Array.isArray(frozenPayload.columns)
-        || frozenPayload.error_code !== null
-        || frozenText.includes('OR 1=1')
-        || frozenText.includes('on_forged_argument')
-        || frozenText.includes('contractVersion')
-        || frozenText.includes('blocks')
-        || frozenText.includes('fallbackText')
-      ) {
-        fail(`frozen_query_raw must bind trusted identity, escape SQL literals, keep validate/run bytes identical, omit SQL, and return raw data fields: ${frozenText}`);
-      }
-      const frozenInvalidValuesPayload = JSON.parse(
-        socketResponses.find(response => response.id === 19)?.result?.content?.[0]?.text ?? '{}',
-      );
-      if (
-        frozenInvalidValuesPayload.error_code !== 'invalid_request'
-        || frozenInvalidValuesPayload.row_count !== 0
-        || frozenInvalidValuesPayload.query_id !== null
-        || !Array.isArray(frozenInvalidValuesPayload.rows)
-        || !Array.isArray(frozenInvalidValuesPayload.columns)
-        || JSON.stringify(frozenInvalidValuesPayload).includes('parameter_required')
-      ) {
-        fail(`frozen_query_raw must expose only raw public error fields: ${JSON.stringify(frozenInvalidValuesPayload)}`);
-      }
-      for (const { id, expectedCode } of frozenErrorCalls) {
-        const payload = JSON.parse(
-          socketResponses.find(response => response.id === id)?.result?.content?.[0]?.text ?? '{}',
-        );
-        if (payload.error_code !== expectedCode) {
-          fail(`frozen_query_raw must normalize service errors: expected ${expectedCode}, got ${JSON.stringify(payload)}`);
-        }
-      }
-
       const executionValidateCall = {
         ...socketValidateCall,
         id: 23,

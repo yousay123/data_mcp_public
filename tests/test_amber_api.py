@@ -30,7 +30,14 @@ class FakeService:
 
     def run_query_for_user(self, *args, **kwargs):
         self.calls.append(("run", args, kwargs))
-        return {"status": "success", "row_count": 1, "rows": [{"one": 1}]}
+        return {
+            "status": "success",
+            "row_count": 20,
+            "rows": [{"one": 1}],
+            "truncated": True,
+            "limit_notice": "查询结果达到或超出限制（上限 20 行）",
+            "user_limit_notice": "当前结果仅代表限定范围，不能用于全量汇总。",
+        }
 
 
 def build_runtime(tmp_path):
@@ -67,6 +74,8 @@ def test_amber_query_uses_only_signed_identity_and_exact_sql(tmp_path) -> None:
         amber_app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    assert response.json()["limit_notice"] == "查询结果达到或超出限制（上限 20 行）"
+    assert response.json()["user_limit_notice"] == "当前结果仅代表限定范围，不能用于全量汇总。"
     assert [call[0] for call in service.calls] == ["validate", "run"]
     validate, run = service.calls
     assert validate[1][0] == "on_test_user"
