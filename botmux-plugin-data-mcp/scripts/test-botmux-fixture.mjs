@@ -29,11 +29,15 @@ if (args[0] === 'observe') {
 } else if (args[0] === 'send') {
   const requestedFiles = args.filter(arg => arg === '--files').length;
   if (fail === 'send' || (fail === 'file' && requestedFiles > 0) || (fail === 'text' && requestedFiles === 0)) process.exit(2);
+  const partialFileFailure = process.env.FAKE_BOTMUX_FILE_RESULT === 'failed-attachment' && requestedFiles > 0;
+  const missingFileMessage = process.env.FAKE_BOTMUX_FILE_RESULT === 'missing-message-id' && requestedFiles > 0;
   console.log(JSON.stringify({
     success: true,
     messageId: 'om_fixture_reply',
-    attachmentMessageIds: Array.from({ length: requestedFiles }, (_, i) => 'om_file_' + i),
-    failedAttachments: [],
+    attachmentMessageIds: missingFileMessage
+      ? []
+      : Array.from({ length: requestedFiles }, (_, i) => 'om_file_' + i),
+    failedAttachments: partialFileFailure ? ['synthetic.xlsx'] : [],
   }));
 } else {
   process.exit(2);
