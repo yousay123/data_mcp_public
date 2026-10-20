@@ -1180,6 +1180,23 @@ class DataMcpService:
         issue_codes = {issue.code for issue in validation.issues}
         result.limit_injected = "limit_injected" in issue_codes
         result.limit_capped = "limit_capped" in issue_codes
+        result.effective_limit = validation.effective_limit
+        if (
+            result.status == Status.SUCCESS
+            and validation.effective_limit is not None
+            and result.row_count >= validation.effective_limit
+            and not result.truncated
+        ):
+            # rows_before_limit_at_least is a lower bound and can equal the
+            # returned row count when ClickHouse stops reading at LIMIT. Treat
+            # an at-limit result as possibly truncated instead of claiming it
+            # is complete. We deliberately avoid exact_rows_before_limit=1:
+            # it can force a full scan and violate the service read budget.
+            result.truncated = True
+            result.truncation_uncertain = True
+            result.quality_warnings.append(
+                "返回行数达到有效 LIMIT，ClickHouse 未提供足够证据证明结果完整"
+            )
         audit_logger.emit(
             AuditEvent(
                 event_type="select",
@@ -1195,9 +1212,11 @@ class DataMcpService:
                     "datasource": validation.datasource,
                     "row_count": result.row_count,
                     "rows_before_limit_at_least": result.rows_before_limit_at_least,
+                    "effective_limit": result.effective_limit,
                     "read_rows": result.read_rows,
                     "read_bytes": result.read_bytes,
                     "truncated": result.truncated,
+                    "truncation_uncertain": result.truncation_uncertain,
                     "limit_injected": result.limit_injected,
                     "limit_capped": result.limit_capped,
                     "execution_ms": result.execution_ms,

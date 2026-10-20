@@ -81,6 +81,7 @@ class SqlValidationResult(BaseModel):
     status: Status
     datasource: str = "tchouse-c"
     normalized_sql: str | None = None
+    effective_limit: int | None = None
     tables: list[str] = Field(default_factory=list)
     columns: list[str] = Field(default_factory=list)
     issues: list[ValidationIssue] = Field(default_factory=list)
@@ -96,9 +97,11 @@ class QueryResult(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
     rows_before_limit_at_least: int | None = None
+    effective_limit: int | None = None
     read_rows: int | None = None
     read_bytes: int | None = None
     truncated: bool = False
+    truncation_uncertain: bool = False
     limit_injected: bool = False
     limit_capped: bool = False
     quality_warnings: list[str] = Field(default_factory=list)

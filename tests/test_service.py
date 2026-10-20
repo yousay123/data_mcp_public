@@ -3,7 +3,7 @@ import pytest
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.credentials.base import CredentialMappingUnavailable
 from ksher_agent_data_mcp.dependencies import build_container
-from ksher_agent_data_mcp.models.contracts import CredentialRef, Status
+from ksher_agent_data_mcp.models.contracts import CredentialRef, QueryResult, Status
 from ksher_agent_data_mcp.tools import service as service_module
 from ksher_agent_data_mcp.tools.service import DataMcpService
 
@@ -176,7 +176,75 @@ def test_run_query_reports_limit_policy_flags(
     assert result["status"] == Status.SUCCESS
     assert result["limit_injected"] is expected_injected
     assert result["limit_capped"] is expected_capped
+    assert result["effective_limit"] == int(expected_limit.removeprefix("LIMIT "))
     assert expected_limit in result["sql"]
+
+
+@pytest.mark.parametrize(
+    (
+        "row_count",
+        "rows_before_limit",
+        "executor_truncated",
+        "expected_truncated",
+        "expected_uncertain",
+    ),
+    [
+        (199, None, False, False, False),
+        (200, None, False, True, True),
+        (200, 200, False, True, True),
+        (200, 201, True, True, False),
+    ],
+)
+def test_run_query_fails_closed_when_limit_metadata_cannot_prove_completeness(
+    monkeypatch,
+    row_count: int,
+    rows_before_limit: int | None,
+    executor_truncated: bool,
+    expected_truncated: bool,
+    expected_uncertain: bool,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+
+    def fake_run(credential, sql, timeout_seconds, max_rows=None):
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_" + "1" * 32,
+            datasource=credential.datasource,
+            sql=sql,
+            row_count=row_count,
+            rows_before_limit_at_least=rows_before_limit,
+            truncated=executor_truncated,
+        )
+
+    monkeypatch.setattr(service.container.executor, "run", fake_run)
+    sql = "SELECT 1"
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["effective_limit"] == 200
+    assert result["truncated"] is expected_truncated
+    assert result["truncation_uncertain"] is expected_uncertain
+    select_event = next(event for event in events if event.event_type == "select")
+    assert select_event.detail["effective_limit"] == 200
+    assert select_event.detail["truncated"] is expected_truncated
+    assert select_event.detail["truncation_uncertain"] is expected_uncertain
 
 
 def test_amber_trial_query_reports_injected_twenty_row_limit() -> None:

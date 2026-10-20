@@ -290,7 +290,7 @@ class SqlGuard:
         if self.settings.require_partition_filter:
             issues.extend(self._partition_issues(expression, datasource, tables, table_metas))
 
-        normalized_sql, limit_was_injected, limit_was_capped = self._bounded_sql(
+        normalized_sql, limit_was_injected, limit_was_capped, effective_limit = self._bounded_sql(
             expression, effective_max_rows, effective_default_rows
         )
         if limit_was_injected:
@@ -313,7 +313,14 @@ class SqlGuard:
                 )
             )
 
-        return self._finish(datasource, normalized_sql, tables, columns, issues)
+        return self._finish(
+            datasource,
+            normalized_sql,
+            tables,
+            columns,
+            issues,
+            effective_limit=effective_limit,
+        )
 
     def _describe_tables(
         self,
@@ -441,12 +448,14 @@ class SqlGuard:
         tables: list[str],
         columns: list[str],
         issues: list[ValidationIssue],
+        effective_limit: int | None = None,
     ) -> SqlValidationResult:
         has_error = any(issue.severity == "error" for issue in issues)
         return SqlValidationResult(
             status=Status.VALIDATION_ERROR if has_error else Status.SUCCESS,
             datasource=datasource,
             normalized_sql=None if has_error else normalized_sql,
+            effective_limit=None if has_error else effective_limit,
             tables=tables,
             columns=columns,
             issues=issues,
@@ -454,12 +463,12 @@ class SqlGuard:
 
     def _bounded_sql(
         self, expression: exp.Expression, max_rows: int, default_rows: int
-    ) -> tuple[str, bool, bool]:
+    ) -> tuple[str, bool, bool, int]:
         bounded = expression.copy()
         root_limit = bounded.args.get("limit")
         if root_limit is None:
             bounded.set("limit", exp.Limit(expression=exp.Literal.number(default_rows)))
-            return self._normalize_sql(bounded), True, False
+            return self._normalize_sql(bounded), True, False, default_rows
 
         limit_expression = root_limit.args.get("expression")
         limit_value: int | None = None
@@ -469,10 +478,10 @@ class SqlGuard:
             except (TypeError, ValueError):
                 limit_value = None
         if limit_value is not None and 0 <= limit_value <= max_rows:
-            return self._normalize_sql(bounded), False, False
+            return self._normalize_sql(bounded), False, False, limit_value
 
         root_limit.set("expression", exp.Literal.number(max_rows))
-        return self._normalize_sql(bounded), False, True
+        return self._normalize_sql(bounded), False, True, max_rows
 
     @staticmethod
     def _normalize_sql(expression: exp.Expression) -> str:

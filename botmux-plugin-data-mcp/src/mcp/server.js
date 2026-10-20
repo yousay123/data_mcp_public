@@ -737,7 +737,9 @@ function storableQueryResult(result) {
     rows_before_limit_at_least: Number.isSafeInteger(result.rows_before_limit_at_least)
       ? result.rows_before_limit_at_least
       : null,
+    effective_limit: Number.isSafeInteger(result.effective_limit) ? result.effective_limit : null,
     truncated: result.truncated === true,
+    truncation_uncertain: result.truncation_uncertain === true,
     limit_injected: result.limit_injected === true,
     limit_capped: result.limit_capped === true,
     quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],

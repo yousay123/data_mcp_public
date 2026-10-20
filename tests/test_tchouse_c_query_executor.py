@@ -169,6 +169,25 @@ def test_tchouse_c_executor_uses_clickhouse_limit_metadata_for_truncation_detect
     assert result.rows_before_limit_at_least == rows_before_limit
 
 
+def test_tchouse_c_executor_detects_incomplete_payload_from_reported_row_count(
+    monkeypatch,
+) -> None:
+    def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
+        return {
+            "meta": [{"name": "number", "type": "UInt64"}],
+            "data": [{"number": 1}],
+            "rows": 2,
+        }
+
+    monkeypatch.setattr(query_executor, "execute_clickhouse_json", fake_execute_clickhouse_json)
+
+    result = TChouseCQueryExecutor(Settings()).run(
+        _credential(), "SELECT number FROM numbers(2) LIMIT 2", 30
+    )
+
+    assert result.truncated is True
+
+
 def test_tchouse_c_executor_rejects_other_datasource() -> None:
     executor = TChouseCQueryExecutor(Settings())
 
