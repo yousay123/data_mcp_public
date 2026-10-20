@@ -57,9 +57,15 @@ const noticeSend = records.find(row => row.args[0] === 'send' && row.content?.in
 if (!fileSend || fileSend.content !== '' || !noticeSend?.content.includes('SYNTHETIC_SUMMARY')) {
   throw new Error('attachment-first delivery order mismatch');
 }
+for (const send of [fileSend, noticeSend]) {
+  const quoteIndex = send.args.indexOf('--quote');
+  if (quoteIndex < 0 || send.args[quoteIndex + 1] !== 'om_file') {
+    throw new Error('every attachment delivery send must stay anchored to the signed turnId');
+  }
+}
 if (fileSend.args[fileSend.args.indexOf('--response-kind') + 1] !== 'auxiliary'
   || noticeSend.args[noticeSend.args.indexOf('--response-kind') + 1] !== 'progress') {
-  throw new Error('file/text idempotency lanes were not separated');
+  throw new Error('file/text response lanes were not separated');
 }
 
 const longReceipt = await deliverDirectLarkReply(caller('om_long'), { markdown: '数'.repeat(30_000) }, pluginHome);
@@ -68,7 +74,9 @@ if (!longReceipt.truncated || longReceipt.textBytes > 20_000) throw new Error('U
 for (const rejected of [
   caller('turn_synthetic'),
   caller('om_bot', { senderType: 'bot' }),
-  caller('om_schedule', { callerSource: 'schedule_creator', taskId: 'task_1' }),
+  caller('om_schedule_source', { callerSource: 'schedule_creator' }),
+  caller('om_recovery_source', { callerSource: 'failed_turn_recovery' }),
+  caller('om_schedule_task', { taskId: 'task_1' }),
 ]) {
   let code;
   try { await deliverDirectLarkReply(rejected, { markdown: 'MUST_NOT_SEND' }, pluginHome); }
@@ -100,6 +108,38 @@ if (attachmentFailure !== 'direct_reply_attachment_failed') throw new Error('att
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
 if (records.some(row => row.content?.includes('NO_FALSE_NOTICE'))) {
   throw new Error('text notice was sent after attachment failure');
+}
+
+for (const fileResult of ['failed-attachment', 'missing-message-id']) {
+  process.env.FAKE_BOTMUX_FILE_RESULT = fileResult;
+  let partialAttachmentFailure;
+  try {
+    await deliverDirectLarkReply(caller(`om_${fileResult.replaceAll('-', '_')}`), {
+      markdown: `NO_FALSE_NOTICE_${fileResult}`,
+      files: [{ path: workbook }],
+    }, pluginHome);
+  } catch (error) { partialAttachmentFailure = error.code; }
+  delete process.env.FAKE_BOTMUX_FILE_RESULT;
+  if (partialAttachmentFailure !== 'direct_reply_attachment_failed') {
+    throw new Error(`partial attachment failure was accepted: ${fileResult}`);
+  }
+}
+records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+if (records.some(row => row.content?.includes('NO_FALSE_NOTICE_failed-attachment')
+  || row.content?.includes('NO_FALSE_NOTICE_missing-message-id'))) {
+  throw new Error('text notice was sent after a partial attachment failure');
+}
+
+const outsideWorkbook = join(root, 'outside.xlsx');
+writeFileSync(outsideWorkbook, 'OUTSIDE_OUTBOUND_BYTES', { mode: 0o600 });
+let outsideFailure;
+try {
+  await deliverDirectLarkReply(caller('om_outside_file'), {
+    markdown: 'MUST_NOT_SEND_OUTSIDE_FILE', files: [{ path: outsideWorkbook }],
+  }, pluginHome);
+} catch (error) { outsideFailure = error.code; }
+if (outsideFailure !== 'direct_reply_attachment_failed') {
+  throw new Error('regular file outside outbound was not rejected');
 }
 
 process.env.FAKE_BOTMUX_FAIL = 'text';

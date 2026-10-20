@@ -213,10 +213,19 @@ directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages
 remain flat replies in the same conversation. Before sending, the plugin uses
 Botmux's live session observation to verify that the bound session app matches
-the signed app id, then delegates routing and idempotency to `botmux send`.
+the signed app id, then delegates routing to `botmux send`. Direct delivery has
+no cross-invocation deduplication: repeating the same delivery tool call can
+send duplicate text and attachments, so callers must not retry after an
+ambiguous receipt.
 It fails closed rather than falling back to another bot profile. Normal MCP content contains only delivery
 counts/status or a fixed error code; it never contains result text, filenames,
 paths, or file bytes.
+
+Direct replies remain in ordinary Lark chat history. A calling model with access
+to Botmux history/quoted-message tools can read that content in a later turn,
+even though the delivery tool response itself is redacted. Use direct delivery
+only with synthetic test data until the host provides result-message filtering
+or the protected result-page flow is restored.
 
 Known host limitation: a busy shared topic can expose the most recently
 captured human identity to a tool call. Binding mismatches fail closed, so this

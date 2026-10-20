@@ -68,7 +68,9 @@ When the user names a table directly:
    controlled runtime configuration.
 4. Results are replied to the original trusted Feishu conversation. In a group
    or topic, all members of that conversation can see the result and it remains
-   in chat history; use an appropriately restricted conversation for sensitive data.
+   in chat history. A later model turn can read it through Botmux history or
+   quoted-message tools, so direct delivery is limited to synthetic test data
+   until host-side filtering or the protected result-page flow is restored.
 5. Excel exports should contain header + data rows only, with readable column
    widths and frozen header row.
 6. When the user explicitly asks for an Excel file, call
@@ -78,8 +80,9 @@ When the user names a table directly:
 7. When the user does not ask for a file/export/Excel attachment, do not call the
    export tool. Normal query responses must not include a `file` key.
 8. The plugin must validate that the staged file is a regular non-symlink below
-   its own outbound directory, then delegate upload/routing/idempotency to the
-   exact bound Botmux session.
+   its own outbound directory, then delegate upload/routing to the exact bound
+   Botmux session. Direct delivery is not deduplicated across repeated tool
+   calls, so do not retry after an ambiguous receipt.
 9. Treat `expires_at` as best-effort local retention metadata. Data MCP cleans
    expired export directories before later exports, but the plugin still deletes
    the staged local file after each delivery attempt.
