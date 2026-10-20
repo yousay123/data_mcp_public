@@ -46,7 +46,9 @@ const service = createServer((req, res) => {
     }
     if (req.url === '/run') {
       jsonResponse(res, {
-        status: 'success', datasource: 'tchouse-c', row_count: 1, truncated: false,
+        status: 'success', datasource: 'tchouse-c', row_count: 1,
+        rows_before_limit_at_least: 1, truncated: false,
+        limit_injected: true, limit_capped: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
       });
@@ -267,6 +269,16 @@ if (plugin.stderr().includes(rowSentinel) || plugin.stderr().includes(modelSenti
   throw new Error('plugin stderr contains result data or internal-model output');
 }
 if (modelPayloads.length < 2) throw new Error('internal model was not called for initial and follow-up analysis');
+const followupModelPayload = JSON.stringify(modelPayloads[1]);
+for (const expected of [
+  '\\"rows_before_limit_at_least\\":1',
+  '\\"limit_injected\\":true',
+  '\\"limit_capped\\":false',
+]) {
+  if (!followupModelPayload.includes(expected)) {
+    throw new Error(`stored follow-up result lost limit evidence: ${expected}`);
+  }
+}
 
 await plugin.close();
 

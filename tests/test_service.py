@@ -139,6 +139,87 @@ def test_run_query_for_user_uses_supplied_verified_identity() -> None:
     assert "on_example_user" not in str(result["sql_account_binding"])
 
 
+@pytest.mark.parametrize(
+    ("sql", "expected_injected", "expected_capped", "expected_limit"),
+    [
+        ("SELECT 1", True, False, "LIMIT 200"),
+        ("SELECT 1 LIMIT 50", False, False, "LIMIT 50"),
+        ("SELECT 1 LIMIT 5000", False, True, "LIMIT 1000"),
+    ],
+)
+def test_run_query_reports_limit_policy_flags(
+    sql: str,
+    expected_injected: bool,
+    expected_capped: bool,
+    expected_limit: str,
+) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=issue_plan(service, sql),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["limit_injected"] is expected_injected
+    assert result["limit_capped"] is expected_capped
+    assert expected_limit in result["sql"]
+
+
+def test_amber_trial_query_reports_injected_twenty_row_limit() -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+    sql = "SELECT 1"
+    audit_context = {
+        "caller_source": "amber",
+        "sender_type": "user",
+        "session_id": "amber:run_trial",
+        "turn_id": "run_trial",
+        "trust_domain": "test-host:service-user:amber",
+        "query_max_rows": "20",
+    }
+    validation = service.validate_sql_for_user(
+        "on_example_user",
+        None,
+        sql,
+        audit_context=audit_context,
+    )
+
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id=None,
+        sql=sql,
+        query_plan_id=validation["query_plan_id"],
+        audit_context=audit_context,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["limit_injected"] is True
+    assert result["limit_capped"] is False
+    assert "LIMIT 20" in result["sql"]
+
+
 def test_run_query_for_user_rejects_mismatched_tchouse_account() -> None:
     service = DataMcpService(
         build_container(

@@ -208,8 +208,20 @@ class TChouseCQueryExecutor(QueryExecutor):
             for column in meta
         ]
         row_count = int(payload.get("rows", len(rows)))
+        rows_before_limit_at_least = _optional_int(
+            payload.get("rows_before_limit_at_least")
+        )
         statistics = payload.get("statistics") or {}
-        truncated = len(rows) >= effective_max_rows or len(rows) < row_count
+        # Equality with a configured LIMIT is ambiguous: an exact-limit result
+        # can still be complete. ClickHouse's pre-LIMIT count is the evidence
+        # that distinguishes that case from a result with additional rows.
+        truncated = (
+            len(rows) < row_count
+            or (
+                rows_before_limit_at_least is not None
+                and rows_before_limit_at_least > len(rows)
+            )
+        )
         warnings = []
         if truncated:
             warnings.append("返回结果可能被 LIMIT 或服务最大行数限制截断")
@@ -222,6 +234,7 @@ class TChouseCQueryExecutor(QueryExecutor):
             columns=columns,
             rows=rows,
             row_count=row_count,
+            rows_before_limit_at_least=rows_before_limit_at_least,
             read_rows=_optional_int(statistics.get("rows_read")),
             read_bytes=_optional_int(statistics.get("bytes_read")),
             truncated=truncated,

@@ -95,9 +95,12 @@ class QueryResult(BaseModel):
     columns: list[ColumnMeta] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
+    rows_before_limit_at_least: int | None = None
     read_rows: int | None = None
     read_bytes: int | None = None
     truncated: bool = False
+    limit_injected: bool = False
+    limit_capped: bool = False
     quality_warnings: list[str] = Field(default_factory=list)
     execution_ms: int = 0
     error_code: str | None = None

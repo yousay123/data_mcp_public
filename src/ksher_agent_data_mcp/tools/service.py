@@ -1177,6 +1177,9 @@ class DataMcpService:
         if result_max_rows is not None:
             executor_kwargs["max_rows"] = result_max_rows
         result = self.container.executor.run(**executor_kwargs)
+        issue_codes = {issue.code for issue in validation.issues}
+        result.limit_injected = "limit_injected" in issue_codes
+        result.limit_capped = "limit_capped" in issue_codes
         audit_logger.emit(
             AuditEvent(
                 event_type="select",
@@ -1191,9 +1194,12 @@ class DataMcpService:
                     "tables": validation.tables,
                     "datasource": validation.datasource,
                     "row_count": result.row_count,
+                    "rows_before_limit_at_least": result.rows_before_limit_at_least,
                     "read_rows": result.read_rows,
                     "read_bytes": result.read_bytes,
                     "truncated": result.truncated,
+                    "limit_injected": result.limit_injected,
+                    "limit_capped": result.limit_capped,
                     "execution_ms": result.execution_ms,
                     "result_class": result.result_class,
                     "error_code": result.error_code,

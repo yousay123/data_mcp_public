@@ -734,7 +734,12 @@ function storableQueryResult(result) {
     columns: Array.isArray(result.columns) ? result.columns : [],
     rows: Array.isArray(result.rows) ? result.rows : Array.isArray(result.data) ? result.data : [],
     row_count: Number.isSafeInteger(result.row_count) ? result.row_count : 0,
+    rows_before_limit_at_least: Number.isSafeInteger(result.rows_before_limit_at_least)
+      ? result.rows_before_limit_at_least
+      : null,
     truncated: result.truncated === true,
+    limit_injected: result.limit_injected === true,
+    limit_capped: result.limit_capped === true,
     quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],
   };
 }

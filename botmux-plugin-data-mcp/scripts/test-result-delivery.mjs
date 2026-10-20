@@ -11,6 +11,7 @@ const pluginHome = mkdtempSync(join(tmpdir(), 'data-mcp-delivery-'));
 const hostEnvFile = join(pluginHome, 'host.env');
 let modelSawSentinel = false;
 let modelSawAuth = false;
+let modelSawLimitEvidence = false;
 
 const modelServer = createServer((req, res) => {
   const chunks = [];
@@ -19,6 +20,9 @@ const modelServer = createServer((req, res) => {
     const body = Buffer.concat(chunks).toString('utf8');
     modelSawSentinel = body.includes(sentinel);
     modelSawAuth = req.headers.authorization === 'Bearer internal-test-key';
+    modelSawLimitEvidence = body.includes('\\"rows_before_limit_at_least\\":1')
+      && body.includes('\\"limit_injected\\":true')
+      && body.includes('\\"limit_capped\\":false');
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ choices: [{ message: { content: '受控分析结果：合成记录。' } }] }));
   });
@@ -35,7 +39,9 @@ writeFileSync(hostEnvFile, [
 ].join('\n') + '\n', { mode: 0o600 });
 
 const runResult = {
-  status: 'success', query_id: 'q_internal', row_count: 1, truncated: false,
+  status: 'success', query_id: 'q_internal', row_count: 1,
+  rows_before_limit_at_least: 1, truncated: false,
+  limit_injected: true, limit_capped: false,
   columns: [{ name: 'amount' }], rows: [{ amount: sentinel }],
 };
 const child = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'server.js')], {
@@ -95,7 +101,7 @@ if (visible.includes(sentinel)) throw new Error('business row leaked into callin
 if (response.result?._meta?.botmuxHostDelivery?.markdown !== '受控分析结果：合成记录。') {
   throw new Error('internal model analysis was not wrapped for trusted host delivery');
 }
-if (!modelSawSentinel || !modelSawAuth) {
+if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
   throw new Error('internal result model did not receive the protected result and credential');
 }
 const rawResponse = responses.find(item => item.id === 2);
