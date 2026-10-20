@@ -24,6 +24,7 @@ const modelServer = createServer((req, res) => {
       && body.includes('\\"effective_limit\\":200')
       && body.includes('\\"truncation_uncertain\\":true')
       && body.includes('\\"user_limit_reached\\":false')
+      && body.includes('\\"user_limit_notice\\":\\"当前结果仅代表限定范围，不能用于全量汇总。\\"')
       && body.includes('\\"limit_notice\\":\\"查询结果达到或超出限制（上限 200 行）\\"')
       && body.includes('\\"limit_injected\\":true')
       && body.includes('\\"limit_capped\\":false');
@@ -47,6 +48,7 @@ const runResult = {
   rows_before_limit_at_least: 1, truncated: false,
   effective_limit: 200, truncation_uncertain: true,
   user_limit_reached: false,
+  user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
   limit_notice: '查询结果达到或超出限制（上限 200 行）',
   limit_injected: true, limit_capped: false,
   columns: [{ name: 'amount' }], rows: [{ amount: sentinel }],
@@ -120,6 +122,7 @@ const sourceWorkbook = join(pluginHome, 'source.xlsx');
 writeFileSync(sourceWorkbook, 'xlsx-fixture');
 const excelResult = {
   status: 'success', query_id: 'q_export',
+  user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
   file: { path: sourceWorkbook, filename: '业务结果.xlsx', row_count: 3 },
 };
 const excelChild = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'server.js')], {
@@ -176,6 +179,10 @@ if (excelExitCode !== 0) throw new Error(`Excel delivery fixture failed: ${excel
 const excelResponses = excelStdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 const excelResponse = excelResponses.find(item => item.id === 3);
 const deliveredPath = excelResponse.result?._meta?.botmuxHostDelivery?.files?.[0]?.path;
+const deliveredMarkdown = excelResponse.result?._meta?.botmuxHostDelivery?.markdown;
+if (!deliveredMarkdown?.includes('不能用于全量汇总')) {
+  throw new Error('Excel delivery lost the user LIMIT advisory');
+}
 if (!deliveredPath || !deliveredPath.startsWith(join(pluginHome, 'outbound'))) {
   throw new Error('Excel artifact was not staged in the plugin outbound directory');
 }

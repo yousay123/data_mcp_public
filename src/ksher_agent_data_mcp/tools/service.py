@@ -792,6 +792,8 @@ class DataMcpService:
             "query_plan_run_index": result.get("query_plan_run_index"),
             "query_plan_max_runs": result.get("query_plan_max_runs"),
             "sql_account_binding": _export_sql_account_binding(result.get("sql_account_binding")),
+            "user_limit_reached": bool(result.get("user_limit_reached")),
+            "user_limit_notice": result.get("user_limit_notice"),
             "file": {
                 "export_id": export_id,
                 "file_type": "xlsx",
@@ -1186,6 +1188,15 @@ class DataMcpService:
             result.user_limit_reached = (
                 not service_limited and result.row_count >= validation.effective_limit
             )
+            if (
+                result.user_limit_reached
+                and result.rows_before_limit_at_least is not None
+                and result.rows_before_limit_at_least > result.row_count
+            ):
+                result.user_limit_notice = (
+                    f"SQL 自带 LIMIT {validation.effective_limit}，且检测到仍有更多行；"
+                    "当前结果仅代表限定范围，不能用于全量汇总。"
+                )
             if service_limited and not result.truncated:
                 if (
                     result.rows_before_limit_at_least is not None
@@ -1228,6 +1239,7 @@ class DataMcpService:
                     "truncated": result.truncated,
                     "truncation_uncertain": result.truncation_uncertain,
                     "user_limit_reached": result.user_limit_reached,
+                    "user_limit_notice": result.user_limit_notice,
                     "limit_notice": result.limit_notice,
                     "limit_injected": result.limit_injected,
                     "limit_capped": result.limit_capped,

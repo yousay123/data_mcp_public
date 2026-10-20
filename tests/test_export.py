@@ -824,6 +824,8 @@ def test_export_preserves_user_top_n_limit(tmp_path: Path) -> None:
 
     assert result["status"] == Status.SUCCESS
     assert result["file"]["row_count"] == 10
+    assert result["user_limit_reached"] is True
+    assert "不能用于全量汇总" in result["user_limit_notice"]
 
 
 def test_export_rejects_one_row_over_configured_limit_before_truncation(monkeypatch) -> None:

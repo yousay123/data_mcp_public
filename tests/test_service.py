@@ -252,7 +252,13 @@ def test_run_query_fails_closed_when_limit_metadata_cannot_prove_completeness(
     assert select_event.detail["truncation_uncertain"] is expected_uncertain
 
 
-def test_run_query_preserves_user_top_n_semantics(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("rows_before_limit", "expected_notice"),
+    [(10, False), (1000, True)],
+)
+def test_run_query_preserves_user_top_n_semantics(
+    monkeypatch, rows_before_limit: int, expected_notice: bool
+) -> None:
     events = []
     monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
     service = DataMcpService(
@@ -273,7 +279,7 @@ def test_run_query_preserves_user_top_n_semantics(monkeypatch) -> None:
             datasource=credential.datasource,
             sql=sql,
             row_count=10,
-            rows_before_limit_at_least=1000,
+            rows_before_limit_at_least=rows_before_limit,
         )
 
     monkeypatch.setattr(service.container.executor, "run", fake_run)
@@ -294,8 +300,14 @@ def test_run_query_preserves_user_top_n_semantics(monkeypatch) -> None:
     assert result["truncation_uncertain"] is False
     assert result["user_limit_reached"] is True
     assert result["limit_notice"] is None
+    if expected_notice:
+        assert "检测到仍有更多行" in result["user_limit_notice"]
+        assert "不能用于全量汇总" in result["user_limit_notice"]
+    else:
+        assert result["user_limit_notice"] is None
     select_event = next(event for event in events if event.event_type == "select")
     assert select_event.detail["user_limit_reached"] is True
+    assert select_event.detail["user_limit_notice"] == result["user_limit_notice"]
 
 
 def test_run_query_marks_user_limit_capped_by_service_as_truncated(monkeypatch) -> None:

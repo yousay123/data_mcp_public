@@ -741,6 +741,7 @@ function storableQueryResult(result) {
     truncated: result.truncated === true,
     truncation_uncertain: result.truncation_uncertain === true,
     user_limit_reached: result.user_limit_reached === true,
+    user_limit_notice: typeof result.user_limit_notice === 'string' ? result.user_limit_notice : null,
     limit_notice: typeof result.limit_notice === 'string' ? result.limit_notice : null,
     limit_injected: result.limit_injected === true,
     limit_capped: result.limit_capped === true,
@@ -844,7 +845,13 @@ async function deliverQueryResult(caller, args) {
       delivery: {
         schemaVersion: 1,
         deliveryId: `data-result-${randomUUID()}`,
-        markdown: `查询完成，已生成 Excel。\n\n- 行数：${Number(result.file?.row_count ?? 0).toLocaleString('en-US')}\n- 查询编号：${String(result.query_id ?? '未返回')}`,
+        markdown: [
+          '查询完成，已生成 Excel。',
+          '',
+          `- 行数：${Number(result.file?.row_count ?? 0).toLocaleString('en-US')}`,
+          `- 查询编号：${String(result.query_id ?? '未返回')}`,
+          typeof result.user_limit_notice === 'string' ? `- 提示：${result.user_limit_notice}` : null,
+        ].filter(line => line !== null).join('\n'),
         files: [{ path }],
         responseKind: 'final',
       },

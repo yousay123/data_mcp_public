@@ -103,6 +103,7 @@ class QueryResult(BaseModel):
     truncated: bool = False
     truncation_uncertain: bool = False
     user_limit_reached: bool = False
+    user_limit_notice: str | None = None
     limit_notice: str | None = None
     limit_injected: bool = False
     limit_capped: bool = False
