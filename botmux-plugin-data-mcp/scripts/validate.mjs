@@ -1235,8 +1235,8 @@ try {
       fail('public query tools must reject non-tchouse-c datasource before service access');
     }
     const deliveryWithoutCapabilityText = byId.get(40)?.result?.content?.[0]?.text ?? '';
-    if (!deliveryWithoutCapabilityText.includes('trusted_result_delivery_unavailable')) {
-      fail('isolated result delivery must fail before query execution when the host capability is absent');
+    if (!deliveryWithoutCapabilityText.includes('isolated_data_operation_failed')) {
+      fail('direct result delivery must reach data execution without the retired host capability');
     }
 
     const missingSessionCall = {

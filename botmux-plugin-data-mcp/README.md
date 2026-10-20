@@ -206,11 +206,17 @@ plugin should migrate from the process environment to that value.
 `continue_query_result_for_user` accepts only the user's follow-up text and an
 output mode. Analysis uses the stored result. Excel follow-ups deliberately
 revalidate permissions and rerun the original SQL; therefore the spreadsheet
-may differ from the earlier analysis snapshot. Its controlled page states that
-it is a fresh query and includes the generation time. Per trusted turn id, only
-one follow-up call is accepted. Internal-model text, rows, filenames, and paths
-are sent only through trusted host delivery; normal MCP content contains a
-fixed status and random receipt id.
+may differ from the earlier analysis snapshot. Its reply states that it is a
+fresh query and includes the generation time. Per trusted turn id, only
+one follow-up call is accepted. Internal-model text and Excel files are replied
+directly to the signed `turnId` message by the session-bound bot identity.
+Topic messages stay in the original topic; ordinary group and P2P messages
+remain flat replies in the same conversation. Before sending, the plugin uses
+Botmux's live session observation to verify that the bound session app matches
+the signed app id, then delegates routing and idempotency to `botmux send`.
+It fails closed rather than falling back to another bot profile. Normal MCP content contains only delivery
+counts/status or a fixed error code; it never contains result text, filenames,
+paths, or file bytes.
 
 Known host limitation: a busy shared topic can expose the most recently
 captured human identity to a tool call. Binding mismatches fail closed, so this
@@ -227,8 +233,8 @@ write its prompts or responses to ordinary logs.
 | `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
 | `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
 | `export_query_to_excel_file` | Always `isolated_delivery_required`; file metadata is closed | Fixed isolated-operation error |
-| `deliver_query_result_for_user` | `delivery_requested` plus a random receipt; rows, analysis, filenames, and paths use trusted host delivery | Fixed isolated-operation error |
-| `continue_query_result_for_user` | `delivery_requested` plus a random receipt; active-result handles are not arguments | Fixed deterministic state code only |
+| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; result content is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
+| `continue_query_result_for_user` | Fixed direct-delivery receipt; active-result handles are not arguments | Fixed deterministic state or direct-delivery error only |
 | `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |
 | `search_metadata_snapshot` | Allowlisted dictionary fields only; example and sample values are removed | Fixed snapshot status code |
 | `audit_ck_default_role_baseline` | Access-control audit metadata; schedule-only | Policy/service status without query rows |

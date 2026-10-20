@@ -8,6 +8,7 @@ import { basename, join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
 import { pinnedModelLookup, resolvePrivateModelAddress } from './private-network.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
+import { deliverDirectLarkReply, DirectReplyError } from './direct-lark-reply.js';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -495,13 +496,6 @@ function jsonTool(value) {
   return toolText(JSON.stringify(value, null, 2));
 }
 
-function hostDeliveryTool(delivery) {
-  return {
-    content: [{ type: 'text', text: JSON.stringify({ status: 'delivery_requested', deliveryId: delivery.deliveryId }) }],
-    _meta: { botmuxHostDelivery: delivery },
-  };
-}
-
 function argsFrom(request) {
   return request.params?.arguments && typeof request.params.arguments === 'object'
     ? request.params.arguments
@@ -791,15 +785,6 @@ function fixedFollowupResult(code) {
 }
 
 async function deliverQueryResult(caller, args, runtimeConfig) {
-  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
-    return {
-      error: {
-        status: 'validation_error',
-        error_code: 'trusted_result_delivery_unavailable',
-        message: '当前 Botmux 宿主未启用可信结果直送能力，拒绝执行以避免业务数据进入调用模型上下文',
-      },
-    };
-  }
   let identity;
   let store;
   if (caller.senderType === 'user') {
@@ -872,9 +857,6 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
 }
 
 async function continueQueryResult(caller, args, runtimeConfig) {
-  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
-    return { error: fixedFollowupResult('trusted_result_delivery_unavailable') };
-  }
   let identity;
   let store;
   try {
@@ -969,6 +951,39 @@ function isolatedDeliveryFailure() {
     error_code: 'isolated_data_operation_failed',
     message: '数据操作失败；为保护业务数据，未向调用模型返回上游响应详情',
   };
+}
+
+function directReplyFailure(error) {
+  const code = error instanceof DirectReplyError ? error.code : 'direct_reply_failed';
+  const receipt = error instanceof DirectReplyError ? error.receipt : {};
+  return {
+    status: 'error',
+    error_code: code,
+    message: code,
+    delivered: false,
+    textBytes: Number.isSafeInteger(receipt.textBytes) ? receipt.textBytes : 0,
+    attachmentCount: Number.isSafeInteger(receipt.attachmentCount) ? receipt.attachmentCount : 0,
+    truncated: receipt.truncated === true,
+  };
+}
+
+async function sendPreparedDirectReply(caller, prepared) {
+  if (prepared.error) return prepared.error;
+  const paths = Array.isArray(prepared.delivery?.files)
+    ? prepared.delivery.files.map(file => file?.path).filter(Boolean)
+    : [];
+  try {
+    const receipt = await deliverDirectLarkReply(
+      caller,
+      prepared.delivery,
+      nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
+    );
+    return { status: 'delivered', ...receipt };
+  } catch (error) {
+    return directReplyFailure(error);
+  } finally {
+    for (const path of paths) discardStagedOutboundArtifact(path);
+  }
 }
 
 async function callDataMcpService(kind, caller, args, runtimeConfig) {
@@ -1399,7 +1414,7 @@ async function handleToolCall(request) {
     } catch {
       prepared = { error: isolatedDeliveryFailure() };
     }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+    ok(request.id, jsonTool(await sendPreparedDirectReply(caller, prepared)));
     return;
   }
 
@@ -1410,7 +1425,7 @@ async function handleToolCall(request) {
     } catch {
       prepared = { error: fixedFollowupResult('delivery_failed') };
     }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+    ok(request.id, jsonTool(await sendPreparedDirectReply(caller, prepared)));
     return;
   }
 
