@@ -24,6 +24,7 @@ const modelServer = createServer((req, res) => {
       && body.includes('\\"effective_limit\\":200')
       && body.includes('\\"truncation_uncertain\\":true')
       && body.includes('\\"user_limit_reached\\":false')
+      && body.includes('\\"limit_notice\\":\\"查询结果达到或超出限制（上限 200 行）\\"')
       && body.includes('\\"limit_injected\\":true')
       && body.includes('\\"limit_capped\\":false');
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -46,6 +47,7 @@ const runResult = {
   rows_before_limit_at_least: 1, truncated: false,
   effective_limit: 200, truncation_uncertain: true,
   user_limit_reached: false,
+  limit_notice: '查询结果达到或超出限制（上限 200 行）',
   limit_injected: true, limit_capped: false,
   columns: [{ name: 'amount' }], rows: [{ amount: sentinel }],
 };

@@ -675,6 +675,8 @@ def test_export_query_to_excel_file_rejects_large_result(monkeypatch) -> None:
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "export_row_limit_exceeded"
+    assert "上限 1 行" in result["message"]
+    assert "数据部门" in result["message"]
 
 
 def test_export_allows_exact_configured_limit_and_probes_one_extra_row(
@@ -914,6 +916,8 @@ def test_export_rejects_incomplete_query_result(monkeypatch, tmp_path: Path) -> 
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "query_result_truncated"
+    assert "上限 100000 行" in result["message"]
+    assert "数据部门" in result["message"]
     assert not list(tmp_path.rglob("*.xlsx"))
 
 

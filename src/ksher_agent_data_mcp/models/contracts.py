@@ -103,6 +103,7 @@ class QueryResult(BaseModel):
     truncated: bool = False
     truncation_uncertain: bool = False
     user_limit_reached: bool = False
+    limit_notice: str | None = None
     limit_injected: bool = False
     limit_capped: bool = False
     quality_warnings: list[str] = Field(default_factory=list)

@@ -696,12 +696,12 @@ class DataMcpService:
         row_count = int(result.get("row_count") or 0)
         if row_count > limit:
             return export_validation_error(
-                f"导出行数 {row_count} 超过当前上限 {limit}，请缩小范围或由运维调整 DATA_MCP_EXPORT_MAX_ROWS",
+                _row_limit_notice("导出", limit),
                 "export_row_limit_exceeded",
             )
         if result.get("truncated"):
             return export_validation_error(
-                "查询结果已被截断，拒绝导出不完整 Excel；请缩小查询范围或补充更严格过滤条件",
+                _row_limit_notice("导出", limit),
                 "query_result_truncated",
             )
 
@@ -1203,6 +1203,10 @@ class DataMcpService:
                     result.quality_warnings.append(
                         "返回行数达到服务上限，ClickHouse 未提供足够证据证明结果完整"
                     )
+            if service_limited and result.truncated:
+                result.limit_notice = _row_limit_notice(
+                    "查询", validation.effective_limit
+                )
         audit_logger.emit(
             AuditEvent(
                 event_type="select",
@@ -1224,6 +1228,7 @@ class DataMcpService:
                     "truncated": result.truncated,
                     "truncation_uncertain": result.truncation_uncertain,
                     "user_limit_reached": result.user_limit_reached,
+                    "limit_notice": result.limit_notice,
                     "limit_injected": result.limit_injected,
                     "limit_capped": result.limit_capped,
                     "execution_ms": result.execution_ms,
@@ -1745,6 +1750,13 @@ def _safe_export_error_message(error_code: str) -> str:
     }:
         return "Excel 已生成，但写入本机导出目录失败"
     return "Excel 导出失败"
+
+
+def _row_limit_notice(action: str, limit: int) -> str:
+    return (
+        f"{action}结果达到或超出限制（上限 {limit} 行），不能确认当前结果包含完整明细。"
+        "如需完整明细，请向数据部门提需求导出，或先汇总后再导出。"
+    )
 
 
 def _query_plan_audit_ref(query_plan_id: str | None) -> str | None:

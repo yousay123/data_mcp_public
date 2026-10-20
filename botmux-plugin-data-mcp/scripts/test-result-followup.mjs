@@ -50,6 +50,7 @@ const service = createServer((req, res) => {
         rows_before_limit_at_least: 1, truncated: false,
         effective_limit: 200, truncation_uncertain: true,
         user_limit_reached: false,
+        limit_notice: '查询结果达到或超出限制（上限 200 行）',
         limit_injected: true, limit_capped: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
@@ -277,6 +278,7 @@ for (const expected of [
   '\\"effective_limit\\":200',
   '\\"truncation_uncertain\\":true',
   '\\"user_limit_reached\\":false',
+  '\\"limit_notice\\":\\"查询结果达到或超出限制（上限 200 行）\\"',
   '\\"limit_injected\\":true',
   '\\"limit_capped\\":false',
 ]) {

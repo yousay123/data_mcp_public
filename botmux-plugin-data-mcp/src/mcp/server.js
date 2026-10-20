@@ -741,6 +741,7 @@ function storableQueryResult(result) {
     truncated: result.truncated === true,
     truncation_uncertain: result.truncation_uncertain === true,
     user_limit_reached: result.user_limit_reached === true,
+    limit_notice: typeof result.limit_notice === 'string' ? result.limit_notice : null,
     limit_injected: result.limit_injected === true,
     limit_capped: result.limit_capped === true,
     quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],

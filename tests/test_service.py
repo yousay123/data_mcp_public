@@ -241,6 +241,11 @@ def test_run_query_fails_closed_when_limit_metadata_cannot_prove_completeness(
     assert result["effective_limit"] == 200
     assert result["truncated"] is expected_truncated
     assert result["truncation_uncertain"] is expected_uncertain
+    if expected_truncated:
+        assert "上限 200 行" in result["limit_notice"]
+        assert "数据部门" in result["limit_notice"]
+    else:
+        assert result["limit_notice"] is None
     select_event = next(event for event in events if event.event_type == "select")
     assert select_event.detail["effective_limit"] == 200
     assert select_event.detail["truncated"] is expected_truncated
@@ -288,6 +293,7 @@ def test_run_query_preserves_user_top_n_semantics(monkeypatch) -> None:
     assert result["truncated"] is False
     assert result["truncation_uncertain"] is False
     assert result["user_limit_reached"] is True
+    assert result["limit_notice"] is None
     select_event = next(event for event in events if event.event_type == "select")
     assert select_event.detail["user_limit_reached"] is True
 
@@ -331,6 +337,7 @@ def test_run_query_marks_user_limit_capped_by_service_as_truncated(monkeypatch) 
     assert result["truncated"] is True
     assert result["truncation_uncertain"] is False
     assert result["user_limit_reached"] is False
+    assert "上限 1000 行" in result["limit_notice"]
 
 
 def test_amber_trial_caps_user_limit_and_marks_service_truncation(monkeypatch) -> None:
@@ -382,6 +389,7 @@ def test_amber_trial_caps_user_limit_and_marks_service_truncation(monkeypatch) -
     assert result["truncated"] is True
     assert result["truncation_uncertain"] is False
     assert result["user_limit_reached"] is False
+    assert "上限 20 行" in result["limit_notice"]
 
 
 def test_amber_trial_query_reports_injected_twenty_row_limit() -> None:
