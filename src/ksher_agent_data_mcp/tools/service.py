@@ -1205,10 +1205,9 @@ class DataMcpService:
                     result.truncated = True
                     result.quality_warnings.append("返回结果被服务行数上限截断")
                 elif result.row_count >= validation.effective_limit:
-                    # rows_before_limit_at_least is a lower bound and can equal
-                    # the returned row count when ClickHouse stops at LIMIT.
-                    # Fail closed without exact_rows_before_limit=1, which can
-                    # force a full scan and exceed read or timeout budgets.
+                    # rows_before_limit_at_least is only a lower bound. When it
+                    # cannot prove completeness, fail closed without forcing an
+                    # exact full scan that may exceed read or timeout budgets.
                     result.truncated = True
                     result.truncation_uncertain = True
                     result.quality_warnings.append(

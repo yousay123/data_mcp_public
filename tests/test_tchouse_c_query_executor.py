@@ -135,26 +135,16 @@ def test_tchouse_c_executor_uses_per_call_export_row_limit(monkeypatch) -> None:
     assert seen_settings["max_result_rows"] == "100001"
 
 
-@pytest.mark.parametrize(
-    ("returned_rows", "rows_before_limit"),
-    [
-        (20, 20),
-        (20, 66),
-        (200, 200),
-        (200, 201),
-    ],
-)
-def test_tchouse_c_executor_exposes_limit_metadata_without_interpreting_sql_policy(
-    monkeypatch,
-    returned_rows: int,
-    rows_before_limit: int,
+@pytest.mark.parametrize(("returned_rows", "rows_before"), [(20, 20), (20, 66), (200, 200), (200, 201)])
+def test_tchouse_c_executor_exposes_limit_metadata_without_sql_policy(
+    monkeypatch, returned_rows: int, rows_before: int
 ) -> None:
     def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
         return {
             "meta": [{"name": "number", "type": "UInt64"}],
             "data": [{"number": 1}] * returned_rows,
             "rows": returned_rows,
-            "rows_before_limit_at_least": rows_before_limit,
+            "rows_before_limit_at_least": rows_before,
         }
 
     monkeypatch.setattr(query_executor, "execute_clickhouse_json", fake_execute_clickhouse_json)
@@ -165,25 +155,16 @@ def test_tchouse_c_executor_exposes_limit_metadata_without_interpreting_sql_poli
 
     assert result.status == Status.SUCCESS
     assert result.truncated is False
-    assert result.rows_before_limit_at_least == rows_before_limit
+    assert result.rows_before_limit_at_least == rows_before
 
 
-def test_tchouse_c_executor_detects_incomplete_payload_from_reported_row_count(
-    monkeypatch,
-) -> None:
+def test_tchouse_c_executor_detects_incomplete_payload(monkeypatch) -> None:
     def fake_execute_clickhouse_json(target, sql, query_id, timeout_seconds, query_settings=None):
-        return {
-            "meta": [{"name": "number", "type": "UInt64"}],
-            "data": [{"number": 1}],
-            "rows": 2,
-        }
-
+        return {"meta": [], "data": [{"number": 1}], "rows": 2}
     monkeypatch.setattr(query_executor, "execute_clickhouse_json", fake_execute_clickhouse_json)
-
     result = TChouseCQueryExecutor(Settings()).run(
         _credential(), "SELECT number FROM numbers(2) LIMIT 2", 30
     )
-
     assert result.truncated is True
 
 

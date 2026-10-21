@@ -40,10 +40,7 @@ When the user describes a metric, topic, or business object instead of a table:
    definition is ambiguous.
 4. Generate SQL only after the table and口径 are clear.
 5. Call `validate_sql_for_user` first.
-6. Execute only read-only queries after validation succeeds. When the host exposes
-   trusted result delivery, use `deliver_query_result_for_user` so rows, analysis,
-   and exported files never return to the calling model context. Raw run/export
-   responses are always disabled.
+6. Execute only read-only queries through `run_query_for_user` after validation succeeds.
 7. Pass the same byte-exact SQL string to validate and run. Use trimming only to
    reject blank input; do not normalize or reformat SQL between the two calls.
 8. Keep SQL validation, account mapping, execution, export limits, and audit on the Data MCP service side.
@@ -71,15 +68,19 @@ When the user names a table directly:
 5. Excel exports should contain header + data rows only, with readable column
    widths and frozen header row.
 6. When the user explicitly asks for an Excel file, call
-   `deliver_query_result_for_user` with `output_mode=excel`. The host-only
-   delivery envelope carries the staged artifact to Botmux; the calling model
-   receives only a redacted receipt.
+   `export_query_to_excel_file`. The tool runs the validated query, generates
+   Excel in the local Data MCP outbox, and returns a local file path plus
+   `sha256`/`bytes` metadata for BotMux delivery. The same export directory also
+   contains an atomically published `receipt.json`; machine consumers must read
+   that sidecar from the outbox rather than trust JSON copied through an agent.
+   The receipt is tamper evidence for a read-only sandbox, not cross-identity
+   file confidentiality.
 7. When the user does not ask for a file/export/Excel attachment, do not call the
    export tool. Normal query responses must not include a `file` key.
-8. Botmux must validate the full delivery envelope and consume the staged file
-   into bounded memory before any card or upload side effect. It removes the
-   staged source before sending and serializes delivery until the daemon returns
-   a final receipt.
+8. Before sending an exported file, verify that the returned local file exists
+   and that its `sha256` and byte size match. Send it as a Feishu file message,
+   confirm the sent message contains an attached file resource, then delete the
+   local source file.
 9. Treat `expires_at` as best-effort local retention metadata. Data MCP cleans
    expired export directories before later exports, but BotMux should still
    delete the local file after confirmed delivery.
@@ -100,17 +101,8 @@ The plugin MCP server exposes:
 - `data_mcp_identity_probe`: diagnostic only, returns the trusted identity source visible to the plugin (`gateway_meta` or `trusted_turn_fallback`) without trusting model arguments.
 - `data_mcp_query_plan`: plan-only helper; does not execute database access.
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
-- `run_query_for_user`: model-visible raw execution is fail-closed; callers must use trusted result delivery.
-- `export_query_to_excel_file`: model-visible raw export is fail-closed; callers must use trusted result delivery.
-- `deliver_query_result_for_user`: consumes one validated plan and sends either
-  an approved internal-model analysis or an Excel artifact through Botmux's trusted host;
-  the calling model receives only a delivery receipt and never the business result.
-- `continue_query_result_for_user`: use for an unambiguous follow-up about the
-  current caller-bound result. Pass only the user's follow-up text; choose
-  `excel` only when the user explicitly asks for a file. Never invent or pass a
-  result id, user identity, app id, or session id. If it returns a fixed
-  no-active-result status, treat the request as a new query. If the request is
-  ambiguous, ask the user once and default to the new-query workflow.
+- `run_query_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for controlled execution.
+- `export_query_to_excel_file`: forwards explicit SQL and trusted identity to the Data MCP service, which exports the validated result to a local Excel file artifact.
 - `refresh_metadata_snapshot`: accepts no model arguments and forwards only a host-injected `schedule_creator` owner/task/app identity to refresh the fixed dictionary snapshot.
 - `search_metadata_snapshot`: searches the verified signed current snapshot for candidate tables, fields, partitions, and definitions; snapshot failures stop the workflow and never fall back online.
 - `inspect_ck_subjects_by_table`: returns bounded access holders for explicit tables from the caller's configured entry point.

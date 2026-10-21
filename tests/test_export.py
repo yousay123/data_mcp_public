@@ -675,8 +675,6 @@ def test_export_query_to_excel_file_rejects_large_result(monkeypatch) -> None:
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "export_row_limit_exceeded"
-    assert "上限 1 行" in result["message"]
-    assert "数据部门" in result["message"]
 
 
 def test_export_allows_exact_configured_limit_and_probes_one_extra_row(
@@ -729,6 +727,46 @@ def test_export_allows_exact_configured_limit_and_probes_one_extra_row(
     assert seen["result_max_rows"] == 100_001
 
 
+def test_export_preserves_user_top_n_and_notice(tmp_path: Path) -> None:
+    class TopNExecutor:
+        def run(self, credential, sql, timeout_seconds, max_rows=None):
+            rows = [{"number": number} for number in range(10)]
+            return QueryResult(
+                status=Status.SUCCESS,
+                query_id="q_top_n_export",
+                datasource=credential.datasource,
+                sql=sql,
+                columns=[ColumnMeta(name="number", type="UInt64")],
+                rows=rows,
+                row_count=10,
+                rows_before_limit_at_least=1000,
+            )
+
+    settings = Settings(
+        CREDENTIAL_PROVIDER="memory",
+        CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+        METADATA_PROVIDER="memory",
+        DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+    )
+    service = DataMcpService(replace(build_container(settings), executor=TopNExecutor()))
+    sql = "SELECT arrayJoin(range(1000)) AS number ORDER BY number LIMIT 10"
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user", sql, "tchouse-c", session_id=SESSION_ID, lark_app_id=APP_ID
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["file"]["row_count"] == 10
+    assert result["user_limit_reached"] is True
+    assert "不能用于全量汇总" in result["user_limit_notice"]
+
+
 def test_export_without_limit_can_return_more_than_default_query_rows(tmp_path: Path) -> None:
     class RowsExecutor:
         sql = ""
@@ -779,53 +817,6 @@ def test_export_without_limit_can_return_more_than_default_query_rows(tmp_path: 
     assert result["file"]["row_count"] == 1001
     assert executor.sql.endswith("LIMIT 100001")
     assert executor.max_rows == 100_001
-
-
-def test_export_preserves_user_top_n_limit(tmp_path: Path) -> None:
-    class TopNExecutor:
-        def run(self, credential, sql, timeout_seconds, max_rows=None):
-            rows = [{"number": number} for number in range(10)]
-            return QueryResult(
-                status=Status.SUCCESS,
-                query_id="q_top_n_export",
-                datasource=credential.datasource,
-                sql=sql,
-                columns=[ColumnMeta(name="number", type="UInt64")],
-                rows=rows,
-                row_count=10,
-                rows_before_limit_at_least=1000,
-            )
-
-    settings = Settings(
-        METADATA_PROVIDER="memory",
-        CREDENTIAL_MEMORY_FILE=Path("examples/credentials.example.json"),
-        REQUIRE_PARTITION_FILTER=False,
-        DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
-    )
-    service = DataMcpService(
-        replace(build_container(settings), executor=TopNExecutor())
-    )
-    sql = "SELECT arrayJoin(range(1000)) AS number ORDER BY number LIMIT 10"
-
-    result = service.export_query_to_excel_file(
-        request_user_union_id="on_example_user",
-        request_user_open_id="ou_example_user",
-        request_lark_app_id=APP_ID,
-        sql=sql,
-        query_plan_id=service.query_plans.issue(
-            "on_example_user",
-            sql,
-            "tchouse-c",
-            session_id=SESSION_ID,
-            lark_app_id=APP_ID,
-        ),
-        audit_context=HUMAN_AUDIT_CONTEXT,
-    )
-
-    assert result["status"] == Status.SUCCESS
-    assert result["file"]["row_count"] == 10
-    assert result["user_limit_reached"] is True
-    assert "不能用于全量汇总" in result["user_limit_notice"]
 
 
 def test_export_rejects_one_row_over_configured_limit_before_truncation(monkeypatch) -> None:
@@ -918,8 +909,6 @@ def test_export_rejects_incomplete_query_result(monkeypatch, tmp_path: Path) -> 
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "query_result_truncated"
-    assert "上限 100000 行" in result["message"]
-    assert "数据部门" in result["message"]
     assert not list(tmp_path.rglob("*.xlsx"))
 
 

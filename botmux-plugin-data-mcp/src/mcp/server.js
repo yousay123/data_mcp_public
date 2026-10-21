@@ -1,12 +1,9 @@
 import { createInterface } from 'node:readline';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
-import { clearAllStoredResults, ResultStore } from './result-store.js';
-import { resolvePrivateModelAddress } from './private-network.js';
+import { join } from 'node:path';
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:8765';
@@ -14,13 +11,8 @@ const DEFAULT_SERVICE_SOCKET_PATH = join(homedir(), '.cache', 'ksher-agent-data-
 const INTERNAL_AUTH_HEADER = 'X-Internal-Auth';
 const SENSITIVE_PROCESS_ENV_KEYS = [
   'DATA_MCP_INTERNAL_AUTH_TOKEN',
-  'DATA_MCP_RESULT_MODEL_API_KEY',
-  'DATA_MCP_RESULT_BINDING_HMAC_KEY',
   'TCHOUSE_D_PASSWORD',
 ];
-const OUTBOUND_ARTIFACT_PREFIX = 'data-mcp-';
-const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
-const stagedOutboundArtifacts = new Set();
 let hostEnvCache;
 let packageVersionCache;
 
@@ -34,36 +26,6 @@ function assertNoSensitiveProcessEnv(env = process.env) {
 }
 
 assertNoSensitiveProcessEnv();
-
-function removeStagedOutboundArtifacts() {
-  for (const path of stagedOutboundArtifacts) {
-    try { unlinkSync(path); } catch { /* already consumed or best-effort shutdown cleanup */ }
-  }
-  stagedOutboundArtifacts.clear();
-}
-
-function cleanupStaleOutboundArtifacts(now = Date.now()) {
-  const pluginHome = process.env.BOTMUX_PLUGIN_HOME;
-  if (!pluginHome) return;
-  const outbound = resolve(pluginHome, 'outbound');
-  if (!existsSync(outbound)) return;
-  for (const name of readdirSync(outbound)) {
-    if (!name.startsWith(OUTBOUND_ARTIFACT_PREFIX) && !name.startsWith(`.${OUTBOUND_ARTIFACT_PREFIX}`)) continue;
-    const path = join(outbound, name);
-    try {
-      if (now - statSync(path).mtimeMs >= OUTBOUND_STALE_AFTER_MS) unlinkSync(path);
-    } catch { /* concurrent consumer or unrelated filesystem failure */ }
-  }
-}
-
-cleanupStaleOutboundArtifacts();
-process.once('exit', removeStagedOutboundArtifacts);
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    removeStagedOutboundArtifacts();
-    process.exit(signal === 'SIGINT' ? 130 : 143);
-  });
-}
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -137,9 +99,6 @@ function normalizeTrustedCaller(caller, source) {
   const dispatchAttempt = Number.isSafeInteger(caller.dispatchAttempt)
     ? caller.dispatchAttempt
     : undefined;
-  const hostCapabilities = Array.isArray(caller.hostCapabilities)
-    ? caller.hostCapabilities.filter(value => typeof value === 'string')
-    : [];
   if (!requestUserOpenId && !requestUserUnionId) return null;
   return {
     source,
@@ -152,7 +111,6 @@ function normalizeTrustedCaller(caller, source) {
     ...(capturedAt ? { capturedAt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    hostCapabilities,
   };
 }
 
@@ -222,52 +180,12 @@ function configValue(name) {
   return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
 }
 
-if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
-  console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
-}
-
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
   // process environment. Do not replace this with configValue(), whose local
   // host-env-file fallback is valid for service config but not caller context.
   const value = process.env[name];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function resultStoreFor(caller) {
-  const pluginHome = nonBlankProcessEnv('BOTMUX_PLUGIN_HOME');
-  const secret = hostEnv().DATA_MCP_RESULT_BINDING_HMAC_KEY;
-  if (!pluginHome || typeof secret !== 'string' || secret.length < 32) {
-    throw new Error('result_store_not_configured');
-  }
-  return new ResultStore({
-    pluginHome,
-    secret,
-    config: {
-      idleTtlMs: configValue('DATA_MCP_RESULT_IDLE_TTL_MS'),
-      absoluteTtlMs: configValue('DATA_MCP_RESULT_ABSOLUTE_TTL_MS'),
-      maxResultBytes: configValue('DATA_MCP_RESULT_MAX_BYTES'),
-      maxTotalBytes: configValue('DATA_MCP_RESULT_MAX_TOTAL_BYTES'),
-      maxOwnerBytes: configValue('DATA_MCP_RESULT_MAX_OWNER_BYTES'),
-    },
-  });
-}
-
-function activeResultIdentity(caller) {
-  const sessionId = nonBlankProcessEnv('BOTMUX_SESSION_ID');
-  if (
-    caller.senderType !== 'user'
-    || !caller.requestUserUnionId
-    || !caller.requestLarkAppId
-    || !sessionId
-  ) {
-    throw new Error('followup_identity_required');
-  }
-  return {
-    unionId: caller.requestUserUnionId,
-    appId: caller.requestLarkAppId,
-    sessionId,
-  };
 }
 
 function trustedQueryPlanContext() {
@@ -408,48 +326,6 @@ function collapsedValidationDetail(caller) {
   };
 }
 
-function sanitizeValidationResult(body) {
-  if (!body || body.status !== 'success') {
-    return {
-      status: 'validation_error',
-      error_code: 'sql_validation_failed',
-      message: 'sql_validation_failed',
-    };
-  }
-  const result = {
-    status: 'success',
-    datasource: typeof body.datasource === 'string' ? body.datasource : 'tchouse-c',
-    tables: Array.isArray(body.tables) ? body.tables.filter(value => typeof value === 'string') : [],
-    columns: Array.isArray(body.columns) ? body.columns.filter(value => typeof value === 'string') : [],
-  };
-  if (typeof body.normalized_sql === 'string') result.normalized_sql = body.normalized_sql;
-  if (typeof body.query_plan_id === 'string') result.query_plan_id = body.query_plan_id;
-  if (typeof body.execution_mode === 'string') result.execution_mode = body.execution_mode;
-  return result;
-}
-
-const SAFE_METADATA_FIELDS = new Set([
-  'priority', 'full_path', 'backend_name', 'type_classify', 'source_type',
-  'biz_domain', 'database_name', 'table_name', 'table_comment', 'column_name',
-  'column_comment', 'biz_definition', 'sensitive_level', 'ds',
-]);
-
-function sanitizeMetadataSearchResult(body) {
-  if (!body || body.status !== 'success') {
-    return {
-      status: body?.status === 'not_found' ? 'not_found' : 'error',
-      error_code: body?.status === 'not_found' ? 'metadata_snapshot_no_match' : 'metadata_snapshot_unavailable',
-    };
-  }
-  const results = Array.isArray(body.results)
-    ? body.results.map(row => Object.fromEntries(
-      Object.entries(row && typeof row === 'object' ? row : {})
-        .filter(([key, value]) => SAFE_METADATA_FIELDS.has(key) && ['string', 'number', 'boolean'].includes(typeof value)),
-    ))
-    : [];
-  return { status: 'success', results };
-}
-
 function redactHttpErrorDetail(kind, caller) {
   if (kind === 'validate') return collapsedValidationDetail(caller);
   return {
@@ -475,13 +351,6 @@ function toolText(text) {
 
 function jsonTool(value) {
   return toolText(JSON.stringify(value, null, 2));
-}
-
-function hostDeliveryTool(delivery) {
-  return {
-    content: [{ type: 'text', text: JSON.stringify({ status: 'delivery_requested', deliveryId: delivery.deliveryId }) }],
-    _meta: { botmuxHostDelivery: delivery },
-  };
 }
 
 function argsFrom(request) {
@@ -597,373 +466,6 @@ function postJsonOverUrl(endpoint, payload) {
     req.on('error', reject);
     req.end(body);
   });
-}
-
-function resultModelConfig() {
-  const endpointValue = configValue('DATA_MCP_RESULT_MODEL_ENDPOINT');
-  const model = configValue('DATA_MCP_RESULT_MODEL');
-  const allowedHosts = new Set((configValue('DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS') || '')
-    .split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
-  if (!endpointValue || !model || allowedHosts.size === 0) {
-    throw new Error('result_model_not_configured');
-  }
-  const endpoint = new URL(endpointValue);
-  if (!['http:', 'https:'].includes(endpoint.protocol)
-    || endpoint.username || endpoint.password
-    || !allowedHosts.has(endpoint.hostname.toLowerCase())) {
-    throw new Error('result_model_endpoint_not_allowed');
-  }
-  return {
-    endpoint,
-    model,
-    apiKey: configValue('DATA_MCP_RESULT_MODEL_API_KEY'),
-  };
-}
-
-async function postJsonToResultModel(endpoint, apiKey, payload) {
-  const pinned = await resolvePrivateModelAddress(endpoint.hostname, undefined, {
-    testException: configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
-    onTestExceptionUsed: (hostname) => resultStoreFor().auditModelEndpointException(hostname),
-  });
-  return new Promise((resolvePromise, reject) => {
-    const body = JSON.stringify(payload);
-    const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
-    const headers = {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body),
-      ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-    };
-    const req = transport(endpoint, {
-      method: 'POST',
-      headers,
-      lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
-      ...(endpoint.protocol === 'https:' ? { servername: endpoint.hostname } : {}),
-    }, (res) => {
-      const chunks = [];
-      res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolvePromise({
-        ok: res.statusCode >= 200 && res.statusCode < 300,
-        status: res.statusCode,
-        text: Buffer.concat(chunks).toString('utf8'),
-      }));
-    });
-    req.setTimeout(60_000, () => req.destroy(new Error('result_model_timeout')));
-    req.on('error', reject);
-    req.end(body);
-  });
-}
-
-async function analyzeResultWithInternalModel(result, question) {
-  const config = resultModelConfig();
-  const serialized = JSON.stringify(result);
-  if (Buffer.byteLength(serialized) > 5 * 1024 * 1024) throw new Error('result_model_payload_too_large');
-  const response = await postJsonToResultModel(config.endpoint, config.apiKey, {
-    model: config.model,
-    temperature: 0,
-    messages: [
-      {
-        role: 'system',
-        content: [
-          '你是企业内网中的数据结果分析器。只根据给定查询结果回答，不补造事实。',
-          '必须写明时间范围、统计口径、数据缺失/截断和不能推出的结论。',
-          '输出简洁中文 Markdown；不得输出数据库账号、SQL、身份标识或访问凭证。',
-        ].join('\n'),
-      },
-      {
-        role: 'user',
-        content: `用户问题：${question || '请汇总本次查询结果'}\n查询结果：${serialized}`,
-      },
-    ],
-  });
-  if (!response.ok) throw new Error(`result_model_http_${response.status}`);
-  let body;
-  try { body = JSON.parse(response.text); } catch { throw new Error('result_model_invalid_json'); }
-  const markdown = body?.choices?.[0]?.message?.content;
-  if (typeof markdown !== 'string' || !markdown.trim() || markdown.length > 50_000) {
-    throw new Error('result_model_invalid_content');
-  }
-  return markdown;
-}
-
-function copyExportToPluginOutbound(file) {
-  const pluginHome = process.env.BOTMUX_PLUGIN_HOME;
-  if (!pluginHome || !file || typeof file.path !== 'string') throw new Error('export_artifact_missing');
-  const source = realpathSync(file.path);
-  if (!statSync(source).isFile()) throw new Error('export_artifact_invalid');
-  const outbound = resolve(pluginHome, 'outbound');
-  mkdirSync(outbound, { recursive: true, mode: 0o700 });
-  const safeName = basename(typeof file.filename === 'string' ? file.filename : source)
-    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_');
-  const token = randomUUID();
-  const target = join(outbound, `data-mcp-${token}-${safeName || 'query-result.xlsx'}`);
-  const temporary = join(outbound, `.data-mcp-${token}.partial`);
-  stagedOutboundArtifacts.add(temporary);
-  try {
-    copyFileSync(source, temporary);
-    renameSync(temporary, target);
-    stagedOutboundArtifacts.delete(temporary);
-    stagedOutboundArtifacts.add(target);
-    return target;
-  } catch (error) {
-    stagedOutboundArtifacts.delete(temporary);
-    try { unlinkSync(temporary); } catch { /* best-effort */ }
-    throw error;
-  }
-}
-
-function discardStagedOutboundArtifact(path) {
-  if (!path) return;
-  stagedOutboundArtifacts.delete(path);
-  try { unlinkSync(path); } catch { /* already consumed or absent */ }
-}
-
-function sanitizedExcelFilename(value) {
-  const leaf = basename(String(value || 'query-result').replace(/\\/g, '/'))
-    .replace(/[\u0000-\u001f\u007f]/g, '')
-    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_')
-    .replace(/\.xlsx$/i, '')
-    .slice(0, 100)
-    .replace(/^\.+/, '');
-  return `${leaf || 'query-result'}.xlsx`;
-}
-
-function storableQueryResult(result) {
-  return {
-    status: 'success',
-    datasource: typeof result.datasource === 'string' ? result.datasource : 'tchouse-c',
-    columns: Array.isArray(result.columns) ? result.columns : [],
-    rows: Array.isArray(result.rows) ? result.rows : Array.isArray(result.data) ? result.data : [],
-    row_count: Number.isSafeInteger(result.row_count) ? result.row_count : 0,
-    rows_before_limit_at_least: Number.isSafeInteger(result.rows_before_limit_at_least)
-      ? result.rows_before_limit_at_least
-      : null,
-    effective_limit: Number.isSafeInteger(result.effective_limit) ? result.effective_limit : null,
-    truncated: result.truncated === true,
-    truncation_uncertain: result.truncation_uncertain === true,
-    user_limit_reached: result.user_limit_reached === true,
-    user_limit_notice: typeof result.user_limit_notice === 'string' ? result.user_limit_notice : null,
-    limit_notice: typeof result.limit_notice === 'string' ? result.limit_notice : null,
-    limit_injected: result.limit_injected === true,
-    limit_capped: result.limit_capped === true,
-    quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],
-  };
-}
-
-function storedPayload(args, result) {
-  return {
-    query: {
-      sql: args.sql,
-      datasource: typeof args.datasource === 'string' ? args.datasource : 'tchouse-c',
-    },
-    result: result ? storableQueryResult(result) : null,
-  };
-}
-
-async function freshPlan(caller, query) {
-  const validation = await callDataMcpService('validate', caller, {
-    sql: query.sql,
-    datasource: query.datasource,
-    execution_mode: 'single',
-  });
-  if (validation?.status !== 'success' || typeof validation.query_plan_id !== 'string') {
-    throw new Error('followup_revalidation_failed');
-  }
-  return validation.query_plan_id;
-}
-
-function fixedFollowupResult(code) {
-  return {
-    status: code,
-    error_code: code,
-    message: code,
-  };
-}
-
-async function deliverQueryResult(caller, args) {
-  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
-    return {
-      error: {
-        status: 'validation_error',
-        error_code: 'trusted_result_delivery_unavailable',
-        message: '当前 Botmux 宿主未启用可信结果直送能力，拒绝执行以避免业务数据进入调用模型上下文',
-      },
-    };
-  }
-  let identity;
-  let store;
-  if (caller.senderType === 'user') {
-    try {
-      identity = activeResultIdentity(caller);
-      store = resultStoreFor(caller);
-      // A new first-turn query invalidates the old active result before any
-      // work starts. If the new snapshot cannot be stored, follow-ups must see
-      // no result rather than silently using data from the previous query.
-      store.clear(identity);
-    } catch {
-      try { clearAllStoredResults(nonBlankProcessEnv('BOTMUX_PLUGIN_HOME')); }
-      catch { /* fail safe: follow-up store creation still remains unavailable */ }
-      identity = undefined;
-      store = undefined;
-    }
-  }
-  const mode = args.output_mode;
-  if (mode === 'analysis') {
-    const result = await callDataMcpService('run', caller, args);
-    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-    const markdown = await analyzeResultWithInternalModel(result, args.question);
-    if (store) {
-      try { store.put(identity, storedPayload(args, result)); }
-      catch {
-        store.clear(identity);
-        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
-        catch { /* best-effort non-sensitive audit */ }
-      }
-    }
-    return {
-      delivery: {
-        schemaVersion: 1,
-        deliveryId: `data-result-${randomUUID()}`,
-        markdown,
-        responseKind: 'final',
-      },
-    };
-  }
-  if (mode === 'excel') {
-    const safeArgs = { ...args, filename: sanitizedExcelFilename(args.filename) };
-    const result = await callDataMcpService('export', caller, safeArgs);
-    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-    const path = copyExportToPluginOutbound(result.file);
-    if (store) {
-      try { store.put(identity, storedPayload(safeArgs, null)); }
-      catch {
-        store.clear(identity);
-        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
-        catch { /* best-effort non-sensitive audit */ }
-      }
-    }
-    return {
-      delivery: {
-        schemaVersion: 1,
-        deliveryId: `data-result-${randomUUID()}`,
-        markdown: [
-          '查询完成，已生成 Excel。',
-          '',
-          `- 行数：${Number(result.file?.row_count ?? 0).toLocaleString('en-US')}`,
-          `- 查询编号：${String(result.query_id ?? '未返回')}`,
-          typeof result.user_limit_notice === 'string' ? `- 提示：${result.user_limit_notice}` : null,
-        ].filter(line => line !== null).join('\n'),
-        files: [{ path }],
-        responseKind: 'final',
-      },
-    };
-  }
-  return {
-    error: {
-      status: 'validation_error',
-      error_code: 'invalid_delivery_output_mode',
-      message: 'output_mode 仅支持 analysis 或 excel；一次查询只允许一种执行路径',
-    },
-  };
-}
-
-async function continueQueryResult(caller, args) {
-  if (!caller.hostCapabilities.includes('result_delivery_v1')) {
-    return { error: fixedFollowupResult('trusted_result_delivery_unavailable') };
-  }
-  let identity;
-  let store;
-  try {
-    identity = activeResultIdentity(caller);
-    store = resultStoreFor(caller);
-  } catch {
-    return { error: fixedFollowupResult('identity_rejected') };
-  }
-  const question = typeof args.question === 'string' ? args.question.trim() : '';
-  if (!question || question.length > 4000 || !caller.turnId) {
-    return { error: fixedFollowupResult('invalid_followup_request') };
-  }
-  const active = store.read(identity);
-  if (active.status !== 'active') {
-    store.audit(identity, caller.turnId, question, null, active.status);
-    return { error: fixedFollowupResult(active.status) };
-  }
-  if (!store.reserveTurn(identity, caller.turnId)) {
-    store.audit(identity, caller.turnId, question, active.record.version, 'rate_limited');
-    return { error: fixedFollowupResult('rate_limited') };
-  }
-  const expectedVersion = active.record.version;
-  const payload = active.record.payload;
-  const mode = args.output_mode === 'excel' ? 'excel' : 'analysis';
-  try {
-    if (mode === 'analysis') {
-      let result = payload.result;
-      let finalVersion = expectedVersion;
-      if (!result) {
-        const queryPlanId = await freshPlan(caller, payload.query);
-        const rerun = await callDataMcpService('run', caller, {
-          ...payload.query,
-          query_plan_id: queryPlanId,
-        });
-        if (rerun?.status !== 'success') throw new Error('followup_query_failed');
-        result = storableQueryResult(rerun);
-        const updated = store.replaceIfVersion(identity, expectedVersion, {
-          ...payload,
-          result,
-        });
-        finalVersion = updated.version;
-      }
-      const markdown = await analyzeResultWithInternalModel(result, question);
-      store.assertVersion(identity, finalVersion);
-      store.touch(identity, finalVersion);
-      store.audit(identity, caller.turnId, question, finalVersion, 'delivery_requested');
-      return {
-        delivery: {
-          schemaVersion: 1,
-          deliveryId: `data-followup-${randomUUID()}`,
-          markdown,
-          responseKind: 'final',
-        },
-      };
-    }
-
-    const queryPlanId = await freshPlan(caller, payload.query);
-    const exported = await callDataMcpService('export', caller, {
-      ...payload.query,
-      query_plan_id: queryPlanId,
-      filename: sanitizedExcelFilename(args.filename),
-    });
-    if (exported?.status !== 'success') throw new Error('followup_export_failed');
-    store.assertVersion(identity, expectedVersion);
-    const path = copyExportToPluginOutbound(exported.file);
-    try {
-      store.assertVersion(identity, expectedVersion);
-    } catch (error) {
-      discardStagedOutboundArtifact(path);
-      throw error;
-    }
-    store.touch(identity, expectedVersion);
-    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
-    return {
-      delivery: {
-        schemaVersion: 1,
-        deliveryId: `data-followup-${randomUUID()}`,
-        markdown: `Excel 为重新查询结果。\n\n生成时间：${new Date().toISOString()}`,
-        files: [{ path }],
-        responseKind: 'final',
-      },
-    };
-  } catch {
-    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed');
-    return { error: fixedFollowupResult('delivery_failed') };
-  }
-}
-
-function isolatedDeliveryFailure() {
-  return {
-    status: 'error',
-    error_code: 'isolated_data_operation_failed',
-    message: '数据操作失败；为保护业务数据，未向调用模型返回上游响应详情',
-  };
 }
 
 async function callDataMcpService(kind, caller, args) {
@@ -1249,12 +751,7 @@ async function callDataMcpService(kind, caller, args) {
       detail: redactHttpErrorDetail(kind, caller),
     };
   }
-  if (kind === 'validate') {
-    return isTrustedHumanOrSchedule(caller)
-      ? sanitizeValidationResult(body)
-      : redactSchemaDetailsForUntrustedCaller(body, caller);
-  }
-  return body;
+  return kind === 'validate' ? redactSchemaDetailsForUntrustedCaller(body, caller) : body;
 }
 
 function trustedCallerPayload(caller) {
@@ -1306,7 +803,7 @@ async function callSnapshotService(kind, caller, payload) {
       audit_context: auditContext(caller),
     };
   }
-  return kind === 'searchSnapshot' ? sanitizeMetadataSearchResult(body) : body;
+  return body;
 }
 
 async function handleToolCall(request) {
@@ -1363,37 +860,13 @@ async function handleToolCall(request) {
     return;
   }
 
-  if (name === 'run_query_for_user' || name === 'export_query_to_excel_file') {
-    const policyIssue = callerPolicyIssue(caller);
-    ok(request.id, jsonTool({
-      ...(policyIssue ?? {
-        status: 'validation_error',
-        error_code: 'isolated_delivery_required',
-        message: '业务结果必须留在内网投递链路，请改用 deliver_query_result_for_user',
-      }),
-    }));
+  if (name === 'run_query_for_user') {
+    ok(request.id, jsonTool(await callDataMcpService('run', caller, argsFrom(request))));
     return;
   }
 
-  if (name === 'deliver_query_result_for_user') {
-    let prepared;
-    try {
-      prepared = await deliverQueryResult(caller, argsFrom(request));
-    } catch {
-      prepared = { error: isolatedDeliveryFailure() };
-    }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
-    return;
-  }
-
-  if (name === 'continue_query_result_for_user') {
-    let prepared;
-    try {
-      prepared = await continueQueryResult(caller, argsFrom(request));
-    } catch {
-      prepared = { error: fixedFollowupResult('delivery_failed') };
-    }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+  if (name === 'export_query_to_excel_file') {
+    ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request))));
     return;
   }
 
@@ -1490,38 +963,6 @@ function toolSchemas() {
           expected_source_version: { type: 'string', minLength: 1, maxLength: 256 },
         },
         required: ['sql', 'query_plan_id'],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'deliver_query_result_for_user',
-      description: 'Execute one approved query and deliver either an internal-model analysis or an Excel artifact through the trusted Botmux host without exposing business data to the calling model.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sql: { type: 'string' },
-          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
-          query_plan_id: { type: 'string' },
-          output_mode: { type: 'string', enum: ['analysis', 'excel'] },
-          question: { type: 'string' },
-          filename: { type: 'string' },
-          max_export_rows: { type: 'integer', minimum: 1 },
-        },
-        required: ['sql', 'query_plan_id', 'output_mode'],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'continue_query_result_for_user',
-      description: 'Continue analysis of the caller-bound active result and deliver the answer through the trusted Botmux host without exposing result data to the calling model.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', minLength: 1, maxLength: 4000 },
-          output_mode: { type: 'string', enum: ['analysis', 'excel'], default: 'analysis' },
-          filename: { type: 'string', maxLength: 200 },
-        },
-        required: ['question'],
         additionalProperties: false,
       },
     },

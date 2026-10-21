@@ -212,9 +212,9 @@ class TChouseCQueryExecutor(QueryExecutor):
             payload.get("rows_before_limit_at_least")
         )
         statistics = payload.get("statistics") or {}
-        # This layer only detects an incomplete response payload. Whether a SQL
-        # LIMIT is a user-requested Top-N or a service-enforced safety bound is
-        # policy context owned by DataMcpService.
+        # SQL LIMIT semantics belong to DataMcpService, which knows whether the
+        # limit came from the user or from a service safety bound. This layer
+        # only detects an incomplete response payload.
         truncated = len(rows) < row_count
         warnings = []
         if truncated:
