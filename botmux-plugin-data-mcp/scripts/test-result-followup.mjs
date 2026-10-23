@@ -547,6 +547,14 @@ if (!serverSource.includes(
 )) {
   throw new Error('result model test exception is not wired from host configuration');
 }
+if (!serverSource.includes([
+  'const req = transport(endpoint, {',
+  "      method: 'POST',",
+  '      headers,',
+  '      lookup: pinnedModelLookup(pinned.address, pinned.family),',
+].join('\n'))) {
+  throw new Error('result model transport is not wired to the validated pinned DNS address');
+}
 
 const warningEnvFile = join(root, 'test-exception-warning.env');
 writeFileSync(warningEnvFile, [
