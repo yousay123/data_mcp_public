@@ -12,7 +12,7 @@ from ksher_agent_data_mcp.api import app
 
 SMOKE_TEST_SQL = (
     "SELECT count() AS cnt FROM analytics.metadata_dictionary "
-    "WHERE ds = (SELECT max(ds) FROM analytics.metadata_dictionary)"
+    "WHERE ds = '2026-08-31'"
 )
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

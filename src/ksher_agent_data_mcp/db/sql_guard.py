@@ -424,13 +424,19 @@ class SqlGuard:
         tables: list[str],
         table_metas: dict[str, TableMeta],
     ) -> list[ValidationIssue]:
-        sql_text = expression.sql(dialect=SQL_DIALECT).lower()
         issues: list[ValidationIssue] = []
         for table_name in tables:
             table = table_metas.get(table_name)
             if not table or not table.partition_fields:
                 continue
-            if not any(f"{field.lower()}" in sql_text for field in table.partition_fields):
+            table_nodes = [
+                node for node in expression.find_all(exp.Table)
+                if _table_name(node) == table_name
+            ]
+            if not table_nodes or not all(
+                _table_has_partition_predicate(node, table.partition_fields)
+                for node in table_nodes
+            ):
                 issues.append(
                     ValidationIssue(
                         code="missing_partition_filter",
@@ -497,6 +503,52 @@ def _table_name(table: exp.Table) -> str:
     if database:
         return f"{database}.{table.name}".lower()
     return table.name.lower()
+
+
+def _table_has_partition_predicate(
+    table: exp.Table,
+    partition_fields: list[str],
+) -> bool:
+    """Require a partition column in this table's WHERE/PREWHERE predicate.
+
+    Merely projecting or grouping by a partition column does not constrain a
+    scan. For joins, an unqualified column is intentionally not accepted: the
+    validator must be able to prove which physical table the predicate limits.
+    """
+    select = table.find_ancestor(exp.Select)
+    if select is None:
+        return False
+    predicates = [
+        predicate
+        for predicate in (select.args.get("where"), select.args.get("prewhere"))
+        if isinstance(predicate, exp.Expression)
+    ]
+    if not predicates:
+        return False
+
+    tables_in_scope = [
+        candidate
+        for candidate in select.find_all(exp.Table)
+        if candidate.find_ancestor(exp.Select) is select
+    ]
+    allow_unqualified = len(tables_in_scope) == 1
+    accepted_qualifiers = {
+        value.lower()
+        for value in (table.alias_or_name, table.name)
+        if value
+    }
+    required = {field.lower() for field in partition_fields}
+
+    for predicate in predicates:
+        for column in predicate.find_all(exp.Column):
+            if column.find_ancestor(exp.Select) is not select:
+                continue
+            if column.name.lower() not in required:
+                continue
+            qualifier = column.table.lower() if column.table else ""
+            if (not qualifier and allow_unqualified) or qualifier in accepted_qualifiers:
+                return True
+    return False
 
 
 def _minimal_table_meta(full_name: str) -> TableMeta:

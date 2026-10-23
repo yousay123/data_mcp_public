@@ -894,6 +894,7 @@ def test_export_rejects_incomplete_query_result(monkeypatch, tmp_path: Path) -> 
             "columns": [{"name": "number", "type": "UInt64"}],
             "rows": [{"number": 1}],
             "row_count": 2,
+            "effective_limit": 1_000,
             "truncated": True,
             "tables": [],
         }
@@ -918,8 +919,60 @@ def test_export_rejects_incomplete_query_result(monkeypatch, tmp_path: Path) -> 
 
     assert result["status"] == Status.VALIDATION_ERROR
     assert result["issues"][0]["code"] == "query_result_truncated"
-    assert "上限 100000 行" in result["message"]
+    assert "上限 1000 行" in result["message"]
+    assert "100000" not in result["message"]
     assert "数据部门" in result["message"]
+    assert not list(tmp_path.rglob("*.xlsx"))
+
+
+def test_export_truncated_result_without_query_limit_avoids_false_limit(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                METADATA_PROVIDER="memory",
+                DATA_MCP_EXPORT_OUTBOX_DIR=tmp_path,
+            )
+        )
+    )
+
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: {
+            "status": Status.SUCCESS,
+            "query_id": "q_incomplete_unknown_limit",
+            "datasource": "tchouse-c",
+            "sql": "SELECT number FROM numbers(2)",
+            "columns": [{"name": "number", "type": "UInt64"}],
+            "rows": [{"number": 1}],
+            "row_count": 2,
+            "truncated": True,
+            "tables": [],
+        },
+    )
+    sql = "SELECT number FROM numbers(2)"
+
+    result = service.export_query_to_excel_file(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=sql,
+        query_plan_id=service.query_plans.issue(
+            "on_example_user",
+            sql,
+            "tchouse-c",
+            session_id=SESSION_ID,
+            lark_app_id=APP_ID,
+        ),
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert result["issues"][0]["code"] == "query_result_truncated"
+    assert "查询结果不完整" in result["message"]
+    assert "100000" not in result["message"]
     assert not list(tmp_path.rglob("*.xlsx"))
 
 

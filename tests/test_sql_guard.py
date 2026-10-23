@@ -308,6 +308,38 @@ def test_requires_partition_filter() -> None:
     assert any(issue.code == "missing_partition_filter" for issue in result.issues)
 
 
+def test_partition_field_in_projection_does_not_count_as_filter() -> None:
+    result = _guard().validate(
+        _user(),
+        "select dt, count(*) from dwd.dwd_payment_order_di group by dt",
+    )
+
+    assert result.status == Status.VALIDATION_ERROR
+    assert any(issue.code == "missing_partition_filter" for issue in result.issues)
+
+
+def test_partition_field_in_where_counts_as_filter() -> None:
+    result = _guard().validate(
+        _user(),
+        "select dt, count(*) from dwd.dwd_payment_order_di "
+        "where dt >= '2026-08-01' and dt < '2026-09-01' group by dt",
+    )
+
+    assert result.status == Status.SUCCESS
+    assert not any(issue.code == "missing_partition_filter" for issue in result.issues)
+
+
+def test_unfiltered_latest_partition_subquery_does_not_count_as_filter() -> None:
+    result = _guard().validate(
+        _user(),
+        "select count(*) from dwd.dwd_payment_order_di "
+        "where dt = (select max(dt) from dwd.dwd_payment_order_di)",
+    )
+
+    assert result.status == Status.VALIDATION_ERROR
+    assert any(issue.code == "missing_partition_filter" for issue in result.issues)
+
+
 def test_blocks_unknown_table() -> None:
     result = _guard(require_partition_filter=False).validate(
         _user(), "select * from dwd.unknown_table"

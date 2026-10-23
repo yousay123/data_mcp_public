@@ -700,8 +700,21 @@ class DataMcpService:
                 "export_row_limit_exceeded",
             )
         if result.get("truncated"):
+            query_limit = result.get("effective_limit")
+            if isinstance(query_limit, bool) or not isinstance(query_limit, int):
+                query_limit = None
+            query_limit_notice = result.get("limit_notice")
+            if not isinstance(query_limit_notice, str) or not query_limit_notice.strip():
+                query_limit_notice = (
+                    _row_limit_notice("查询", query_limit)
+                    if query_limit is not None and query_limit > 0
+                    else (
+                        "查询结果不完整，拒绝导出不完整 Excel。"
+                        "请缩小查询范围、补充更严格过滤条件，或先汇总后再导出。"
+                    )
+                )
             return export_validation_error(
-                _row_limit_notice("导出", limit),
+                query_limit_notice,
                 "query_result_truncated",
             )
 
