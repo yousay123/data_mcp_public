@@ -24,14 +24,18 @@ const modelServer = createServer((req, res) => {
     const body = Buffer.concat(chunks).toString('utf8');
     modelSawSentinel = body.includes(sentinel);
     modelSawAuth = req.headers.authorization === 'Bearer internal-test-key';
-    modelSawLimitEvidence = body.includes('\"rows_before_limit_at_least\":1')
-      && body.includes('\"effective_limit\":200')
-      && body.includes('\"truncation_uncertain\":true')
-      && body.includes('\"user_limit_reached\":false')
-      && body.includes('\"user_limit_notice\":\"当前结果仅代表限定范围，不能用于全量汇总。\"')
-      && body.includes('\"limit_notice\":\"查询结果达到或超出限制（上限 200 行）\"')
-      && body.includes('\"limit_injected\":true')
-      && body.includes('\"limit_capped\":false');
+    const payload = JSON.parse(body);
+    const userContent = payload.messages?.find(message => message.role === 'user')?.content || '';
+    const serializedResult = userContent.split('查询结果：').at(-1);
+    const internalResult = JSON.parse(serializedResult);
+    modelSawLimitEvidence = internalResult.rows_before_limit_at_least === 1
+      && internalResult.effective_limit === 200
+      && internalResult.truncation_uncertain === true
+      && internalResult.user_limit_reached === false
+      && internalResult.user_limit_notice === '当前结果仅代表限定范围，不能用于全量汇总。'
+      && internalResult.limit_notice === '查询结果达到或超出限制（上限 200 行）'
+      && internalResult.limit_injected === true
+      && internalResult.limit_capped === false;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ choices: [{ message: { content: modelOutput } }] }));
   });
@@ -149,7 +153,7 @@ if (!botmuxRecords.some(row => row.content?.includes(modelOutput))) {
 }
 const fileRecord = botmuxRecords.find(row => row.args[0] === 'send' && row.args.includes('--files'));
 if (!fileRecord) throw new Error('Excel attachment was not sent to Feishu');
-if (!fileRecord.content?.includes('不能用于全量汇总')) {
+if (!botmuxRecords.some(row => row.content?.includes('不能用于全量汇总'))) {
   throw new Error('Excel direct delivery lost the user LIMIT advisory');
 }
 const stagedPath = fileRecord.args[fileRecord.args.indexOf('--files') + 1];
