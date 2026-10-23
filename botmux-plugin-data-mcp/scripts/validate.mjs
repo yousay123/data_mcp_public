@@ -7,6 +7,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeRoot = join(repoRoot, 'dist');
+const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
+
+function makeTestTempDir(prefix) {
+  return mkdtempSync(join(testTmpRoot, prefix));
+}
 
 function fail(message) {
   throw new Error(message);
@@ -189,7 +194,7 @@ if (mcp.transport === 'streamable-http') {
   fail(`unsupported MCP transport: ${mcp.transport}`);
 }
 
-const cleanRoot = mkdtempSync(join(tmpdir(), 'botmux-plugin-dist-'));
+const cleanRoot = makeTestTempDir('botmux-plugin-dist-');
 try {
   cpSync(runtimeRoot, cleanRoot, { recursive: true });
   const cleanCli = join(cleanRoot, 'cli', 'index.js');
@@ -263,7 +268,7 @@ try {
       fail('Data MCP service runner is missing from the clean dist');
     }
 
-    const runnerRoot = mkdtempSync(join(tmpdir(), 'data-mcp-api-runner-'));
+    const runnerRoot = makeTestTempDir('data-mcp-api-runner-');
     try {
       const runtimeHome = join(runnerRoot, 'runtime-abc123');
       const binDir = join(runtimeHome, '.venv', 'bin');
@@ -930,6 +935,17 @@ try {
         } },
       },
     };
+    const trustedHumanValidateCall = {
+      jsonrpc: '2.0', id: 35, method: 'tools/call',
+      params: {
+        name: 'validate_sql_for_user',
+        arguments: { sql: 'SELECT * FROM analytics.secret_table', datasource: 'tchouse-c' },
+        _meta: { botmuxTrustedCaller: {
+          requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
+          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'turn-1',
+        } },
+      },
+    };
     const input = [
       initialize,
       listTools,
@@ -951,6 +967,7 @@ try {
       emptySubjectScopeCall,
       excessiveTableScopeCall,
       invalidDatasourceCall,
+      trustedHumanValidateCall,
       mismatchedScheduleValidateCall,
       mismatchedScheduleRunCall,
       mismatchedScheduleExportCall,
@@ -1193,6 +1210,15 @@ try {
     if (!invalidDatasourceText.includes('unsupported_datasource')) {
       fail('public query tools must reject non-tchouse-c datasource before service access');
     }
+    const trustedHumanValidateText = byId.get(35)?.result?.content?.[0]?.text ?? '';
+    if (
+      !trustedHumanValidateText.includes('analytics.secret_table')
+      || !trustedHumanValidateText.includes('secret_col')
+      || trustedHumanValidateText.includes('sql_account_binding')
+      || trustedHumanValidateText.includes('secret_user')
+    ) {
+      fail('successful validation must return the SQL contract without exposing account bindings');
+    }
 
     const missingSessionCall = {
       jsonrpc: '2.0', id: 22, method: 'tools/call',
@@ -1260,7 +1286,18 @@ try {
               return;
             }
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ status: 'success', transport: 'unix_socket', endpoint: req.url }));
+            res.end(JSON.stringify({
+              status: 'success',
+              transport: 'unix_socket',
+              endpoint: req.url,
+              results: [{
+                full_path: 'analytics.synthetic_table.synthetic_column',
+                table_name: 'synthetic_table',
+                column_name: 'synthetic_column',
+                sql_account_binding: { tchouse_account: 'secret_user' },
+                sample: 'SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE',
+              }],
+            }));
             return;
           }
           const frozenSql = "SELECT '\\\\\\\\'' OR 1=1 --' AS probe";
@@ -1507,16 +1544,22 @@ try {
         fail(`export_query_to_excel_file must return export data and user-limit notice to the model: ${exportText}`);
       }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
-      if (!searchText.includes('/agent/search-metadata-snapshot')) {
-        fail('search_metadata_snapshot must forward local query controls over the shared Unix socket');
+      if (
+        !searchText.includes('analytics.synthetic_table.synthetic_column')
+        || searchText.includes('sql_account_binding')
+        || searchText.includes('secret_user')
+        || searchText.includes('SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE')
+        || searchText.includes('unix_socket')
+      ) {
+        fail('search_metadata_snapshot must return only allowlisted metadata fields');
       }
       const refreshText = socketResponses.find(response => response.id === 15)?.result?.content?.[0]?.text ?? '';
       if (!refreshText.includes('/agent/refresh-metadata-snapshot')) {
         fail('refresh_metadata_snapshot must forward host-injected schedule identity over the shared Unix socket');
       }
       const validateText = socketResponses.find(response => response.id === 16)?.result?.content?.[0]?.text ?? '';
-      if (!validateText.includes('/agent/validate-sql')) {
-        fail('validate_sql_for_user must forward session binding and compare mode over the shared Unix socket');
+      if (!validateText.includes('qplan_socket') || validateText.includes('unix_socket')) {
+        fail('validate_sql_for_user must sanitize the successful Unix-socket response');
       }
       const executionValidateCall = {
         ...socketValidateCall,
@@ -1558,14 +1601,18 @@ try {
         .split('\n')
         .filter(Boolean)
         .map(line => JSON.parse(line));
-      for (const responseId of [23, 24]) {
-        const responseText = executionResponses
-          .find(response => response.id === responseId)?.result?.content?.[0]?.text ?? '';
-        if (!responseText.includes('"transport": "unix_socket"')) {
-          fail(
-            `validate and run must forward the same execution id and byte-exact SQL when no session exists: ${responseText}`,
-          );
-        }
+      const executionValidateText = executionResponses
+        .find(response => response.id === 23)?.result?.content?.[0]?.text ?? '';
+      const executionRunText = executionResponses
+        .find(response => response.id === 24)?.result?.content?.[0]?.text ?? '';
+      if (
+        !executionValidateText.includes('qplan_socket')
+        || executionValidateText.includes('unix_socket')
+        || !executionRunText.includes('"transport": "unix_socket"')
+      ) {
+        fail(
+          'validate and run must forward the same execution id and byte-exact SQL when no session exists',
+        );
       }
 
       const precedenceCall = {
@@ -1600,7 +1647,7 @@ try {
         .filter(Boolean)
         .map(line => JSON.parse(line))
         .find(response => response.id === 25)?.result?.content?.[0]?.text ?? '';
-      if (!precedenceText.includes('"transport": "unix_socket"')) {
+      if (!precedenceText.includes('qplan_socket') || precedenceText.includes('unix_socket')) {
         fail(
           `BOTMUX_SESSION_ID must take precedence when both execution contexts are present: ${precedenceText}`,
         );

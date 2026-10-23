@@ -6,6 +6,25 @@ This package is intentionally private and is not registered in the public
 Botmux plugin market. It is meant to be installed only in controlled
 environments and enabled only for selected bots.
 
+## Current Mainline Mode
+
+This branch is the **single-model compatibility version**. After a successful
+validation, `run_query_for_user` returns query rows to the calling model, and
+the export tool returns its artifact metadata to that model. Consequently,
+business query results enter the external model's conversation context. This
+mode does not require Botmux trusted-result delivery capability or an internal
+result-analysis model.
+
+The isolated two-model implementation is maintained on
+`feat/dual-model-v1-integration-20261023` until its rollout prerequisites are
+met. That mode requires a Botmux host with trusted result delivery support and
+an approved, configured internal model endpoint. It must pass the documented
+end-to-end isolation and delivery audit before being merged into the mainline.
+
+The retired raw bypass tools (`frozen_query_raw` and `execute_frozen_query`)
+must not be restored in either mode. All access remains bound to Gateway-
+injected identity, read-only validation, query plans, and service-side limits.
+
 ## Capabilities
 
 - Skill: `data-mcp`

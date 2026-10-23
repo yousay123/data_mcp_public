@@ -326,6 +326,48 @@ function collapsedValidationDetail(caller) {
   };
 }
 
+function sanitizeValidationResult(body) {
+  if (!body || body.status !== 'success') {
+    return {
+      status: 'validation_error',
+      error_code: 'sql_validation_failed',
+      message: 'sql_validation_failed',
+    };
+  }
+  const result = {
+    status: 'success',
+    datasource: typeof body.datasource === 'string' ? body.datasource : 'tchouse-c',
+    tables: Array.isArray(body.tables) ? body.tables.filter(value => typeof value === 'string') : [],
+    columns: Array.isArray(body.columns) ? body.columns.filter(value => typeof value === 'string') : [],
+  };
+  if (typeof body.normalized_sql === 'string') result.normalized_sql = body.normalized_sql;
+  if (typeof body.query_plan_id === 'string') result.query_plan_id = body.query_plan_id;
+  if (typeof body.execution_mode === 'string') result.execution_mode = body.execution_mode;
+  return result;
+}
+
+const SAFE_METADATA_FIELDS = new Set([
+  'priority', 'full_path', 'backend_name', 'type_classify', 'source_type',
+  'biz_domain', 'database_name', 'table_name', 'table_comment', 'column_name',
+  'column_comment', 'biz_definition', 'sensitive_level', 'ds',
+]);
+
+function sanitizeMetadataSearchResult(body) {
+  if (!body || body.status !== 'success') {
+    return {
+      status: body?.status === 'not_found' ? 'not_found' : 'error',
+      error_code: body?.status === 'not_found' ? 'metadata_snapshot_no_match' : 'metadata_snapshot_unavailable',
+    };
+  }
+  const results = Array.isArray(body.results)
+    ? body.results.map(row => Object.fromEntries(
+      Object.entries(row && typeof row === 'object' ? row : {})
+        .filter(([key, value]) => SAFE_METADATA_FIELDS.has(key) && ['string', 'number', 'boolean'].includes(typeof value)),
+    ))
+    : [];
+  return { status: 'success', results };
+}
+
 function redactHttpErrorDetail(kind, caller) {
   if (kind === 'validate') return collapsedValidationDetail(caller);
   return {
@@ -751,7 +793,12 @@ async function callDataMcpService(kind, caller, args) {
       detail: redactHttpErrorDetail(kind, caller),
     };
   }
-  return kind === 'validate' ? redactSchemaDetailsForUntrustedCaller(body, caller) : body;
+  if (kind === 'validate') {
+    return isTrustedHumanOrSchedule(caller)
+      ? sanitizeValidationResult(body)
+      : redactSchemaDetailsForUntrustedCaller(body, caller);
+  }
+  return body;
 }
 
 function trustedCallerPayload(caller) {
@@ -803,7 +850,7 @@ async function callSnapshotService(kind, caller, payload) {
       audit_context: auditContext(caller),
     };
   }
-  return body;
+  return kind === 'searchSnapshot' ? sanitizeMetadataSearchResult(body) : body;
 }
 
 async function handleToolCall(request) {
