@@ -9,7 +9,7 @@ from ksher_agent_data_mcp.tools.service import DataMcpService
 
 SMOKE_TEST_SQL = (
     "SELECT count() AS cnt FROM analytics.metadata_dictionary "
-    "WHERE ds = (SELECT max(ds) FROM analytics.metadata_dictionary)"
+    "WHERE ds = '2026-08-31'"
 )
 APP_ID = "cli_example"
 SESSION_ID = "session_example"
