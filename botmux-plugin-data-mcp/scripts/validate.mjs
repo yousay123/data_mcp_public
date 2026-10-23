@@ -273,6 +273,7 @@ try {
       const runtimeHome = join(runnerRoot, 'runtime-abc123');
       const binDir = join(runtimeHome, '.venv', 'bin');
       const fakeApi = join(binDir, 'ksher-agent-data-api');
+      const fakeApiScript = join(binDir, 'ksher-agent-data-api.cjs');
       const runner = join(cleanRoot, serviceDefinition.pm2.script);
       const runnerModule = join(cleanRoot, 'service', 'api-runner.js');
       const pm2ImportContainer = join(runnerRoot, 'pm2-import-container.mjs');
@@ -281,7 +282,7 @@ try {
         pm2ImportContainer,
         `process.channel?.ref();\nimport('node:url').then(({ pathToFileURL }) => import(pathToFileURL(process.env.pm_exec_path).href));\n`,
       );
-      writeFileSync(fakeApi, `#!${process.execPath}
+      writeFileSync(fakeApiScript, `
         const http = require('node:http');
         const { chmodSync, readFileSync, writeFileSync } = require('node:fs');
         const privateConfig = {};
@@ -323,6 +324,10 @@ try {
           setInterval(() => {}, 1000);
         }
       `);
+      writeFileSync(
+        fakeApi,
+        `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeApiScript)}\n`,
+      );
       chmodSync(fakeApi, 0o755);
 
       const spawnRunner = (name, mode, extra = {}, { viaPm2Import = false } = {}) => {
@@ -468,14 +473,30 @@ try {
       }
 
       const childEnvReport = join(runnerRoot, 'env-isolation', 'env.child-env-report');
-      const envIsolation = spawnRunner('env-isolation', 'exit', {
+      const envIsolationReady = join(runnerRoot, 'env-isolation', 'ready');
+      const envIsolation = spawnRunner('env-isolation', 'healthy', {
         DATA_MCP_INTERNAL_AUTH_TOKEN: 'internal-child-canary',
         TCHOUSE_D_PASSWORD: 'database-child-canary',
-      }).child;
-      await waitForExit(envIsolation, 15_000, 'env-isolation runner');
-      await waitForFile(childEnvReport);
+        FAKE_READY_FILE: envIsolationReady,
+        DATA_MCP_SERVICE_READY_TIMEOUT_MS: '5000',
+      });
+      try {
+        await waitForFile(envIsolationReady);
+        await waitForFile(childEnvReport);
+      } catch (error) {
+        throw new Error(`${error.message}; runner stderr: ${JSON.stringify(envIsolation.stderr())}`);
+      }
       if (readFileSync(childEnvReport, 'utf8') !== '[]') {
         fail('Python API process environment must not contain internal auth or database secrets');
+      }
+      envIsolation.child.kill('SIGTERM');
+      const envIsolationResult = await waitForExit(
+        envIsolation.child,
+        15_000,
+        'env-isolation runner',
+      );
+      if (envIsolationResult.code !== 0) {
+        fail(`env-isolation runner must exit cleanly after SIGTERM, got ${envIsolationResult.code}`);
       }
 
       const pm2ImportedEarlyExit = spawnRunner(
