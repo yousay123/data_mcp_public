@@ -40,10 +40,14 @@ When the user describes a metric, topic, or business object instead of a table:
    definition is ambiguous.
 4. Generate SQL only after the table and口径 are clear.
 5. Call `validate_sql_for_user` first.
-6. Execute only read-only queries after validation succeeds. Use
-   `deliver_query_result_for_user` so rows, analysis,
-   and exported files never return to the calling model context. Raw run/export
-   responses are always disabled.
+6. Execute only read-only queries after validation succeeds. Follow the tools
+   actually registered for this Bot:
+   - when `deliver_query_result_for_user` is present, use it; rows, analysis,
+     and files stay on the isolated delivery path;
+   - when it is absent, this Bot is explicitly configured for single-model
+     operation: use `run_query_for_user`, and use
+     `export_query_to_excel_file` only for an explicit file request. In this
+     mode query rows enter the calling model context by design.
 7. Pass the same byte-exact SQL string to validate and run. Use trimming only to
    reject blank input; do not normalize or reformat SQL between the two calls.
 8. Keep SQL validation, account mapping, execution, export limits, and audit on the Data MCP service side.
@@ -73,10 +77,9 @@ When the user names a table directly:
    until host-side filtering or the protected result-page flow is restored.
 5. Excel exports should contain header + data rows only, with readable column
    widths and frozen header row.
-6. When the user explicitly asks for an Excel file, call
-   `deliver_query_result_for_user` with `output_mode=excel`. The plugin sends the
-   staged artifact through the bound Botmux session; the calling model receives
-   only a redacted receipt.
+6. When the user explicitly asks for an Excel file, use
+   `deliver_query_result_for_user` with `output_mode=excel` in dual-model mode,
+   or `export_query_to_excel_file` in single-model mode.
 7. When the user does not ask for a file/export/Excel attachment, do not call the
    export tool. Normal query responses must not include a `file` key.
 8. The plugin must validate that the staged file is a regular non-symlink below
@@ -103,8 +106,10 @@ The plugin MCP server exposes:
 - `data_mcp_identity_probe`: diagnostic only, returns the trusted identity source visible to the plugin (`gateway_meta` or `trusted_turn_fallback`) without trusting model arguments.
 - `data_mcp_query_plan`: plan-only helper; does not execute database access.
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
-- `run_query_for_user`: model-visible raw execution is fail-closed; callers must use trusted result delivery.
-- `export_query_to_excel_file`: model-visible raw export is fail-closed; callers must use trusted result delivery.
+- `run_query_for_user`: returns the bounded result only in explicitly configured
+  single-model mode; in dual-model mode it is fail-closed.
+- `export_query_to_excel_file`: returns the export artifact only in explicitly
+  configured single-model mode; in dual-model mode it is fail-closed.
 - `deliver_query_result_for_user`: consumes one validated plan and replies either
   an approved internal-model analysis or an Excel artifact to the signed original Feishu message;
   the calling model receives only a delivery receipt and never the business result.
@@ -114,6 +119,10 @@ The plugin MCP server exposes:
   result id, user identity, app id, or session id. If it returns a fixed
   no-active-result status, treat the request as a new query. If the request is
   ambiguous, ask the user once and default to the new-query workflow.
+
+`deliver_query_result_for_user` and `continue_query_result_for_user` are not
+registered at all in single-model mode. Tool availability, not model-authored
+arguments, is the authoritative mode signal.
 - `refresh_metadata_snapshot`: accepts no model arguments and forwards only a host-injected `schedule_creator` owner/task/app identity to refresh the fixed dictionary snapshot.
 - `search_metadata_snapshot`: searches the verified signed current snapshot for candidate tables, fields, partitions, and definitions; snapshot failures stop the workflow and never fall back online.
 - `inspect_ck_subjects_by_table`: returns bounded access holders for explicit tables from the caller's configured entry point.

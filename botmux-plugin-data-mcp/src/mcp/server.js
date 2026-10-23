@@ -245,12 +245,25 @@ function runtimeConfigForCaller(caller) {
   });
 }
 
+const hostRuntimeConfig = Object.freeze({
+  testProfileSelected: false,
+  value: configValue,
+});
+
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
   // process environment. Do not replace this with configValue(), whose local
   // host-env-file fallback is valid for service config but not caller context.
   const value = process.env[name];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function dataMcpModelMode() {
+  const mode = nonBlankProcessEnv('DATA_MCP_MODEL_MODE') ?? 'dual';
+  if (mode !== 'single' && mode !== 'dual') {
+    throw new Error('data_mcp_model_mode_invalid');
+  }
+  return mode;
 }
 
 function resultStoreFor(caller) {
@@ -546,16 +559,18 @@ function serviceSocketPath(runtimeConfig) {
   return socketPath || DEFAULT_SERVICE_SOCKET_PATH;
 }
 
-function serviceHeaders() {
+function serviceHeaders(runtimeConfig) {
   const headers = { 'content-type': 'application/json' };
-  const token = hostEnv().DATA_MCP_INTERNAL_AUTH_TOKEN;
+  const token = runtimeConfig
+    ? runtimeConfig.value('DATA_MCP_INTERNAL_AUTH_TOKEN')
+    : hostEnv().DATA_MCP_INTERNAL_AUTH_TOKEN;
   if (token) {
     headers[INTERNAL_AUTH_HEADER] = token;
   }
   return headers;
 }
 
-function postJsonOverUnixSocket(socketPath, path, payload) {
+function postJsonOverUnixSocket(socketPath, path, payload, runtimeConfig) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
     const req = httpRequest({
@@ -563,7 +578,7 @@ function postJsonOverUnixSocket(socketPath, path, payload) {
       path,
       method: 'POST',
       headers: {
-        ...serviceHeaders(),
+        ...serviceHeaders(runtimeConfig),
         'content-length': Buffer.byteLength(body),
       },
     }, (res) => {
@@ -582,11 +597,11 @@ function postJsonOverUnixSocket(socketPath, path, payload) {
   });
 }
 
-function postJsonOverUrl(endpoint, payload) {
+function postJsonOverUrl(endpoint, payload, runtimeConfig) {
   if (endpoint.startsWith('data:')) {
     return fetch(endpoint, {
       method: 'POST',
-      headers: serviceHeaders(),
+      headers: serviceHeaders(runtimeConfig),
       body: JSON.stringify(payload),
     });
   }
@@ -595,7 +610,7 @@ function postJsonOverUrl(endpoint, payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
     const headers = {
-      ...serviceHeaders(),
+      ...serviceHeaders(runtimeConfig),
       'content-length': Buffer.byteLength(body),
     };
     const req = transport(url, { method: 'POST', headers }, (res) => {
@@ -1256,8 +1271,8 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
     const explicit = explicitServiceEndpoint(kind, runtimeConfig);
     const socketPath = serviceSocketPath(runtimeConfig);
     response = explicit || !socketPath
-      ? await postJsonOverUrl(explicit || serviceEndpoint(kind, runtimeConfig), payload)
-      : await postJsonOverUnixSocket(socketPath, servicePath(kind), payload);
+      ? await postJsonOverUrl(explicit || serviceEndpoint(kind, runtimeConfig), payload, runtimeConfig)
+      : await postJsonOverUnixSocket(socketPath, servicePath(kind), payload, runtimeConfig);
   } catch (err) {
     return {
       status: 'error',
@@ -1312,10 +1327,14 @@ async function callSnapshotService(kind, caller, payload, runtimeConfig) {
   ].includes(kind);
   let response;
   try {
-    const socketPath = serviceSocketPath(runtimeConfig);
+    // Metadata search is a shared signed catalog and must not follow the
+    // caller's SQL execution profile. Audit/refresh endpoints still use the
+    // caller-selected service boundary.
+    const serviceConfig = kind === 'searchSnapshot' ? hostRuntimeConfig : runtimeConfig;
+    const socketPath = serviceSocketPath(serviceConfig);
     response = socketPath
-      ? await postJsonOverUnixSocket(socketPath, servicePath(kind), payload)
-      : await postJsonOverUrl(serviceEndpoint(kind, runtimeConfig), payload);
+      ? await postJsonOverUnixSocket(socketPath, servicePath(kind), payload, serviceConfig)
+      : await postJsonOverUrl(serviceEndpoint(kind, serviceConfig), payload, serviceConfig);
   } catch (err) {
     return {
       status: 'error',
@@ -1411,6 +1430,16 @@ async function handleToolCall(request) {
     return;
   }
 
+  if (name === 'run_query_for_user' && dataMcpModelMode() === 'single') {
+    ok(request.id, jsonTool(await callDataMcpService('run', caller, argsFrom(request), runtimeConfig)));
+    return;
+  }
+
+  if (name === 'export_query_to_excel_file' && dataMcpModelMode() === 'single') {
+    ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request), runtimeConfig)));
+    return;
+  }
+
   if (name === 'run_query_for_user' || name === 'export_query_to_excel_file') {
     const policyIssue = callerPolicyIssue(caller);
     ok(request.id, jsonTool({
@@ -1424,6 +1453,10 @@ async function handleToolCall(request) {
   }
 
   if (name === 'deliver_query_result_for_user') {
+    if (dataMcpModelMode() !== 'dual') {
+      error(request.id, -32602, `unknown_tool:${String(name)}`);
+      return;
+    }
     let prepared;
     try {
       prepared = await deliverQueryResult(caller, argsFrom(request), runtimeConfig);
@@ -1435,6 +1468,10 @@ async function handleToolCall(request) {
   }
 
   if (name === 'continue_query_result_for_user') {
+    if (dataMcpModelMode() !== 'dual') {
+      error(request.id, -32602, `unknown_tool:${String(name)}`);
+      return;
+    }
     let prepared;
     try {
       prepared = await continueQueryResult(caller, argsFrom(request), runtimeConfig);
@@ -1474,7 +1511,7 @@ async function handleToolCall(request) {
 }
 
 function toolSchemas() {
-  return [
+  const tools = [
     {
       name: 'data_mcp_identity_probe',
       description: 'Return the Botmux Gateway trusted caller context visible to Data MCP.',
@@ -1635,6 +1672,13 @@ function toolSchemas() {
       },
     },
   ];
+  if (dataMcpModelMode() === 'single') {
+    return tools.filter(tool => ![
+      'deliver_query_result_for_user',
+      'continue_query_result_for_user',
+    ].includes(tool.name));
+  }
+  return tools;
 }
 
 input.on('line', (line) => {

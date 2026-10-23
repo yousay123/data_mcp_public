@@ -28,6 +28,8 @@ const selectedAppId = 'cli_signed_profile_test';
 const otherAppId = 'cli_other_bot';
 const bindingSecret = '0123456789abcdef0123456789abcdef';
 const evilBindingSecret = 'profile-must-not-override-this-secret';
+const profileAuthToken = 'synthetic-profile-auth-token';
+const defaultAuthToken = 'synthetic-default-auth-token';
 const rowSentinel = 'SIGNED_PROFILE_ROW_SENTINEL';
 const modelSentinel = 'SIGNED_PROFILE_MODEL_SENTINEL';
 let modelCalls = 0;
@@ -43,6 +45,10 @@ const service = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
+    if (req.headers['x-internal-auth'] !== profileAuthToken) {
+      jsonResponse(res, { status: 'error' }, 401);
+      return;
+    }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
     if (req.url === '/agent/validate-sql') {
       jsonResponse(res, {
@@ -89,8 +95,12 @@ await new Promise(resolvePromise => model.listen(0, '127.0.0.1', resolvePromise)
 const modelAddress = model.address();
 if (!modelAddress || typeof modelAddress === 'string') throw new Error('model fixture did not bind');
 
-const defaultService = createServer((_req, res) => {
+const defaultService = createServer((req, res) => {
   defaultServiceHits += 1;
+  if (req.headers['x-internal-auth'] !== defaultAuthToken) {
+    jsonResponse(res, { status: 'error' }, 401);
+    return;
+  }
   jsonResponse(res, { status: 'error' }, 503);
 });
 await new Promise(resolvePromise => defaultService.listen(0, '127.0.0.1', resolvePromise));
@@ -102,6 +112,7 @@ if (!defaultServiceAddress || typeof defaultServiceAddress === 'string') {
 function completeProfileLines(overrides = {}) {
   return {
     DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
+    DATA_MCP_INTERNAL_AUTH_TOKEN: profileAuthToken,
     DATA_MCP_RESULT_MODEL_ENDPOINT: `http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
     DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS: '127.0.0.1',
     DATA_MCP_RESULT_MODEL: 'signed-profile-model',
@@ -117,6 +128,7 @@ function writeProfile(path, values, mode = 0o600) {
 const defaultEnvFile = join(root, 'default.env');
 writeFileSync(defaultEnvFile, [
   `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
+  `DATA_MCP_INTERNAL_AUTH_TOKEN=${defaultAuthToken}`,
   `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
   `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
   `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
@@ -180,6 +192,12 @@ function spawnPlugin(extraEnv = {}) {
     }
   });
   return {
+    listTools() {
+      const id = nextId++;
+      const response = new Promise(resolvePromise => pending.set(id, resolvePromise));
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list', params: {} })}\n`);
+      return response;
+    },
     call(name, arguments_, caller) {
       const id = nextId++;
       const response = new Promise(resolvePromise => pending.set(id, resolvePromise));
@@ -261,8 +279,43 @@ if (toolPayload(exported).attachmentCount !== 1) {
 }
 await plugin.close();
 
+const singlePlugin = spawnPlugin({
+  BOTMUX_SESSION_ID: 'single-model-session',
+  DATA_MCP_MODEL_MODE: 'single',
+});
+const singleTools = (await singlePlugin.listTools()).result?.tools?.map(tool => tool.name) ?? [];
+if (singleTools.includes('deliver_query_result_for_user')
+  || singleTools.includes('continue_query_result_for_user')
+  || !singleTools.includes('run_query_for_user')
+  || !singleTools.includes('export_query_to_excel_file')) {
+  throw new Error('single-model tool registration is incorrect');
+}
+const singleValidation = await singlePlugin.call('validate_sql_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+}, caller(selectedAppId, 'om_single_validate'));
+if (!JSON.stringify(singleValidation).includes('signed-profile-plan')) {
+  throw new Error('single-model validation did not use the selected service profile');
+}
+const singleRun = await singlePlugin.call('run_query_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'signed-profile-plan',
+}, caller(selectedAppId, 'om_single_run'));
+if (!JSON.stringify(singleRun).includes(rowSentinel)
+  || JSON.stringify(singleRun).includes('isolated_delivery_required')) {
+  throw new Error('single-model run did not return the service result');
+}
+const hiddenDualTool = await singlePlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'must stay hidden',
+}, caller(selectedAppId, 'om_single_hidden'));
+if (!JSON.stringify(hiddenDualTool).includes('unknown_tool:deliver_query_result_for_user')) {
+  throw new Error('single-model mode accepted a dual-model-only tool');
+}
+await singlePlugin.close();
+
 for (const [label, mutate] of [
   ['missing socket', values => { delete values.DATA_MCP_SERVICE_SOCKET_PATH; }],
+  ['missing internal auth', values => { delete values.DATA_MCP_INTERNAL_AUTH_TOKEN; }],
   ['missing model endpoint', values => { delete values.DATA_MCP_RESULT_MODEL_ENDPOINT; }],
   ['missing allowed hosts', values => { delete values.DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS; }],
   ['missing model', values => { delete values.DATA_MCP_RESULT_MODEL; }],
