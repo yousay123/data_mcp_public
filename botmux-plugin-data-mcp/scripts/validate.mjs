@@ -7,6 +7,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimeRoot = join(repoRoot, 'dist');
+const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
+
+function makeTestTempDir(prefix) {
+  return mkdtempSync(join(testTmpRoot, prefix));
+}
 
 function fail(message) {
   throw new Error(message);
@@ -189,7 +194,7 @@ if (mcp.transport === 'streamable-http') {
   fail(`unsupported MCP transport: ${mcp.transport}`);
 }
 
-const cleanRoot = mkdtempSync(join(tmpdir(), 'botmux-plugin-dist-'));
+const cleanRoot = makeTestTempDir('botmux-plugin-dist-');
 try {
   cpSync(runtimeRoot, cleanRoot, { recursive: true });
   const cleanCli = join(cleanRoot, 'cli', 'index.js');
@@ -263,7 +268,7 @@ try {
       fail('Data MCP service runner is missing from the clean dist');
     }
 
-    const runnerRoot = mkdtempSync(join(tmpdir(), 'data-mcp-api-runner-'));
+    const runnerRoot = makeTestTempDir('data-mcp-api-runner-');
     try {
       const runtimeHome = join(runnerRoot, 'runtime-abc123');
       const binDir = join(runtimeHome, '.venv', 'bin');
@@ -1692,7 +1697,7 @@ try {
     // A file under `<dataDir>/trusted-turns/` must NEVER be honored — the
     // directory is world-readable and the file name is derived from a plaintext
     // session id, so any same-uid process could impersonate anyone by writing it.
-    const fallbackHome = mkdtempSync(join(tmpdir(), 'botmux-plugin-trusted-turn-'));
+    const fallbackHome = makeTestTempDir('botmux-plugin-trusted-turn-');
     try {
       const sessionId = 'fallback-session';
       const dataDir = join(fallbackHome, '.botmux', 'data');

@@ -17,7 +17,8 @@ import {
 } from '../src/mcp/signed-app-profile.js';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const root = mkdtempSync(join(tmpdir(), 'data-mcp-signed-profile-'));
+const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
+const root = mkdtempSync(join(testTmpRoot, 'data-mcp-signed-profile-'));
 const socketPath = join(root, 'test-api.sock');
 const pluginHome = join(root, 'plugin-home');
 const selectedAppId = 'cli_signed_profile_test';

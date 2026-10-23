@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -405,6 +405,31 @@ const singleLookupResult = await new Promise((resolve, reject) => {
 });
 if (singleLookupResult.address !== '10.2.3.4' || singleLookupResult.family !== 4) {
   throw new Error('pinned model lookup did not honor the single-address callback contract');
+}
+const pinnedHttpServer = createServer((_req, res) => jsonResponse(res, { ok: true }));
+await new Promise(resolve => pinnedHttpServer.listen(0, '127.0.0.1', resolve));
+try {
+  const address = pinnedHttpServer.address();
+  if (!address || typeof address === 'string') throw new Error('pinned HTTP test server did not bind');
+  const response = await new Promise((resolve, reject) => {
+    const req = httpRequest({
+      hostname: 'synthetic.internal',
+      port: address.port,
+      path: '/',
+      lookup: pinnedModelLookup('127.0.0.1', 4),
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ statusCode: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.once('error', reject);
+    req.end();
+  });
+  if (response.statusCode !== 200 || JSON.parse(response.body).ok !== true) {
+    throw new Error('pinned model lookup failed in a real HTTP request');
+  }
+} finally {
+  await new Promise((resolve, reject) => pinnedHttpServer.close(error => error ? reject(error) : resolve()));
 }
 for (const answers of [
   [{ address: '198.18.0.1', family: 4 }],
