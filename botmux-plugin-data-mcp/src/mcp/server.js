@@ -1,12 +1,12 @@
 import { createInterface } from 'node:readline';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
-import { pinnedModelLookup, resolvePrivateModelAddress } from './private-network.js';
+import { runInternalResultAgent } from './result-agent.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 import { deliverDirectLarkReply, DirectReplyError } from './direct-lark-reply.js';
 
@@ -20,7 +20,7 @@ const SENSITIVE_PROCESS_ENV_KEYS = [
   'DATA_MCP_RESULT_BINDING_HMAC_KEY',
   'TCHOUSE_D_PASSWORD',
 ];
-const OUTBOUND_ARTIFACT_PREFIX = 'data-mcp-';
+const OUTBOUND_ARTIFACT_PREFIXES = ['data-mcp-', 'result-agent-'];
 const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
 const stagedOutboundArtifacts = new Set();
 let hostEnvCache;
@@ -50,7 +50,7 @@ function cleanupStaleOutboundArtifacts(now = Date.now()) {
   const outbound = resolve(pluginHome, 'outbound');
   if (!existsSync(outbound)) return;
   for (const name of readdirSync(outbound)) {
-    if (!name.startsWith(OUTBOUND_ARTIFACT_PREFIX) && !name.startsWith(`.${OUTBOUND_ARTIFACT_PREFIX}`)) continue;
+    if (!OUTBOUND_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix) || name.startsWith(`.${prefix}`))) continue;
     const path = join(outbound, name);
     try {
       if (now - statSync(path).mtimeMs >= OUTBOUND_STALE_AFTER_MS) unlinkSync(path);
@@ -629,132 +629,33 @@ function postJsonOverUrl(endpoint, payload, runtimeConfig) {
   });
 }
 
-function resultModelConfig(runtimeConfig) {
-  const endpointValue = runtimeConfig.value('DATA_MCP_RESULT_MODEL_ENDPOINT');
-  const model = runtimeConfig.value('DATA_MCP_RESULT_MODEL');
-  const allowedHosts = new Set((runtimeConfig.value('DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS') || '')
-    .split(',').map(value => value.trim().toLowerCase()).filter(Boolean));
-  if (!endpointValue || !model || allowedHosts.size === 0) {
-    throw new Error('result_model_not_configured');
-  }
-  const endpoint = new URL(endpointValue);
-  if (!['http:', 'https:'].includes(endpoint.protocol)
-    || endpoint.username || endpoint.password
-    || !allowedHosts.has(endpoint.hostname.toLowerCase())) {
-    throw new Error('result_model_endpoint_not_allowed');
-  }
-  return {
-    endpoint,
-    model,
-    apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY'),
-  };
-}
-
-async function postJsonToResultModel(endpoint, apiKey, payload, runtimeConfig) {
-  const pinned = await resolvePrivateModelAddress(endpoint.hostname, undefined, {
-    testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
-    onTestExceptionUsed: (hostname) => resultStoreFor().auditModelEndpointException(hostname),
-  });
-  return new Promise((resolvePromise, reject) => {
-    const body = JSON.stringify(payload);
-    const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
-    const headers = {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body),
-      ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-    };
-    const req = transport(endpoint, {
-      method: 'POST',
-      headers,
-      lookup: pinnedModelLookup(pinned.address, pinned.family),
-      ...(endpoint.protocol === 'https:' ? { servername: endpoint.hostname } : {}),
-    }, (res) => {
-      const chunks = [];
-      res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolvePromise({
-        ok: res.statusCode >= 200 && res.statusCode < 300,
-        status: res.statusCode,
-        text: Buffer.concat(chunks).toString('utf8'),
-      }));
-    });
-    req.setTimeout(60_000, () => req.destroy(new Error('result_model_timeout')));
-    req.on('error', reject);
-    req.end(body);
-  });
-}
-
-async function analyzeResultWithInternalModel(result, question, runtimeConfig) {
-  const config = resultModelConfig(runtimeConfig);
-  const serialized = JSON.stringify(result);
-  if (Buffer.byteLength(serialized) > 5 * 1024 * 1024) throw new Error('result_model_payload_too_large');
-  const response = await postJsonToResultModel(config.endpoint, config.apiKey, {
-    model: config.model,
-    temperature: 0,
-    messages: [
-      {
-        role: 'system',
-        content: [
-          '你是企业内网中的数据结果分析器。只根据给定查询结果回答，不补造事实。',
-          '必须写明时间范围、统计口径、数据缺失/截断和不能推出的结论。',
-          '输出简洁中文 Markdown；不得输出数据库账号、SQL、身份标识或访问凭证。',
-        ].join('\n'),
-      },
-      {
-        role: 'user',
-        content: `用户问题：${question || '请汇总本次查询结果'}\n查询结果：${serialized}`,
-      },
-    ],
-  }, runtimeConfig);
-  if (!response.ok) throw new Error(`result_model_http_${response.status}`);
-  let body;
-  try { body = JSON.parse(response.text); } catch { throw new Error('result_model_invalid_json'); }
-  const markdown = body?.choices?.[0]?.message?.content;
-  if (typeof markdown !== 'string' || !markdown.trim() || markdown.length > 50_000) {
-    throw new Error('result_model_invalid_content');
-  }
-  return markdown;
-}
-
-function copyExportToPluginOutbound(file) {
-  const pluginHome = process.env.BOTMUX_PLUGIN_HOME;
-  if (!pluginHome || !file || typeof file.path !== 'string') throw new Error('export_artifact_missing');
-  const source = realpathSync(file.path);
-  if (!statSync(source).isFile()) throw new Error('export_artifact_invalid');
-  const outbound = resolve(pluginHome, 'outbound');
-  mkdirSync(outbound, { recursive: true, mode: 0o700 });
-  const safeName = basename(typeof file.filename === 'string' ? file.filename : source)
-    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_');
-  const token = randomUUID();
-  const target = join(outbound, `data-mcp-${token}-${safeName || 'query-result.xlsx'}`);
-  const temporary = join(outbound, `.data-mcp-${token}.partial`);
-  stagedOutboundArtifacts.add(temporary);
-  try {
-    copyFileSync(source, temporary);
-    renameSync(temporary, target);
-    stagedOutboundArtifacts.delete(temporary);
-    stagedOutboundArtifacts.add(target);
-    return target;
-  } catch (error) {
-    stagedOutboundArtifacts.delete(temporary);
-    try { unlinkSync(temporary); } catch { /* best-effort */ }
-    throw error;
-  }
-}
-
 function discardStagedOutboundArtifact(path) {
   if (!path) return;
   stagedOutboundArtifacts.delete(path);
   try { unlinkSync(path); } catch { /* already consumed or absent */ }
 }
 
-function sanitizedExcelFilename(value) {
-  const leaf = basename(String(value || 'query-result').replace(/\\/g, '/'))
-    .replace(/[\u0000-\u001f\u007f]/g, '')
-    .replace(/[^A-Za-z0-9._\u4e00-\u9fff-]/g, '_')
-    .replace(/\.xlsx$/i, '')
-    .slice(0, 100)
-    .replace(/^\.+/, '');
-  return `${leaf || 'query-result'}.xlsx`;
+function requestedOutputs(args) {
+  if (Array.isArray(args.requested_outputs)) return args.requested_outputs;
+  if (args.output_mode === 'excel') return ['excel'];
+  if (args.output_mode === 'pdf') return ['pdf'];
+  if (args.output_mode === 'chart') return ['chart'];
+  if (args.output_mode === 'document' || args.output_mode === 'feishu_doc') return ['document'];
+  return ['analysis'];
+}
+
+async function runResultAgent(result, args, runtimeConfig) {
+  return runInternalResultAgent({
+    result,
+    question: typeof args.question === 'string' && args.question.trim()
+      ? args.question.trim()
+      : '请基于本次查询结果生成用户要求的产物',
+    resultContext: args.result_context,
+    requestedOutputs: requestedOutputs(args),
+    runtimeConfig,
+    pluginHome: nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
+    onTestExceptionUsed: hostname => resultStoreFor().auditModelEndpointException(hostname),
+  });
 }
 
 function storableQueryResult(result) {
@@ -785,20 +686,10 @@ function storedPayload(args, result) {
       sql: args.sql,
       datasource: typeof args.datasource === 'string' ? args.datasource : 'tchouse-c',
     },
+    result_context: args.result_context && typeof args.result_context === 'object'
+      && !Array.isArray(args.result_context) ? args.result_context : {},
     result: result ? storableQueryResult(result) : null,
   };
-}
-
-async function freshPlan(caller, query, runtimeConfig) {
-  const validation = await callDataMcpService('validate', caller, {
-    sql: query.sql,
-    datasource: query.datasource,
-    execution_mode: 'single',
-  }, runtimeConfig);
-  if (validation?.status !== 'success' || typeof validation.query_plan_id !== 'string') {
-    throw new Error('followup_revalidation_failed');
-  }
-  return validation.query_plan_id;
 }
 
 function fixedFollowupResult(code) {
@@ -827,62 +718,24 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       store = undefined;
     }
   }
-  const mode = args.output_mode;
-  if (mode === 'analysis') {
-    const result = await callDataMcpService('run', caller, args, runtimeConfig);
-    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-    const markdown = await analyzeResultWithInternalModel(result, args.question, runtimeConfig);
-    if (store) {
-      try { store.put(identity, storedPayload(args, result)); }
-      catch {
-        store.clear(identity);
-        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
-        catch { /* best-effort non-sensitive audit */ }
-      }
+  const result = await callDataMcpService('run', caller, args, runtimeConfig);
+  if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
+  const authored = await runResultAgent(result, args, runtimeConfig);
+  if (store) {
+    try { store.put(identity, storedPayload(args, result)); }
+    catch {
+      store.clear(identity);
+      try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
+      catch { /* best-effort non-sensitive audit */ }
     }
-    return {
-      delivery: {
-        schemaVersion: 1,
-        deliveryId: `data-result-${randomUUID()}`,
-        markdown,
-        responseKind: 'final',
-      },
-    };
-  }
-  if (mode === 'excel') {
-    const safeArgs = { ...args, filename: sanitizedExcelFilename(args.filename) };
-    const result = await callDataMcpService('export', caller, safeArgs, runtimeConfig);
-    if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-    const path = copyExportToPluginOutbound(result.file);
-    if (store) {
-      try { store.put(identity, storedPayload(safeArgs, null)); }
-      catch {
-        store.clear(identity);
-        try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
-        catch { /* best-effort non-sensitive audit */ }
-      }
-    }
-    return {
-      delivery: {
-        schemaVersion: 1,
-        deliveryId: `data-result-${randomUUID()}`,
-        markdown: [
-          '查询完成，已生成 Excel。',
-          '',
-          `- 行数：${Number(result.file?.row_count ?? 0).toLocaleString('en-US')}`,
-          `- 查询编号：${String(result.query_id ?? '未返回')}`,
-          typeof result.user_limit_notice === 'string' ? `- 提示：${result.user_limit_notice}` : null,
-        ].filter(line => line !== null).join('\n'),
-        files: [{ path }],
-        responseKind: 'final',
-      },
-    };
   }
   return {
-    error: {
-      status: 'validation_error',
-      error_code: 'invalid_delivery_output_mode',
-      message: 'output_mode 仅支持 analysis 或 excel；一次查询只允许一种执行路径',
+    delivery: {
+      schemaVersion: 1,
+      deliveryId: `data-result-${randomUUID()}`,
+      markdown: authored.markdown,
+      ...(authored.files.length ? { files: authored.files } : {}),
+      responseKind: 'final',
     },
   };
 }
@@ -911,62 +764,22 @@ async function continueQueryResult(caller, args, runtimeConfig) {
   }
   const expectedVersion = active.record.version;
   const payload = active.record.payload;
-  const mode = args.output_mode === 'excel' ? 'excel' : 'analysis';
   try {
-    if (mode === 'analysis') {
-      let result = payload.result;
-      let finalVersion = expectedVersion;
-      if (!result) {
-        const queryPlanId = await freshPlan(caller, payload.query, runtimeConfig);
-        const rerun = await callDataMcpService('run', caller, {
-          ...payload.query,
-          query_plan_id: queryPlanId,
-        }, runtimeConfig);
-        if (rerun?.status !== 'success') throw new Error('followup_query_failed');
-        result = storableQueryResult(rerun);
-        const updated = store.replaceIfVersion(identity, expectedVersion, {
-          ...payload,
-          result,
-        });
-        finalVersion = updated.version;
-      }
-      const markdown = await analyzeResultWithInternalModel(result, question, runtimeConfig);
-      store.assertVersion(identity, finalVersion);
-      store.touch(identity, finalVersion);
-      store.audit(identity, caller.turnId, question, finalVersion, 'delivery_requested');
-      return {
-        delivery: {
-          schemaVersion: 1,
-          deliveryId: `data-followup-${randomUUID()}`,
-          markdown,
-          responseKind: 'final',
-        },
-      };
-    }
-
-    const queryPlanId = await freshPlan(caller, payload.query, runtimeConfig);
-    const exported = await callDataMcpService('export', caller, {
-      ...payload.query,
-      query_plan_id: queryPlanId,
-      filename: sanitizedExcelFilename(args.filename),
+    if (!payload.result) throw new Error('followup_result_unavailable');
+    const authored = await runResultAgent(payload.result, {
+      ...args,
+      question,
+      result_context: payload.result_context,
     }, runtimeConfig);
-    if (exported?.status !== 'success') throw new Error('followup_export_failed');
     store.assertVersion(identity, expectedVersion);
-    const path = copyExportToPluginOutbound(exported.file);
-    try {
-      store.assertVersion(identity, expectedVersion);
-    } catch (error) {
-      discardStagedOutboundArtifact(path);
-      throw error;
-    }
     store.touch(identity, expectedVersion);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
     return {
       delivery: {
         schemaVersion: 1,
         deliveryId: `data-followup-${randomUUID()}`,
-        markdown: `Excel 为重新查询结果。\n\n生成时间：${new Date().toISOString()}`,
-        files: [{ path }],
+        markdown: authored.markdown,
+        ...(authored.files.length ? { files: authored.files } : {}),
         responseKind: 'final',
       },
     };
@@ -1435,12 +1248,7 @@ async function handleToolCall(request) {
     return;
   }
 
-  if (name === 'export_query_to_excel_file' && dataMcpModelMode() === 'single') {
-    ok(request.id, jsonTool(await callDataMcpService('export', caller, argsFrom(request), runtimeConfig)));
-    return;
-  }
-
-  if (name === 'run_query_for_user' || name === 'export_query_to_excel_file') {
+  if (name === 'run_query_for_user') {
     const policyIssue = callerPolicyIssue(caller);
     ok(request.id, jsonTool({
       ...(policyIssue ?? {
@@ -1562,49 +1370,49 @@ function toolSchemas() {
       },
     },
     {
-      name: 'export_query_to_excel_file',
-      description: 'Run explicit read-only SQL through the Data MCP service and export the result to a local Excel file artifact when the user explicitly asks for a file.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          sql: { type: 'string' },
-          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
-          query_plan_id: { type: 'string' },
-          filename: { type: 'string' },
-          max_export_rows: { type: 'integer', minimum: 1 },
-          expected_source_version: { type: 'string', minLength: 1, maxLength: 256 },
-        },
-        required: ['sql', 'query_plan_id'],
-        additionalProperties: false,
-      },
-    },
-    {
       name: 'deliver_query_result_for_user',
-      description: 'Execute one approved query and deliver either an internal-model analysis or an Excel artifact through the trusted Botmux host without exposing business data to the calling model.',
+      description: 'Execute one approved query once, pass rows/schema/context to the internal result Agent, and deliver Agent-authored analysis and requested artifacts through the trusted Botmux host.',
       inputSchema: {
         type: 'object',
         properties: {
           sql: { type: 'string' },
           datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
           query_plan_id: { type: 'string' },
-          output_mode: { type: 'string', enum: ['analysis', 'excel'] },
-          question: { type: 'string' },
-          filename: { type: 'string' },
-          max_export_rows: { type: 'integer', minimum: 1 },
+          question: { type: 'string', minLength: 1, maxLength: 4000 },
+          requested_outputs: {
+            type: 'array', minItems: 1, maxItems: 5, uniqueItems: true,
+            items: { type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document'] },
+          },
+          result_context: {
+            type: 'object',
+            description: 'Confirmed metric/time/filter/grouping/unit/timezone context passed to the internal Agent with the result manifest.',
+            additionalProperties: true,
+          },
+          output_mode: {
+            type: 'string',
+            enum: ['analysis', 'excel', 'pdf', 'chart', 'document', 'feishu_doc'],
+            description: 'Deprecated single-output compatibility field; prefer requested_outputs.',
+          },
         },
-        required: ['sql', 'query_plan_id', 'output_mode'],
+        required: ['sql', 'query_plan_id', 'question', 'result_context'],
         additionalProperties: false,
       },
     },
     {
       name: 'continue_query_result_for_user',
-      description: 'Continue analysis of the caller-bound active result and deliver the answer through the trusted Botmux host without exposing result data to the calling model.',
+      description: 'Continue from the caller-bound stored result through the internal result Agent without re-querying or exposing result data to the calling model.',
       inputSchema: {
         type: 'object',
         properties: {
           question: { type: 'string', minLength: 1, maxLength: 4000 },
-          output_mode: { type: 'string', enum: ['analysis', 'excel'], default: 'analysis' },
-          filename: { type: 'string', maxLength: 200 },
+          requested_outputs: {
+            type: 'array', minItems: 1, maxItems: 5, uniqueItems: true,
+            items: { type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document'] },
+          },
+          output_mode: {
+            type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document', 'feishu_doc'],
+            description: 'Deprecated single-output compatibility field; prefer requested_outputs.',
+          },
         },
         required: ['question'],
         additionalProperties: false,

@@ -51,7 +51,8 @@ turn. A `schedule_creator` caller is accepted only when `turnId` has the form
 source is `schedule_creator`. This prevents a scheduled input adopted into an
 already-active turn from using that turn's preserved caller identity.
 
-Trusted Excel delivery is one-shot. The plugin stages an atomic outbound file;
+Trusted artifact delivery is one-shot. The internal result Agent selects and
+invokes the Excel/PDF/chart/document tool. The plugin stages atomic outbound files;
 the Botmux host consumes it into bounded memory and removes the staged source
 before any send. Plugin shutdown cleans files still owned by that process, and
 startup removes abandoned Data MCP artifacts older than 15 minutes.
@@ -129,8 +130,9 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
   - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
-- Raw `run_query_for_user` / `export_query_to_excel_file` result responses are
-  always disabled. Business results must use `deliver_query_result_for_user`;
+- Raw `run_query_for_user` responses are always disabled in dual-model mode,
+  and no model-visible Data MCP export tool is registered. Business results
+  must use `deliver_query_result_for_user`;
   this fail-closed boundary cannot be disabled by environment configuration.
 - `DATA_MCP_RESULT_MODEL_ENDPOINT`
   - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
@@ -194,8 +196,9 @@ environment.
 
 For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. SQL validation, permission checks,
-account mapping, execution, export limits, and audit remain on the Data MCP
-side. No model-visible tool may return raw query rows.
+account mapping, query execution limits, and audit remain on the Data MCP side.
+Final artifact generation belongs to the internal result Agent, not Data MCP.
+No model-visible tool may return raw query rows.
 
 Interactive results are bound to the host-authenticated union id and app id,
 plus `BOTMUX_SESSION_ID`, which Botmux freezes in the plugin process environment
@@ -203,12 +206,11 @@ and the model cannot supply as a tool argument. The result handle is never
 model-visible. When Botmux adds a signed session id to per-turn metadata, the
 plugin should migrate from the process environment to that value.
 
-`continue_query_result_for_user` accepts only the user's follow-up text and an
-output mode. Analysis uses the stored result. Excel follow-ups deliberately
-revalidate permissions and rerun the original SQL; therefore the spreadsheet
-may differ from the earlier analysis snapshot. Its reply states that it is a
-fresh query and includes the generation time. Per trusted turn id, only
-one follow-up call is accepted. Internal-model text and Excel files are replied
+`continue_query_result_for_user` accepts only the user's follow-up text and
+requested output types. It reuses the caller-bound stored rows/schema/context
+without rerunning the query. The internal result Agent must call the matching
+Excel/PDF/chart/document tool; every artifact binds values to that same stored
+result. Per trusted turn id, only one follow-up call is accepted. Agent text and files are replied
 directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages
 remain flat replies in the same conversation. Before sending, the plugin uses
@@ -241,8 +243,7 @@ write its prompts or responses to ordinary logs.
 | `data_mcp_query_plan` | Planning guidance only; does not execute SQL | Fixed planning error |
 | `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
 | `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
-| `export_query_to_excel_file` | Always `isolated_delivery_required`; file metadata is closed | Fixed isolated-operation error |
-| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; result content is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
+| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; the internal result Agent receives rows/schema/context, calls requested artifact tools, and the result is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
 | `continue_query_result_for_user` | Fixed direct-delivery receipt; active-result handles are not arguments | Fixed deterministic state or direct-delivery error only |
 | `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |
 | `search_metadata_snapshot` | Allowlisted dictionary fields only; example and sample values are removed | Fixed snapshot status code |

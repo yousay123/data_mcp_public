@@ -1026,8 +1026,11 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
+    }
+    if (tools.some(tool => tool.name === 'export_query_to_excel_file')) {
+      fail('Data MCP must not expose a final-file export tool; file generation belongs to the result Agent');
     }
     for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
       if (tools.some(tool => tool.name === retiredName)) {
@@ -1047,7 +1050,6 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
     const visibleFollowupSchema = tools.find(tool => tool.name === 'continue_query_result_for_user')?.inputSchema;
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
@@ -1056,13 +1058,12 @@ try {
     if (!visibleRunSchema?.required?.includes('query_plan_id')) {
       fail('run_query_for_user schema must require query_plan_id');
     }
-    if (!visibleExportSchema?.required?.includes('query_plan_id')) {
-      fail('export_query_to_excel_file schema must require query_plan_id');
-    }
     if (!visibleDeliverySchema?.required?.includes('query_plan_id')
-      || !visibleDeliverySchema?.required?.includes('output_mode')
-      || JSON.stringify(visibleDeliverySchema?.properties?.output_mode?.enum) !== JSON.stringify(['analysis', 'excel'])) {
-      fail('deliver_query_result_for_user must require one explicit isolated output mode and query_plan_id');
+      || !visibleDeliverySchema?.required?.includes('question')
+      || !visibleDeliverySchema?.required?.includes('result_context')
+      || JSON.stringify(visibleDeliverySchema?.properties?.requested_outputs?.items?.enum)
+        !== JSON.stringify(['analysis', 'excel', 'pdf', 'chart', 'document'])) {
+      fail('deliver_query_result_for_user must expose Agent-authored multi-output delivery');
     }
     const followupSchemaText = JSON.stringify(visibleFollowupSchema ?? {});
     if (!visibleFollowupSchema?.required?.includes('question')) {
@@ -1076,7 +1077,6 @@ try {
     for (const [name, schema] of [
       ['validate_sql_for_user', visibleValidateSchema],
       ['run_query_for_user', visibleRunSchema],
-      ['export_query_to_excel_file', visibleExportSchema],
     ]) {
       if (JSON.stringify(schema?.properties?.datasource?.enum) !== JSON.stringify(['tchouse-c'])) {
         fail(`${name} datasource schema must allow only tchouse-c`);
@@ -1205,8 +1205,8 @@ try {
       fail('run_query_for_user must remain closed before any raw result can be returned');
     }
     const missingExportPlanText = byId.get(13)?.result?.content?.[0]?.text ?? '';
-    if (!missingExportPlanText.includes('isolated_delivery_required')) {
-      fail('export_query_to_excel_file must remain closed before any raw result can be returned');
+    if (!JSON.stringify(byId.get(13)).includes('unknown_tool:export_query_to_excel_file')) {
+      fail('removed Data MCP file export tool must stay unavailable');
     }
     const humanRefreshText = byId.get(14)?.result?.content?.[0]?.text ?? '';
     if (!humanRefreshText.includes('metadata_snapshot_schedule_identity_required')) {

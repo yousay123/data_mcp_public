@@ -26,7 +26,7 @@ const bindingSecret = '0123456789abcdef0123456789abcdef';
 let planCounter = 0;
 let modelCalls = 0;
 const modelPayloads = [];
-let exportedFilename;
+let exportCalls = 0;
 let mutateActiveResultDuringModelCall;
 
 function jsonResponse(res, value, status = 200) {
@@ -63,13 +63,8 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/export') {
-      exportedFilename = body.filename;
-      const path = join(root, 'synthetic.xlsx');
-      writeFileSync(path, 'synthetic workbook', { mode: 0o600 });
-      jsonResponse(res, {
-        status: 'success', query_id: 'synthetic-export',
-        file: { path, filename: body.filename, row_count: 1 },
-      });
+      exportCalls += 1;
+      jsonResponse(res, { status: 'error', error: 'final artifact export is forbidden' }, 500);
       return;
     }
     jsonResponse(res, { status: 'error' }, 404);
@@ -85,12 +80,27 @@ const model = createServer((req, res) => {
   req.on('end', () => {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!JSON.stringify(body).includes(rowSentinel)) throw new Error('internal model did not receive stored synthetic row');
-    if (Object.hasOwn(body, 'tools') || Object.hasOwn(body, 'tool_choice')) {
-      throw new Error('internal model request must not expose tools');
-    }
     if (JSON.stringify(body).includes('CAS_REPLACE_SYNTHETIC')) mutateActiveResultDuringModelCall?.();
     modelPayloads.push(body);
     modelCalls += 1;
+    if (body.tool_choice === 'required') {
+      const tools = (body.tools ?? []).map(tool => tool.function?.name);
+      if (!tools.includes('create_excel')) throw new Error('internal result Agent did not receive Excel tool');
+      jsonResponse(res, { choices: [{ message: {
+        content: null,
+        tool_calls: [{
+          id: 'call_excel_followup', type: 'function',
+          function: {
+            name: 'create_excel',
+            arguments: JSON.stringify({
+              filename: 'followup-result.xlsx',
+              sheets: [{ name: '结果', columns: ['synthetic_value'] }],
+            }),
+          },
+        }],
+      } }] });
+      return;
+    }
     jsonResponse(res, { choices: [{ message: { content: modelOutput } }] });
   });
 });
@@ -255,13 +265,15 @@ const botCaller = await plugin.call('continue_query_result_for_user', { question
 if (!JSON.stringify(botCaller).includes('identity_rejected')) throw new Error('bot follow-up was not rejected');
 
 const excel = await plugin.call('continue_query_result_for_user', {
-  question: 'export the active result', output_mode: 'excel', filename: '../..\\\u0001synthetic.csv',
+  question: 'export the active result', requested_outputs: ['excel'],
 }, { ...callerA, turnId: 'om_excel' });
 const excelVisible = JSON.stringify(excel.result?.content ?? []);
 if (excelVisible.includes('synthetic.csv') || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
   throw new Error('Excel path or filename leaked into model-visible content');
 }
-if (exportedFilename !== 'synthetic.csv.xlsx') throw new Error(`unsafe filename was not normalized: ${exportedFilename}`);
+if (toolPayload(excel).attachmentCount !== 1 || exportCalls !== 0) {
+  throw new Error('Excel follow-up did not use the Agent tool or called the retired Data MCP export endpoint');
+}
 
 const auditText = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8');
 if (auditText.includes(rowSentinel) || auditText.includes(modelSentinel)
@@ -541,18 +553,14 @@ if (parseResultModelTestException(
   throw new Error('test endpoint exception longer than 60 days was accepted');
 }
 
-const serverSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'server.js'), 'utf8');
-if (!serverSource.includes(
+const resultAgentSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'result-agent.js'), 'utf8');
+if (!resultAgentSource.includes(
   "testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
 )) {
   throw new Error('result model test exception is not wired from host configuration');
 }
-if (!serverSource.includes([
-  'const req = transport(endpoint, {',
-  "      method: 'POST',",
-  '      headers,',
-  '      lookup: pinnedModelLookup(pinned.address, pinned.family),',
-].join('\n'))) {
+if (!resultAgentSource.includes('const req = transport(config.endpoint, {')
+  || !resultAgentSource.includes('lookup: pinnedModelLookup(pinned.address, pinned.family),')) {
   throw new Error('result model transport is not wired to the validated pinned DNS address');
 }
 

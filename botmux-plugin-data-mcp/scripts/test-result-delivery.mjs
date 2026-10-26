@@ -16,6 +16,32 @@ const modelOutput = '受控分析结果：合成记录。';
 let modelSawSentinel = false;
 let modelSawAuth = false;
 let modelSawLimitEvidence = false;
+let queryCount = 0;
+
+const runResult = {
+  status: 'success', query_id: 'q_internal', row_count: 2,
+  rows_before_limit_at_least: 2, truncated: false,
+  effective_limit: 200, truncation_uncertain: true,
+  user_limit_reached: false,
+  user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
+  limit_notice: '查询结果达到或超出限制（上限 200 行）',
+  limit_injected: true, limit_capped: false,
+  columns: [{ name: 'stat_date' }, { name: 'amount' }, { name: 'secret' }],
+  rows: [
+    { stat_date: '2026-03-01', amount: 10, secret: sentinel },
+    { stat_date: '2026-03-02', amount: 20, secret: sentinel },
+  ],
+};
+
+const serviceServer = createServer((req, res) => {
+  queryCount += 1;
+  req.resume();
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(runResult));
+});
+await new Promise(resolve => serviceServer.listen(0, '127.0.0.1', resolve));
+const serviceAddress = serviceServer.address();
+if (!serviceAddress || typeof serviceAddress === 'string') throw new Error('service fixture did not bind');
 
 const modelServer = createServer((req, res) => {
   const chunks = [];
@@ -25,19 +51,24 @@ const modelServer = createServer((req, res) => {
     modelSawSentinel = body.includes(sentinel);
     modelSawAuth = req.headers.authorization === 'Bearer internal-test-key';
     const payload = JSON.parse(body);
-    const userContent = payload.messages?.find(message => message.role === 'user')?.content || '';
-    const serializedResult = userContent.split('查询结果：').at(-1);
-    const internalResult = JSON.parse(serializedResult);
-    modelSawLimitEvidence = internalResult.rows_before_limit_at_least === 1
-      && internalResult.effective_limit === 200
-      && internalResult.truncation_uncertain === true
-      && internalResult.user_limit_reached === false
-      && internalResult.user_limit_notice === '当前结果仅代表限定范围，不能用于全量汇总。'
-      && internalResult.limit_notice === '查询结果达到或超出限制（上限 200 行）'
-      && internalResult.limit_injected === true
-      && internalResult.limit_capped === false;
+    const userContent = payload.messages?.find(message => message.role === 'user')?.content || '{}';
+    const internalResult = JSON.parse(userContent);
+    const manifest = internalResult.result_manifest || {};
+    modelSawLimitEvidence = manifest.truncation_uncertain === true
+      && manifest.user_limit_reached === false
+      && manifest.user_limit_notice === '当前结果仅代表限定范围，不能用于全量汇总。'
+      && manifest.limit_notice === '查询结果达到或超出限制（上限 200 行）';
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ choices: [{ message: { content: modelOutput } }] }));
+    if (payload.tool_choice === 'required') {
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [
+        { id: 'excel', type: 'function', function: { name: 'create_excel', arguments: JSON.stringify({ filename: '业务结果.xlsx', sheets: [{ name: '每日', columns: ['stat_date', 'amount'] }] }) } },
+        { id: 'chart', type: 'function', function: { name: 'create_chart', arguments: JSON.stringify({ filename: '趋势.svg', title: '趋势', type: 'line', label_column: 'stat_date', value_column: 'amount' }) } },
+        { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ filename: '报告.pdf', title: '报告', sections: [{ heading: '结论', paragraphs: ['同一结果集。'] }], table_columns: ['stat_date', 'amount'] }) } },
+        { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ filename: '说明.md', title: '说明', sections: [{ heading: '口径', paragraphs: ['按日汇总。'] }], table_columns: ['stat_date', 'amount'] }) } },
+      ] } }] }));
+      return;
+    }
+    res.end(JSON.stringify({ choices: [{ message: { content: `${modelOutput}\n\n当前结果仅代表限定范围，不能用于全量汇总。` } }] }));
   });
 });
 await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve));
@@ -52,24 +83,6 @@ writeFileSync(hostEnvFile, [
 ].join('\n') + '\n', { mode: 0o600 });
 
 const fake = installFakeBotmux(root);
-const runResult = {
-  status: 'success', query_id: 'q_internal', row_count: 1,
-  rows_before_limit_at_least: 1, truncated: false,
-  effective_limit: 200, truncation_uncertain: true,
-  user_limit_reached: false,
-  user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
-  limit_notice: '查询结果达到或超出限制（上限 200 行）',
-  limit_injected: true, limit_capped: false,
-  columns: [{ name: 'amount' }], rows: [{ amount: sentinel }],
-};
-const sourceWorkbook = join(root, 'source.xlsx');
-writeFileSync(sourceWorkbook, 'SYNTHETIC_XLSX_BYTES');
-const exportResult = {
-  status: 'success', query_id: 'q_export',
-  user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
-  file: { path: sourceWorkbook, filename: '业务结果.xlsx', row_count: 3 },
-};
-
 function runPlugin(requests, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [join(pluginRoot, 'dist', 'mcp', 'server.js')], {
@@ -78,8 +91,7 @@ function runPlugin(requests, extraEnv = {}) {
         BOTMUX_SESSION_ID: 'session_result_delivery_test',
         BOTMUX_PLUGIN_HOME: pluginHome,
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
-        DATA_MCP_RUN_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(runResult))}`,
-        DATA_MCP_EXPORT_QUERY_ENDPOINT: `data:application/json,${encodeURIComponent(JSON.stringify(exportResult))}`,
+        DATA_MCP_RUN_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/agent/run-query`,
         KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
         FAKE_BOTMUX_LOG: botmuxLog,
         ...extraEnv,
@@ -112,7 +124,7 @@ const responses = await runPlugin([
     name: 'deliver_query_result_for_user',
     arguments: {
       sql: 'SELECT amount FROM fixture', datasource: 'tchouse-c',
-      query_plan_id: 'qplan_internal', output_mode: 'analysis', question: '汇总',
+      query_plan_id: 'qplan_internal', requested_outputs: ['analysis'], question: '汇总',
     },
     _meta: { botmuxTrustedCaller: caller },
   },
@@ -120,7 +132,10 @@ const responses = await runPlugin([
     name: 'deliver_query_result_for_user',
     arguments: {
       sql: 'SELECT amount FROM fixture', datasource: 'tchouse-c',
-      query_plan_id: 'qplan_export', output_mode: 'excel', filename: '业务结果',
+      query_plan_id: 'qplan_artifacts',
+      requested_outputs: ['excel', 'chart', 'pdf', 'document'],
+      question: '生成 Excel、图表、PDF 和文档',
+      result_context: { metric: '提现成功金额 USD', grouping: 'day' },
     },
     _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_excel' } },
   },
@@ -138,8 +153,8 @@ for (const forbidden of [sentinel, modelOutput, 'botmuxHostDelivery']) {
   if (analysisVisible.includes(forbidden)) throw new Error(`calling model saw protected value: ${forbidden}`);
 }
 const excelVisible = JSON.stringify(byId.get(2)?.result ?? {});
-if (toolPayload(byId.get(2)).attachmentCount !== 1 || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
-  throw new Error('Excel receipt was unsafe or incomplete');
+if (toolPayload(byId.get(2)).attachmentCount !== 4 || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
+  throw new Error('multi-artifact receipt was unsafe or incomplete');
 }
 if (!JSON.stringify(byId.get(3)).includes('isolated_delivery_required')) {
   throw new Error('raw query path was not isolated');
@@ -147,17 +162,20 @@ if (!JSON.stringify(byId.get(3)).includes('isolated_delivery_required')) {
 if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
   throw new Error('internal result model did not receive the protected result, credential, and limit evidence');
 }
+if (queryCount !== 2) throw new Error(`each delivery must query exactly once; got ${queryCount} queries for 2 deliveries`);
 const botmuxRecords = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
 if (!botmuxRecords.some(row => row.content?.includes(modelOutput))) {
   throw new Error('analysis text was not sent to Feishu');
 }
 const fileRecord = botmuxRecords.find(row => row.args[0] === 'send' && row.args.includes('--files'));
-if (!fileRecord) throw new Error('Excel attachment was not sent to Feishu');
+if (!fileRecord || fileRecord.args.filter(arg => arg === '--files').length !== 4) {
+  throw new Error('Agent artifacts were not sent to Feishu together');
+}
 if (!botmuxRecords.some(row => row.content?.includes('不能用于全量汇总'))) {
   throw new Error('Excel direct delivery lost the user LIMIT advisory');
 }
-const stagedPath = fileRecord.args[fileRecord.args.indexOf('--files') + 1];
-if (existsSync(stagedPath)) throw new Error('staged Excel artifact was not removed after delivery');
+const stagedPaths = fileRecord.args.flatMap((arg, index) => arg === '--files' ? [fileRecord.args[index + 1]] : []);
+if (stagedPaths.some(existsSync)) throw new Error('staged Agent artifact was not removed after delivery');
 
 const rejected = await runPlugin([{
   name: 'deliver_query_result_for_user',
@@ -183,4 +201,5 @@ if (!failedVisible.includes('direct_reply_transport_failed') || failedVisible.in
 }
 
 modelServer.close();
+serviceServer.close();
 console.log('trusted direct result delivery tests passed');

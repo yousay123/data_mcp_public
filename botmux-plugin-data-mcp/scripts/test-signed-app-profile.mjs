@@ -35,6 +35,7 @@ const modelSentinel = 'SIGNED_PROFILE_MODEL_SENTINEL';
 let modelCalls = 0;
 let modelAuthorization;
 let defaultServiceHits = 0;
+let exportServiceHits = 0;
 
 function jsonResponse(res, value, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -67,12 +68,8 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/agent/export-query-excel-file') {
-      const path = join(root, 'signed-profile.xlsx');
-      writeFileSync(path, 'synthetic workbook', { mode: 0o600 });
-      jsonResponse(res, {
-        status: 'success', query_id: 'signed-profile-export',
-        file: { path, filename: body.filename, row_count: 1 },
-      });
+      exportServiceHits += 1;
+      jsonResponse(res, { status: 'error', error: 'final artifact export is forbidden' }, 500);
       return;
     }
     jsonResponse(res, { status: 'error' }, 404);
@@ -84,10 +81,27 @@ const model = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
-    const body = Buffer.concat(chunks).toString('utf8');
-    if (!body.includes(rowSentinel)) throw new Error('selected profile model did not receive synthetic result');
+    const bodyText = Buffer.concat(chunks).toString('utf8');
+    if (!bodyText.includes(rowSentinel)) throw new Error('selected profile model did not receive synthetic result');
+    const body = JSON.parse(bodyText);
     modelAuthorization = req.headers.authorization;
     modelCalls += 1;
+    if (body.tool_choice === 'required') {
+      jsonResponse(res, { choices: [{ message: {
+        content: null,
+        tool_calls: [{
+          id: 'call_signed_excel', type: 'function',
+          function: {
+            name: 'create_excel',
+            arguments: JSON.stringify({
+              filename: 'signed-profile.xlsx',
+              sheets: [{ name: '结果', columns: ['synthetic_value'] }],
+            }),
+          },
+        }],
+      } }] });
+      return;
+    }
     jsonResponse(res, { choices: [{ message: { content: modelSentinel } }] });
   });
 });
@@ -272,10 +286,10 @@ if (toolPayload(followup).status !== 'delivered' || modelCalls !== 2) {
 }
 
 const exported = await plugin.call('continue_query_result_for_user', {
-  question: 'export', output_mode: 'excel', filename: '../unsafe.xlsx',
+  question: 'export', requested_outputs: ['excel'],
 }, caller(selectedAppId, 'om_export'));
-if (toolPayload(exported).attachmentCount !== 1) {
-  throw new Error('follow-up export did not use the selected service profile');
+if (toolPayload(exported).attachmentCount !== 1 || exportServiceHits !== 0 || modelCalls !== 4) {
+  throw new Error('follow-up Excel did not use the selected internal Agent profile exclusively');
 }
 await plugin.close();
 
@@ -287,7 +301,7 @@ const singleTools = (await singlePlugin.listTools()).result?.tools?.map(tool => 
 if (singleTools.includes('deliver_query_result_for_user')
   || singleTools.includes('continue_query_result_for_user')
   || !singleTools.includes('run_query_for_user')
-  || !singleTools.includes('export_query_to_excel_file')) {
+  || singleTools.includes('export_query_to_excel_file')) {
   throw new Error('single-model tool registration is incorrect');
 }
 const singleValidation = await singlePlugin.call('validate_sql_for_user', {

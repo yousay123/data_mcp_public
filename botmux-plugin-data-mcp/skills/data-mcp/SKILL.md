@@ -45,12 +45,13 @@ When the user describes a metric, topic, or business object instead of a table:
    - when `deliver_query_result_for_user` is present, use it; rows, analysis,
      and files stay on the isolated delivery path;
    - when it is absent, this Bot is explicitly configured for single-model
-     operation: use `run_query_for_user`, and use
-     `export_query_to_excel_file` only for an explicit file request. In this
-     mode query rows enter the calling model context by design.
+     operation: use `run_query_for_user`; the calling model must create any
+     requested file with its own artifact skill/tool. In this mode query rows
+     enter the calling model context by design.
 7. Pass the same byte-exact SQL string to validate and run. Use trimming only to
    reject blank input; do not normalize or reformat SQL between the two calls.
-8. Keep SQL validation, account mapping, execution, export limits, and audit on the Data MCP service side.
+8. Keep SQL validation, account mapping, query execution limits, and audit on
+   the Data MCP service side. Final artifact generation does not belong there.
 9. Use the default `execution_mode=single` for normal work. Use `compare` only
    for an explicit before/after comparison that needs the exact same validated
    SQL twice; never attempt a third run or ask for a caller-defined run count.
@@ -62,26 +63,29 @@ When the user names a table directly:
 3. Apply explicit date, region, and business filters.
 4. Prefer small previews before exports.
 
-## Export
+## Result artifacts
 
-1. Export may proceed directly when the query is read-only, tied to the trusted
-   caller, and within the configured service-side export row limit.
-2. Do not add a separate confirmation step only because `row_count > 100`.
-3. If a result exceeds the configured export row limit, ask the user to narrow
-   the query or have an operator raise `DATA_MCP_EXPORT_MAX_ROWS` through the
-   controlled runtime configuration.
+1. Data MCP validates and executes the query once. It supplies rows, schema and
+   confirmed metric/time/filter/grouping/unit/timezone context to the internal
+   result Agent; it never generates a final Excel, PDF, chart, or document.
+2. In dual-model mode, pass every requested output in `requested_outputs`. The
+   internal result Agent must call `create_excel`, `create_pdf`, `create_chart`,
+   or `create_document` itself. A requested file with no matching tool call
+   fails closed.
+3. If a result exceeds an artifact-tool limit, ask the user to narrow the query.
 4. Results are replied to the original trusted Feishu conversation. In a group
    or topic, all members of that conversation can see the result and it remains
    in chat history. A later model turn can read it through Botmux history or
    quoted-message tools, so direct delivery is limited to synthetic test data
    until host-side filtering or the protected result-page flow is restored.
-5. Excel exports should contain header + data rows only, with readable column
-   widths and frozen header row.
-6. When the user explicitly asks for an Excel file, use
-   `deliver_query_result_for_user` with `output_mode=excel` in dual-model mode,
-   or `export_query_to_excel_file` in single-model mode.
-7. When the user does not ask for a file/export/Excel attachment, do not call the
-   export tool. Normal query responses must not include a `file` key.
+5. All artifacts from one request must bind values to the same protected rows
+   and schema; the Agent chooses structure and source columns but never rewrites
+   raw values in tool arguments.
+6. When the user asks for one or more files, use `requested_outputs` in
+   dual-model mode. In single-model mode, use the calling model's own artifact
+   skill/tool after `run_query_for_user`.
+7. When the user does not ask for a file, request only `analysis` and do not
+   invoke artifact tools.
 8. The plugin must validate that the staged file is a regular non-symlink below
    its own outbound directory, then delegate upload/routing to the exact bound
    Botmux session. Direct delivery is not deduplicated across repeated tool
@@ -108,14 +112,13 @@ The plugin MCP server exposes:
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
 - `run_query_for_user`: returns the bounded result only in explicitly configured
   single-model mode; in dual-model mode it is fail-closed.
-- `export_query_to_excel_file`: returns the export artifact only in explicitly
-  configured single-model mode; in dual-model mode it is fail-closed.
-- `deliver_query_result_for_user`: consumes one validated plan and replies either
-  an approved internal-model analysis or an Excel artifact to the signed original Feishu message;
-  the calling model receives only a delivery receipt and never the business result.
+- `deliver_query_result_for_user`: executes one validated plan once, gives
+  rows/schema/context to the internal result Agent, and delivers Agent-authored
+  analysis and requested Excel/PDF/chart/document artifacts to the signed
+  original Feishu message. The calling model receives only a delivery receipt.
 - `continue_query_result_for_user`: use for an unambiguous follow-up about the
-  current caller-bound result. Pass only the user's follow-up text; choose
-  `excel` only when the user explicitly asks for a file. Never invent or pass a
+  current caller-bound result without querying again. Pass only the user's
+  follow-up text and explicit `requested_outputs`. Never invent or pass a
   result id, user identity, app id, or session id. If it returns a fixed
   no-active-result status, treat the request as a new query. If the request is
   ambiguous, ask the user once and default to the new-query workflow.
