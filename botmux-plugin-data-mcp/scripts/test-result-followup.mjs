@@ -13,6 +13,7 @@ import {
 } from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
 import { installFakeBotmux } from './test-botmux-fixture.mjs';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-followup-'));
@@ -26,7 +27,6 @@ const bindingSecret = '0123456789abcdef0123456789abcdef';
 let planCounter = 0;
 let modelCalls = 0;
 const modelPayloads = [];
-let exportCalls = 0;
 let mutateActiveResultDuringModelCall;
 
 function jsonResponse(res, value, status = 200) {
@@ -59,12 +59,8 @@ const service = createServer((req, res) => {
         limit_injected: true, limit_capped: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
+        result_context: canonicalContext([{ name: 'synthetic_value', type: 'String' }]),
       });
-      return;
-    }
-    if (req.url === '/export') {
-      exportCalls += 1;
-      jsonResponse(res, { status: 'error', error: 'final artifact export is forbidden' }, 500);
       return;
     }
     jsonResponse(res, { status: 'error' }, 404);
@@ -86,13 +82,17 @@ const model = createServer((req, res) => {
     if (body.tool_choice === 'required') {
       const tools = (body.tools ?? []).map(tool => tool.function?.name);
       if (!tools.includes('create_excel')) throw new Error('internal result Agent did not receive Excel tool');
+      const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
+      const analysis = content.requested_outputs.includes('analysis');
       jsonResponse(res, { choices: [{ message: {
         content: null,
         tool_calls: [{
-          id: 'call_excel_followup', type: 'function',
+          id: analysis ? 'call_analysis_followup' : 'call_excel_followup', type: 'function',
           function: {
-            name: 'create_excel',
-            arguments: JSON.stringify({
+            name: analysis ? 'create_analysis' : 'create_excel',
+            arguments: JSON.stringify(analysis ? {
+              title: '受控结果', sections: [{ heading: '结论', paragraphs: ['结果来自当前绑定快照。'] }],
+            } : {
               filename: 'followup-result.xlsx',
               sheets: [{ name: '结果', columns: ['synthetic_value'] }],
             }),
@@ -125,7 +125,6 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
       DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
       DATA_MCP_VALIDATE_SQL_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/validate`,
       DATA_MCP_RUN_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/run`,
-      DATA_MCP_EXPORT_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/export`,
       KSHER_AGENT_DATA_MCP_ENV_FILE: envFile,
       FAKE_BOTMUX_LOG: botmuxLog,
     }),
@@ -271,8 +270,8 @@ const excelVisible = JSON.stringify(excel.result?.content ?? []);
 if (excelVisible.includes('synthetic.csv') || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
   throw new Error('Excel path or filename leaked into model-visible content');
 }
-if (toolPayload(excel).attachmentCount !== 1 || exportCalls !== 0) {
-  throw new Error('Excel follow-up did not use the Agent tool or called the retired Data MCP export endpoint');
+if (toolPayload(excel).attachmentCount !== 1) {
+  throw new Error('Excel follow-up did not use the Agent tool');
 }
 
 const auditText = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8');
@@ -553,7 +552,7 @@ if (parseResultModelTestException(
   throw new Error('test endpoint exception longer than 60 days was accepted');
 }
 
-const resultAgentSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'result-agent.js'), 'utf8');
+const resultAgentSource = readFileSync(join(pluginRoot, 'src', 'result-agent', 'runtime.js'), 'utf8');
 if (!resultAgentSource.includes(
   "testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
 )) {

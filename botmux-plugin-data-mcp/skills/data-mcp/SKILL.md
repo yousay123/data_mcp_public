@@ -65,12 +65,14 @@ When the user names a table directly:
 
 ## Result artifacts
 
-1. Data MCP validates and executes the query once. It supplies rows, schema and
-   confirmed metric/time/filter/grouping/unit/timezone context to the internal
+1. Data MCP validates and executes the query once. It derives and query-plan-binds
+   canonical projection/time/filter/grouping/unit-status/timezone-status context
+   from validated SQL and the returned schema, then supplies it with rows to the internal
    result Agent; it never generates a final Excel, PDF, chart, or document.
-2. In dual-model mode, pass every requested output in `requested_outputs`. The
-   internal result Agent must call `create_excel`, `create_pdf`, `create_chart`,
-   or `create_document` itself. A requested file with no matching tool call
+2. In dual-model mode, pass every requested output in `requested_outputs`. Never
+   supply result context as a tool argument. The isolated internal result Agent
+   must call `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or
+   `create_document` itself. A requested output with no matching tool call
    fails closed.
 3. If a result exceeds an artifact-tool limit, ask the user to narrow the query.
 4. Results are replied to the original trusted Feishu conversation. In a group
@@ -80,7 +82,8 @@ When the user names a table directly:
    until host-side filtering or the protected result-page flow is restored.
 5. All artifacts from one request must bind values to the same protected rows
    and schema; the Agent chooses structure and source columns but never rewrites
-   raw values in tool arguments.
+   raw values in tool arguments. Numeric prose claims must use structured
+   source-bound aggregations computed by the tool.
 6. When the user asks for one or more files, use `requested_outputs` in
    dual-model mode. In single-model mode, use the calling model's own artifact
    skill/tool after `run_query_for_user`.

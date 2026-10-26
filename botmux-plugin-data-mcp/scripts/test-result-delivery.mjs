@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installFakeBotmux } from './test-botmux-fixture.mjs';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-delivery-'));
@@ -31,6 +32,9 @@ const runResult = {
     { stat_date: '2026-03-01', amount: 10, secret: sentinel },
     { stat_date: '2026-03-02', amount: 20, secret: sentinel },
   ],
+  result_context: canonicalContext([
+    { name: 'stat_date', type: 'Date' }, { name: 'amount', type: 'UInt64' }, { name: 'secret', type: 'String' },
+  ]),
 };
 
 const serviceServer = createServer((req, res) => {
@@ -60,12 +64,15 @@ const modelServer = createServer((req, res) => {
       && manifest.limit_notice === '查询结果达到或超出限制（上限 200 行）';
     res.writeHead(200, { 'content-type': 'application/json' });
     if (payload.tool_choice === 'required') {
-      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [
+      const fileCalls = [
         { id: 'excel', type: 'function', function: { name: 'create_excel', arguments: JSON.stringify({ filename: '业务结果.xlsx', sheets: [{ name: '每日', columns: ['stat_date', 'amount'] }] }) } },
         { id: 'chart', type: 'function', function: { name: 'create_chart', arguments: JSON.stringify({ filename: '趋势.svg', title: '趋势', type: 'line', label_column: 'stat_date', value_column: 'amount' }) } },
         { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ filename: '报告.pdf', title: '报告', sections: [{ heading: '结论', paragraphs: ['同一结果集。'] }], table_columns: ['stat_date', 'amount'] }) } },
         { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ filename: '说明.md', title: '说明', sections: [{ heading: '口径', paragraphs: ['按日汇总。'] }], table_columns: ['stat_date', 'amount'] }) } },
-      ] } }] }));
+      ];
+      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ title: '受控分析结果', sections: [{ heading: '结论', paragraphs: ['合成记录。'] }], claims: [{ label: '金额合计', operation: 'sum', column: 'amount' }] }) } };
+      const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: calls } }] }));
       return;
     }
     res.end(JSON.stringify({ choices: [{ message: { content: `${modelOutput}\n\n当前结果仅代表限定范围，不能用于全量汇总。` } }] }));
@@ -135,7 +142,6 @@ const responses = await runPlugin([
       query_plan_id: 'qplan_artifacts',
       requested_outputs: ['excel', 'chart', 'pdf', 'document'],
       question: '生成 Excel、图表、PDF 和文档',
-      result_context: { metric: '提现成功金额 USD', grouping: 'day' },
     },
     _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_excel' } },
   },
@@ -164,8 +170,8 @@ if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
 }
 if (queryCount !== 2) throw new Error(`each delivery must query exactly once; got ${queryCount} queries for 2 deliveries`);
 const botmuxRecords = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
-if (!botmuxRecords.some(row => row.content?.includes(modelOutput))) {
-  throw new Error('analysis text was not sent to Feishu');
+if (!botmuxRecords.some(row => row.content?.includes('金额合计（sum amount）：30'))) {
+  throw new Error('source-bound analysis was not sent to Feishu');
 }
 const fileRecord = botmuxRecords.find(row => row.args[0] === 'send' && row.args.includes('--files'));
 if (!fileRecord || fileRecord.args.filter(arg => arg === '--files').length !== 4) {

@@ -40,6 +40,10 @@ from ksher_agent_data_mcp.query_plan import (
     QueryPlanStore,
     RepairChainStore,
 )
+from ksher_agent_data_mcp.result_context import (
+    attach_returned_columns,
+    canonical_result_context,
+)
 from ksher_agent_data_mcp.source_version import (
     SourceVersionObservation,
     SourceVersionProvider,
@@ -475,6 +479,12 @@ class DataMcpService:
                 trust_domain=trust_domain,
                 task_id=task_id,
                 execution_mode=execution_mode,
+                result_context=canonical_result_context(
+                    result.normalized_sql,
+                    datasource=datasource,
+                    tables=result.tables,
+                    referenced_columns=result.columns,
+                ),
             )
             response["query_plan_execution_mode"] = execution_mode
             response["query_plan_max_runs"] = EXECUTION_MODE_MAX_RUNS[execution_mode]
@@ -553,6 +563,11 @@ class DataMcpService:
             plan_run.repair_chain_id,
         )
         response = self._attach_repair_chain(response, plan_run.repair_chain_id)
+        if response.get("status") == Status.SUCCESS.value:
+            response["result_context"] = attach_returned_columns(
+                plan_run.result_context,
+                response.get("columns", []),
+            )
         self._audit_query_plan_execution(
             user,
             query_plan_id,

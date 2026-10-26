@@ -8,6 +8,7 @@ to multiple workers requires a shared store before enabling this contract.
 import secrets
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 
 QUERY_PLAN_TTL_SECONDS = 300
@@ -32,6 +33,7 @@ class QueryPlan:
     ttl_seconds: int
     execution_mode: str
     max_runs: int
+    result_context: dict[str, object]
     repair_chain_id: str | None = None
     runs_used: int = 0
 
@@ -42,6 +44,7 @@ class QueryPlanRun:
     execution_mode: str
     run_index: int
     max_runs: int
+    result_context: dict[str, object]
 
 
 class QueryPlanStore:
@@ -73,6 +76,7 @@ class QueryPlanStore:
         lark_app_id: str | None = None,
         task_id: str | None = None,
         execution_mode: str = EXECUTION_MODE_SINGLE,
+        result_context: dict[str, object] | None = None,
     ) -> str:
         if not session_id.strip():
             raise ValueError("query plan session_id must not be empty")
@@ -98,6 +102,7 @@ class QueryPlanStore:
                 ttl_seconds=ttl_seconds,
                 execution_mode=execution_mode,
                 max_runs=EXECUTION_MODE_MAX_RUNS[execution_mode],
+                result_context=deepcopy(result_context or {}),
                 repair_chain_id=repair_chain_id,
             )
         return plan_id
@@ -178,6 +183,7 @@ class QueryPlanStore:
                     execution_mode=plan.execution_mode,
                     run_index=plan.runs_used,
                     max_runs=plan.max_runs,
+                    result_context=deepcopy(plan.result_context),
                 ),
             )
 

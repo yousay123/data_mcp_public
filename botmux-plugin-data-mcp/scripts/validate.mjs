@@ -167,6 +167,17 @@ assertNoSymlinks(runtimeRoot);
 const mcp = readJson(join(runtimeRoot, 'mcp', 'index.json'));
 const mcpServerSource = readFileSync(join(runtimeRoot, 'mcp', 'server.js'), 'utf-8');
 const mcpServerSourceFile = readFileSync(join(repoRoot, 'src', 'mcp', 'server.js'), 'utf-8');
+const resultAgentClientSource = readFileSync(join(repoRoot, 'src', 'mcp', 'result-agent-client.js'), 'utf-8');
+if (!existsSync(join(runtimeRoot, 'result-agent', 'worker.js'))) {
+  fail('isolated result Agent worker must be built as a separate executable entry');
+}
+for (const forbidden of ['runInternalResultAgent', 'buildModelWorkbook', 'DATA_MCP_EXPORT_QUERY_ENDPOINT', '/agent/export-query-excel-file']) {
+  if (mcpServerSourceFile.includes(forbidden)) fail(`MCP server retained forbidden result/export responsibility: ${forbidden}`);
+}
+if (!resultAgentClientSource.includes('spawn(process.execPath, [workerPath]')
+  || !resultAgentClientSource.includes("env: Object.fromEntries(['PATH', 'TMPDIR', 'TMP', 'TEMP']")) {
+  fail('result Agent must execute in a separate process with an allowlisted environment');
+}
 const trustedCallerStart = mcpServerSourceFile.indexOf('function trustedCallerFrom(request) {');
 const trustedCallerEnd = mcpServerSourceFile.indexOf('\n}\n\nfunction normalizeTrustedCaller', trustedCallerStart);
 if (trustedCallerStart < 0 || trustedCallerEnd < 0) {
@@ -1008,7 +1019,6 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
-        DATA_MCP_EXPORT_QUERY_ENDPOINT: 'data:application/json,%7B%22ok%22%3Atrue%7D',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
     });
@@ -1060,10 +1070,12 @@ try {
     }
     if (!visibleDeliverySchema?.required?.includes('query_plan_id')
       || !visibleDeliverySchema?.required?.includes('question')
-      || !visibleDeliverySchema?.required?.includes('result_context')
       || JSON.stringify(visibleDeliverySchema?.properties?.requested_outputs?.items?.enum)
         !== JSON.stringify(['analysis', 'excel', 'pdf', 'chart', 'document'])) {
       fail('deliver_query_result_for_user must expose Agent-authored multi-output delivery');
+    }
+    if (Object.hasOwn(visibleDeliverySchema?.properties ?? {}, 'result_context')) {
+      fail('calling model must not supply canonical result context');
     }
     const followupSchemaText = JSON.stringify(visibleFollowupSchema ?? {});
     if (!visibleFollowupSchema?.required?.includes('question')) {

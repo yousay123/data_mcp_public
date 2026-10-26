@@ -6,7 +6,7 @@ import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { clearAllStoredResults, ResultStore } from './result-store.js';
-import { runInternalResultAgent } from './result-agent.js';
+import { runIsolatedResultAgent } from './result-agent-client.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 import { deliverDirectLarkReply, DirectReplyError } from './direct-lark-reply.js';
 
@@ -525,8 +525,6 @@ function explicitServiceEndpoint(kind, runtimeConfig) {
   if (runtimeConfig.testProfileSelected) return undefined;
   if (kind === 'validate') {
     return runtimeConfig.value('DATA_MCP_VALIDATE_SQL_ENDPOINT');
-  } else if (kind === 'export') {
-    return runtimeConfig.value('DATA_MCP_EXPORT_QUERY_ENDPOINT') || runtimeConfig.value('DATA_MCP_EXPORT_ENDPOINT');
   } else if (kind === 'run') {
     return runtimeConfig.value('DATA_MCP_RUN_QUERY_ENDPOINT') || runtimeConfig.value('DATA_MCP_QUERY_ENDPOINT');
   }
@@ -537,7 +535,6 @@ function explicitServiceEndpoint(kind, runtimeConfig) {
 
 function servicePath(kind) {
   if (kind === 'validate') return '/agent/validate-sql';
-  if (kind === 'export') return '/agent/export-query-excel-file';
   if (kind === 'run') return '/agent/run-query';
   if (kind === 'refreshSnapshot') return '/agent/refresh-metadata-snapshot';
   if (kind === 'searchSnapshot') return '/agent/search-metadata-snapshot';
@@ -645,12 +642,11 @@ function requestedOutputs(args) {
 }
 
 async function runResultAgent(result, args, runtimeConfig) {
-  return runInternalResultAgent({
+  return runIsolatedResultAgent({
     result,
     question: typeof args.question === 'string' && args.question.trim()
       ? args.question.trim()
       : '请基于本次查询结果生成用户要求的产物',
-    resultContext: args.result_context,
     requestedOutputs: requestedOutputs(args),
     runtimeConfig,
     pluginHome: nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
@@ -677,6 +673,7 @@ function storableQueryResult(result) {
     limit_injected: result.limit_injected === true,
     limit_capped: result.limit_capped === true,
     quality_warnings: Array.isArray(result.quality_warnings) ? result.quality_warnings : [],
+    result_context: result.result_context,
   };
 }
 
@@ -686,8 +683,6 @@ function storedPayload(args, result) {
       sql: args.sql,
       datasource: typeof args.datasource === 'string' ? args.datasource : 'tchouse-c',
     },
-    result_context: args.result_context && typeof args.result_context === 'object'
-      && !Array.isArray(args.result_context) ? args.result_context : {},
     result: result ? storableQueryResult(result) : null,
   };
 }
@@ -769,7 +764,6 @@ async function continueQueryResult(caller, args, runtimeConfig) {
     const authored = await runResultAgent(payload.result, {
       ...args,
       question,
-      result_context: payload.result_context,
     }, runtimeConfig);
     store.assertVersion(identity, expectedVersion);
     store.touch(identity, expectedVersion);
@@ -1017,7 +1011,7 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
       issues: [{
         code: 'unsupported_datasource',
         severity: 'error',
-        message: 'validate/run/export 仅允许 tchouse-c',
+        message: 'validate/run 仅允许 tchouse-c',
       }],
       permission_scope: 'datasource',
     };
@@ -1041,8 +1035,8 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
       issues: [{
         code: 'query_plan_required',
         severity: 'error',
-        message: 'run/export 必须携带 validate_sql_for_user 返回的 query_plan_id',
-        suggested_action: '先调用 validate_sql_for_user 获取 query_plan_id，再执行查询或导出',
+        message: 'run 必须携带 validate_sql_for_user 返回的 query_plan_id',
+        suggested_action: '先调用 validate_sql_for_user 获取 query_plan_id，再执行查询',
       }],
       permission_scope: 'query_plan',
     };
@@ -1067,18 +1061,6 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
       : {}),
     ...(kind !== 'validate' ? { query_plan_id: args.query_plan_id.trim() } : {}),
   };
-  if (kind === 'export') {
-    if (typeof args.filename === 'string' && args.filename.trim()) {
-      payload.filename = args.filename.trim();
-    }
-    if (Number.isSafeInteger(args.max_export_rows) && args.max_export_rows > 0) {
-      payload.max_export_rows = args.max_export_rows;
-    }
-    if (typeof args.expected_source_version === 'string' && args.expected_source_version.trim()) {
-      payload.expected_source_version = args.expected_source_version.trim();
-    }
-  }
-
   let response;
   try {
     const explicit = explicitServiceEndpoint(kind, runtimeConfig);
@@ -1383,18 +1365,13 @@ function toolSchemas() {
             type: 'array', minItems: 1, maxItems: 5, uniqueItems: true,
             items: { type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document'] },
           },
-          result_context: {
-            type: 'object',
-            description: 'Confirmed metric/time/filter/grouping/unit/timezone context passed to the internal Agent with the result manifest.',
-            additionalProperties: true,
-          },
           output_mode: {
             type: 'string',
             enum: ['analysis', 'excel', 'pdf', 'chart', 'document', 'feishu_doc'],
             description: 'Deprecated single-output compatibility field; prefer requested_outputs.',
           },
         },
-        required: ['sql', 'query_plan_id', 'question', 'result_context'],
+        required: ['sql', 'query_plan_id', 'question'],
         additionalProperties: false,
       },
     },

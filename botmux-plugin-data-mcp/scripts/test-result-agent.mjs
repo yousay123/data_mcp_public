@@ -2,7 +2,9 @@ import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runInternalResultAgent } from '../src/mcp/result-agent.js';
+import { runInternalResultAgent } from '../src/result-agent/runtime.js';
+import { runIsolatedResultAgent } from '../src/mcp/result-agent-client.js';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-result-agent-'));
 const pluginHome = join(root, 'plugin-home');
@@ -10,6 +12,7 @@ let responseMode = 'tools';
 let requests = [];
 
 const toolCalls = [
+  ['call_analysis', 'create_analysis', { title: '结果分析', sections: [{ heading: '结论', paragraphs: ['结果来自同一查询。'] }], claims: [{ label: '金额合计', operation: 'sum', column: 'amount' }] }],
   ['call_excel', 'create_excel', { filename: '结果.xlsx', sheets: [{ name: '每日', columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { filename: '趋势.svg', title: '每日趋势', type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { filename: '报告.pdf', title: '结果报告', sections: [{ heading: '结论', paragraphs: ['结果来自同一查询。'] }], table_columns: ['stat_date', 'amount'] }],
@@ -32,11 +35,25 @@ const modelServer = createServer((req, res) => {
       return;
     }
     if (responseMode === 'unrequested') {
-      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[1]] } }] }));
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[2]] } }] }));
       return;
     }
     if (responseMode === 'excel-only') {
-      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[0]] } }] }));
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[1]] } }] }));
+      return;
+    }
+    if (responseMode === 'bogus-number') {
+      const call = {
+        id: 'call_bogus', type: 'function',
+        function: {
+          name: 'create_document',
+          arguments: JSON.stringify({
+            filename: 'bogus.md', title: '结果说明',
+            sections: [{ heading: '结论', paragraphs: ['总金额为 BOGUS_TOTAL_999999'] }],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
     res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: toolCalls } }] }));
@@ -57,15 +74,18 @@ const result = {
   columns: [{ name: 'stat_date', type: 'Date' }, { name: 'amount', type: 'Decimal' }],
   rows: [{ stat_date: '2026-03-01', amount: 12.5 }, { stat_date: '2026-03-02', amount: 18.75 }],
   truncated: false, quality_warnings: [],
+  result_context: canonicalContext([
+    { name: 'stat_date', type: 'Date' }, { name: 'amount', type: 'Decimal' },
+  ], {
+    filter_predicates: ["stat_date >= '2026-03-01'", "stat_date < '2026-04-01'"],
+    time_range_predicates: ["stat_date >= '2026-03-01'", "stat_date < '2026-04-01'"],
+    grouping_columns: ['stat_date'],
+  }),
 };
 
 const delivered = await runInternalResultAgent({
   result,
   question: '生成分析、Excel、PDF、图表和文档',
-  resultContext: {
-    time_range: '[2026-03-01, 2026-04-01)', metric: '提现成功金额 USD',
-    grouping: 'day', timezone: 'Asia/Shanghai', filters: ['ds=20260301..20260331'],
-  },
   requestedOutputs: ['analysis', 'excel', 'pdf', 'chart', 'document'],
   runtimeConfig,
   pluginHome,
@@ -73,17 +93,17 @@ const delivered = await runInternalResultAgent({
 if (delivered.files.length !== 4 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
   throw new Error('result Agent did not create every requested artifact');
 }
-if (requests.length !== 2 || requests.some(entry => entry.authorization !== 'Bearer internal-test-key')) {
+if (requests.length !== 1 || requests.some(entry => entry.authorization !== 'Bearer internal-test-key')) {
   throw new Error('result Agent model loop or authentication is incorrect');
 }
 const firstRequest = requests[0].payload;
 const envelope = JSON.parse(firstRequest.messages.find(message => message.role === 'user').content);
 if (envelope.rows.length !== 2
   || envelope.result_manifest.columns[1].name !== 'amount'
-  || envelope.result_manifest.context.timezone !== 'Asia/Shanghai') {
+  || envelope.result_manifest.context.provenance !== 'data_mcp_validated_query_plan') {
   throw new Error('result Agent did not receive rows, schema, and metric context');
 }
-const expectedTools = ['create_excel', 'create_pdf', 'create_chart', 'create_document'];
+const expectedTools = ['create_analysis', 'create_excel', 'create_pdf', 'create_chart', 'create_document'];
 for (const name of expectedTools) {
   if (!firstRequest.tools.some(tool => tool.function?.name === name)) throw new Error(`missing Agent tool ${name}`);
 }
@@ -143,6 +163,42 @@ try {
 if (rowLimitError?.message !== 'result_agent_artifact_row_limit') {
   throw new Error(`artifact row limit must fail closed, got ${rowLimitError?.message}`);
 }
+
+responseMode = 'bogus-number';
+requests = [];
+let numericTextError;
+try {
+  await runInternalResultAgent({
+    result, question: '生成文档', requestedOutputs: ['document'], runtimeConfig, pluginHome,
+  });
+} catch (error) { numericTextError = error; }
+if (numericTextError?.message !== 'result_agent_unbound_numeric_text') {
+  throw new Error(`unbound numeric prose must fail closed, got ${numericTextError?.message}`);
+}
+
+let contextError;
+try {
+  await runInternalResultAgent({
+    result: {
+      ...result,
+      result_context: { ...result.result_context, grouping_columns: ['tampered_group'] },
+    },
+    question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+} catch (error) { contextError = error; }
+if (contextError?.message !== 'result_agent_context_invalid') {
+  throw new Error(`tampered canonical context must fail closed, got ${contextError?.message}`);
+}
+
+responseMode = 'excel-only';
+requests = [];
+const isolated = await runIsolatedResultAgent({
+  result, question: '生成 Excel', requestedOutputs: ['excel'], runtimeConfig, pluginHome,
+});
+if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
+  throw new Error('isolated result Agent worker did not create the requested artifact');
+}
+rmSync(isolated.files[0].path, { force: true });
 
 for (const file of delivered.files) rmSync(file.path, { force: true });
 modelServer.close();

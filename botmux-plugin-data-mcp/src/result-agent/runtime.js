@@ -1,13 +1,14 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { basename, join, resolve } from 'node:path';
 import { buildModelWorkbook } from './model-workbook.js';
-import { pinnedModelLookup, resolvePrivateModelAddress } from './private-network.js';
+import { pinnedModelLookup, resolvePrivateModelAddress } from '../mcp/private-network.js';
 
-const FILE_OUTPUTS = new Set(['excel', 'pdf', 'chart', 'document']);
+const OUTPUTS = new Set(['analysis', 'excel', 'pdf', 'chart', 'document']);
 const TOOL_BY_OUTPUT = Object.freeze({
+  analysis: 'create_analysis',
   excel: 'create_excel',
   pdf: 'create_pdf',
   chart: 'create_chart',
@@ -96,17 +97,7 @@ function resultEnvelope(result, resultContext) {
   const columns = columnNames(result);
   if (!columns.length) throw new Error('result_agent_schema_missing');
   const rows = normalizedRows(result, columns);
-  const suppliedContext = resultContext && typeof resultContext === 'object' && !Array.isArray(resultContext)
-    ? resultContext : {};
-  const context = {
-    metric: suppliedContext.metric ?? null,
-    time_range: suppliedContext.time_range ?? null,
-    filters: Array.isArray(suppliedContext.filters) ? suppliedContext.filters : [],
-    grouping: suppliedContext.grouping ?? null,
-    unit: suppliedContext.unit ?? null,
-    timezone: suppliedContext.timezone ?? null,
-    ...suppliedContext,
-  };
+  const context = validateCanonicalContext(resultContext);
   return {
     manifest: {
       schema_version: 1,
@@ -133,11 +124,47 @@ function resultEnvelope(result, resultContext) {
   };
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function validateCanonicalContext(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('result_agent_context_missing');
+  const integrity = value.integrity;
+  const unsigned = { ...value };
+  delete unsigned.integrity;
+  const expected = createHash('sha256').update(stableJson(unsigned)).digest('hex');
+  const stringArrays = ['tables', 'metric_columns', 'filter_predicates', 'time_range_predicates', 'grouping_columns'];
+  if (value.schema_version !== 1
+    || value.provenance !== 'data_mcp_validated_query_plan'
+    || typeof value.datasource !== 'string'
+    || stringArrays.some(key => !Array.isArray(value[key]) || value[key].some(item => typeof item !== 'string'))
+    || !Array.isArray(value.returned_columns)
+    || value.returned_columns.some(column => !column || typeof column.name !== 'string' || typeof column.type !== 'string')
+    || value.unit?.status !== 'not_inferred_from_sql'
+    || value.timezone?.status !== 'database_session_default'
+    || integrity?.algorithm !== 'sha256'
+    || integrity?.digest !== expected) {
+    throw new Error('result_agent_context_invalid');
+  }
+  return value;
+}
+
 function boundedString(value, max, code, fallback = '') {
   const text = typeof value === 'string' ? value.trim() : fallback;
   if (!text || text.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
     throw new Error(code);
   }
+  return text;
+}
+
+function prose(value, max, code) {
+  const text = boundedString(value, max, code);
+  if (/\d/.test(text)) throw new Error('result_agent_unbound_numeric_text');
   return text;
 }
 
@@ -150,7 +177,9 @@ function selectedColumns(args, available, key = 'columns') {
 }
 
 function scopeNotice(manifest) {
-  if (manifest.truncated || manifest.truncation_uncertain) return '查询结果存在截断或截断状态不确定，产物不代表完整结果。';
+  if (manifest.truncated || manifest.truncation_uncertain) {
+    return manifest.user_limit_notice || manifest.limit_notice || '查询结果存在截断或截断状态不确定，产物不代表完整结果。';
+  }
   if (manifest.user_limit_reached) return manifest.user_limit_notice || '查询使用了显式 LIMIT，产物仅代表限定范围。';
   return null;
 }
@@ -246,18 +275,57 @@ function executeChart(args, envelope, pluginHome) {
   return { type: 'chart', filename, path: stageArtifact(pluginHome, filename, svg), bytes: svg.length };
 }
 
-function documentLines(args, envelope, maxRows) {
-  const title = boundedString(args.title, 160, 'result_agent_invalid_document_title', '查询结果报告');
+function computedClaims(args, envelope) {
+  const claims = Array.isArray(args.claims) ? args.claims : [];
+  if (claims.length > 20) throw new Error('result_agent_invalid_claims');
+  return claims.map(claim => {
+    const label = prose(claim?.label, 160, 'result_agent_invalid_claim_label');
+    const operation = claim?.operation;
+    if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(operation)) {
+      throw new Error('result_agent_invalid_claim_operation');
+    }
+    if (operation === 'count') return `${label}（count）：${envelope.rows.length}`;
+    const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
+    if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
+    const values = envelope.rows.map(row => Number(row[column]));
+    if (!values.length || values.some(value => !Number.isFinite(value))) {
+      throw new Error('result_agent_invalid_claim_value');
+    }
+    let value;
+    if (operation === 'sum') value = values.reduce((total, item) => total + item, 0);
+    if (operation === 'average') value = values.reduce((total, item) => total + item, 0) / values.length;
+    if (operation === 'minimum') value = Math.min(...values);
+    if (operation === 'maximum') value = Math.max(...values);
+    return `${label}（${operation} ${column}）：${Number(value.toPrecision(15))}`;
+  });
+}
+
+function narrativeLines(args, envelope) {
+  const title = prose(args.title, 160, 'result_agent_invalid_document_title');
   const sections = Array.isArray(args.sections) ? args.sections : [];
   if (!sections.length || sections.length > 12) throw new Error('result_agent_invalid_document_plan');
   const lines = [title, ''];
   for (const section of sections) {
-    lines.push(boundedString(section.heading, 160, 'result_agent_invalid_document_heading'));
+    lines.push(prose(section.heading, 160, 'result_agent_invalid_document_heading'));
     const paragraphs = Array.isArray(section.paragraphs) ? section.paragraphs : [];
     if (paragraphs.length > 8) throw new Error('result_agent_invalid_document_plan');
-    for (const paragraph of paragraphs) lines.push(boundedString(paragraph, 2500, 'result_agent_invalid_document_paragraph'));
+    for (const paragraph of paragraphs) lines.push(prose(paragraph, 2500, 'result_agent_invalid_document_paragraph'));
     lines.push('');
   }
+  const claims = computedClaims(args, envelope);
+  if (claims.length) lines.push('数据结论', ...claims, '');
+  return lines;
+}
+
+function executeAnalysis(args, envelope) {
+  const lines = narrativeLines(args, envelope);
+  const notice = scopeNotice(envelope.manifest);
+  if (notice) lines.push(`数据范围说明：${notice}`);
+  return { type: 'analysis', markdown: `# ${lines.shift()}\n\n${lines.join('\n')}\n` };
+}
+
+function documentLines(args, envelope, maxRows) {
+  const lines = narrativeLines(args, envelope);
   if (Array.isArray(args.table_columns) && args.table_columns.length) {
     const columns = selectedColumns(args, envelope.columns, 'table_columns');
     lines.push(columns.join(' | '));
@@ -324,6 +392,19 @@ function executePdf(args, envelope, pluginHome) {
 }
 
 function toolDefinitions() {
+  const claims = {
+    type: 'array', maxItems: 20,
+    description: 'Numeric claims computed by the tool from protected rows. Never put numeric values in prose.',
+    items: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        label: { type: 'string', maxLength: 160, pattern: '^\\D+$' },
+        operation: { type: 'string', enum: ['count', 'sum', 'average', 'minimum', 'maximum'] },
+        column: { type: 'string' },
+      },
+      required: ['label', 'operation'],
+    },
+  };
   const documentProperties = {
     filename: { type: 'string', maxLength: 120 },
     title: { type: 'string', maxLength: 160 },
@@ -338,10 +419,12 @@ function toolDefinitions() {
         required: ['heading', 'paragraphs'],
       },
     },
+    claims,
     table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
   return [
+    { type: 'function', function: { name: 'create_analysis', description: 'Create analysis from digit-free prose plus source-bound computed claims. Never write numbers in title, headings, or paragraphs.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['title', 'sections'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select structure and columns; never supply cell data.', parameters: { type: 'object', additionalProperties: false, properties: { filename: { type: 'string', maxLength: 120 }, title: { type: 'string', maxLength: 160 }, sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { name: { type: 'string', maxLength: 31 }, columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['name', 'columns'] } } }, required: ['filename', 'sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an SVG chart whose labels and values are read from exact source columns.', parameters: { type: 'object', additionalProperties: false, properties: { filename: { type: 'string', maxLength: 120 }, title: { type: 'string', maxLength: 160 }, type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['filename', 'title', 'type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Create a Markdown document authored by the result Agent; table values are bound to exact source columns.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['filename', 'title', 'sections'] } } },
@@ -359,6 +442,7 @@ function parseToolCall(call) {
 }
 
 function executeTool(call, envelope, pluginHome) {
+  if (call.name === 'create_analysis') return executeAnalysis(call.args, envelope);
   if (call.name === 'create_excel') return executeExcel(call.args, envelope, pluginHome);
   if (call.name === 'create_chart') return executeChart(call.args, envelope, pluginHome);
   if (call.name === 'create_document') return executeDocument(call.args, envelope, pluginHome);
@@ -368,7 +452,7 @@ function executeTool(call, envelope, pluginHome) {
 
 function normalizedOutputs(requestedOutputs) {
   const outputs = Array.isArray(requestedOutputs) ? [...new Set(requestedOutputs)] : [];
-  if (!outputs.length || outputs.length > 5 || outputs.some(output => output !== 'analysis' && !FILE_OUTPUTS.has(output))) {
+  if (!outputs.length || outputs.length > 5 || outputs.some(output => !OUTPUTS.has(output))) {
     throw new Error('result_agent_invalid_outputs');
   }
   return outputs;
@@ -376,7 +460,7 @@ function normalizedOutputs(requestedOutputs) {
 
 export async function runInternalResultAgent(options) {
   const outputs = normalizedOutputs(options.requestedOutputs);
-  const envelope = resultEnvelope(options.result, options.resultContext);
+  const envelope = resultEnvelope(options.result, options.result?.result_context);
   const config = modelConfig(options.runtimeConfig);
   const serialized = JSON.stringify({
     user_request: options.question,
@@ -390,9 +474,10 @@ export async function runInternalResultAgent(options) {
       role: 'system',
       content: [
         '你是企业内网中的数据结果 Agent。只依据 result_manifest 和 rows 工作，不补造数据。',
-        '文件产物必须由你调用对应工具生成；Data MCP 不生成最终文件。',
-        '只调用 requested_outputs 明确要求的文件工具，每种要求的文件类型恰好调用一次。',
+        '分析与文件产物都必须由你调用对应工具生成；Data MCP 不生成最终文件。',
+        '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
+        '标题、段落和标签不得写任何数字；所有数字结论必须用 claims 指定源列和聚合，由工具计算。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
       ].join('\n'),
     },
@@ -403,45 +488,29 @@ export async function runInternalResultAgent(options) {
     temperature: 0,
     messages,
     tools: toolDefinitions(),
-    tool_choice: outputs.some(output => FILE_OUTPUTS.has(output)) ? 'required' : 'auto',
+    tool_choice: 'required',
   }, options.runtimeConfig, options.onTestExceptionUsed);
   const calls = Array.isArray(first.tool_calls) ? first.tool_calls.map(parseToolCall) : [];
-  const requiredFiles = outputs.filter(output => FILE_OUTPUTS.has(output));
-  if (requiredFiles.length && !calls.length) throw new Error('result_agent_tool_call_required');
-  if (calls.length > MAX_ARTIFACTS || calls.some(call => !requiredFiles.includes(call.output))) {
+  if (!calls.length) throw new Error('result_agent_tool_call_required');
+  if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
     throw new Error('result_agent_unrequested_tool');
   }
-  for (const output of requiredFiles) {
+  for (const output of outputs) {
     if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
   }
   const artifacts = [];
   try {
-    for (const call of calls) artifacts.push(executeTool(call, envelope, options.pluginHome));
-    if (!calls.length) {
-      const markdown = typeof first.content === 'string' ? first.content.trim() : '';
-      if (!markdown || markdown.length > 50_000) throw new Error('result_agent_invalid_content');
-      return { markdown, files: [], artifactTypes: [], manifest: envelope.manifest };
+    let analysis;
+    for (const call of calls) {
+      const artifact = executeTool(call, envelope, options.pluginHome);
+      if (artifact.type === 'analysis') analysis = artifact;
+      else artifacts.push(artifact);
     }
-    const toolMessages = calls.map((call, index) => ({
-      role: 'tool',
-      tool_call_id: call.id,
-      content: JSON.stringify({
-        status: 'created',
-        artifact_type: artifacts[index].type,
-        filename: artifacts[index].filename,
-        bytes: artifacts[index].bytes,
-      }),
-    }));
-    const final = await postModel(config, {
-      model: config.model,
-      temperature: 0,
-      messages: [...messages, { role: 'assistant', content: first.content ?? null, tool_calls: first.tool_calls }, ...toolMessages],
-      tools: toolDefinitions(),
-      tool_choice: 'none',
-    }, options.runtimeConfig, options.onTestExceptionUsed);
-    if (Array.isArray(final.tool_calls) && final.tool_calls.length) throw new Error('result_agent_extra_tool_round');
-    const markdown = typeof final.content === 'string' ? final.content.trim() : '';
-    if (!markdown || markdown.length > 50_000) throw new Error('result_agent_invalid_content');
+    const notice = scopeNotice(envelope.manifest);
+    const markdown = analysis?.markdown || [
+      `已按同一份受控查询结果生成 ${artifacts.length} 个产物。`,
+      notice ? `数据范围说明：${notice}` : null,
+    ].filter(Boolean).join('\n\n');
     return {
       markdown,
       files: artifacts.map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),

@@ -16,6 +16,7 @@ import {
   resolveSignedAppTestProfile,
 } from '../src/mcp/signed-app-profile.js';
 import { installFakeBotmux } from './test-botmux-fixture.mjs';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
@@ -35,7 +36,6 @@ const modelSentinel = 'SIGNED_PROFILE_MODEL_SENTINEL';
 let modelCalls = 0;
 let modelAuthorization;
 let defaultServiceHits = 0;
-let exportServiceHits = 0;
 
 function jsonResponse(res, value, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -64,12 +64,8 @@ const service = createServer((req, res) => {
         status: 'success', datasource: 'tchouse-c', row_count: 1, truncated: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
+        result_context: canonicalContext([{ name: 'synthetic_value', type: 'String' }]),
       });
-      return;
-    }
-    if (req.url === '/agent/export-query-excel-file') {
-      exportServiceHits += 1;
-      jsonResponse(res, { status: 'error', error: 'final artifact export is forbidden' }, 500);
       return;
     }
     jsonResponse(res, { status: 'error' }, 404);
@@ -87,13 +83,17 @@ const model = createServer((req, res) => {
     modelAuthorization = req.headers.authorization;
     modelCalls += 1;
     if (body.tool_choice === 'required') {
+      const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
+      const analysis = content.requested_outputs.includes('analysis');
       jsonResponse(res, { choices: [{ message: {
         content: null,
         tool_calls: [{
-          id: 'call_signed_excel', type: 'function',
+          id: analysis ? 'call_signed_analysis' : 'call_signed_excel', type: 'function',
           function: {
-            name: 'create_excel',
-            arguments: JSON.stringify({
+            name: analysis ? 'create_analysis' : 'create_excel',
+            arguments: JSON.stringify(analysis ? {
+              title: '受控分析', sections: [{ heading: '结论', paragraphs: ['结果来自绑定快照。'] }],
+            } : {
               filename: 'signed-profile.xlsx',
               sheets: [{ name: '结果', columns: ['synthetic_value'] }],
             }),
@@ -145,7 +145,6 @@ writeFileSync(defaultEnvFile, [
   `DATA_MCP_INTERNAL_AUTH_TOKEN=${defaultAuthToken}`,
   `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
   `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
-  `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
   `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
   'DATA_MCP_RESULT_MODEL=default-model',
@@ -288,7 +287,7 @@ if (toolPayload(followup).status !== 'delivered' || modelCalls !== 2) {
 const exported = await plugin.call('continue_query_result_for_user', {
   question: 'export', requested_outputs: ['excel'],
 }, caller(selectedAppId, 'om_export'));
-if (toolPayload(exported).attachmentCount !== 1 || exportServiceHits !== 0 || modelCalls !== 4) {
+if (toolPayload(exported).attachmentCount !== 1 || modelCalls !== 3) {
   throw new Error('follow-up Excel did not use the selected internal Agent profile exclusively');
 }
 await plugin.close();

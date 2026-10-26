@@ -51,8 +51,9 @@ turn. A `schedule_creator` caller is accepted only when `turnId` has the form
 source is `schedule_creator`. This prevents a scheduled input adopted into an
 already-active turn from using that turn's preserved caller identity.
 
-Trusted artifact delivery is one-shot. The internal result Agent selects and
-invokes the Excel/PDF/chart/document tool. The plugin stages atomic outbound files;
+Trusted artifact delivery is one-shot. The internal result Agent runs in a
+separate child process with an allowlisted environment, selects and invokes the
+Excel/PDF/chart/document tool, and stages atomic outbound files;
 the Botmux host consumes it into bounded memory and removes the staged source
 before any send. Plugin shutdown cleans files still owned by that process, and
 startup removes abandoned Data MCP artifacts older than 15 minutes.
@@ -200,6 +201,12 @@ account mapping, query execution limits, and audit remain on the Data MCP side.
 Final artifact generation belongs to the internal result Agent, not Data MCP.
 No model-visible tool may return raw query rows.
 
+The result context is not a model argument. Data MCP derives projection,
+time/filter/grouping, table, unit-status, and timezone-status fields from the
+validated normalized SQL, binds them to the query plan, adds the returned schema,
+and attaches a SHA-256 integrity digest. The isolated Agent rejects missing,
+malformed, or modified context.
+
 Interactive results are bound to the host-authenticated union id and app id,
 plus `BOTMUX_SESSION_ID`, which Botmux freezes in the plugin process environment
 and the model cannot supply as a tool argument. The result handle is never
@@ -209,8 +216,10 @@ plugin should migrate from the process environment to that value.
 `continue_query_result_for_user` accepts only the user's follow-up text and
 requested output types. It reuses the caller-bound stored rows/schema/context
 without rerunning the query. The internal result Agent must call the matching
-Excel/PDF/chart/document tool; every artifact binds values to that same stored
-result. Per trusted turn id, only one follow-up call is accepted. Agent text and files are replied
+analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
+stored result. Model-authored prose cannot contain digits: numerical claims are
+structured as source-column plus aggregation and computed by the tool. Per
+trusted turn id, only one follow-up call is accepted. Agent text and files are replied
 directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages
 remain flat replies in the same conversation. Before sending, the plugin uses
