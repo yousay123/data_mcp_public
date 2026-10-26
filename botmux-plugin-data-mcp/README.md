@@ -220,7 +220,9 @@ analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
 stored result. Artifact tools accept no model-authored titles, paragraphs,
 labels, annotations, sheet names, or filenames. The model selects only columns,
 aggregations, chart type, and layout; controlled templates render every word,
-and arbitrary-precision decimal arithmetic computes every numerical claim. Per
+and arbitrary-precision decimal arithmetic computes every numerical claim.
+The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
+so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per
 trusted turn id, only one follow-up call is accepted. Agent text and files are replied
 directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages

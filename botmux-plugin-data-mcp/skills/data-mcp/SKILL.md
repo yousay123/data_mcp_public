@@ -69,6 +69,8 @@ When the user names a table directly:
    canonical projection/time/filter/grouping/unit-status/timezone-status context
    from validated SQL and the returned schema, then supplies it with rows to the internal
    result Agent; it never generates a final Excel, PDF, chart, or document.
+   Decimal and 64-bit integer values must stay as exact strings across the
+   ClickHouse JSON, Python HTTP, MCP, and isolated-Agent boundaries.
 2. In dual-model mode, pass every requested output in `requested_outputs`. Never
    supply result context as a tool argument. The isolated internal result Agent
    must call `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or

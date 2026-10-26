@@ -5,7 +5,9 @@ The dual-model delivery path has one owner for each responsibility:
 1. The calling Codex generates SQL and confirms metric, time range, filters,
    grouping, unit, and timezone.
 2. Data MCP validates permissions and read-only policy, then executes the
-   approved SQL exactly once.
+   approved SQL exactly once. ClickHouse JSON transport forces quoted Decimal
+   and 64-bit integer output; Python also preserves unquoted float tokens as a
+   defensive fallback, so values do not round before reaching the Agent.
 3. Data MCP derives canonical context from validated normalized SQL, binds it to
    the query plan, adds the returned schema, and attaches an integrity digest.
 4. The MCP server passes bounded `rows`, `schema`, limit/quality manifest, and
