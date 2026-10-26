@@ -65,12 +65,12 @@ const modelServer = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     if (payload.tool_choice === 'required') {
       const fileCalls = [
-        { id: 'excel', type: 'function', function: { name: 'create_excel', arguments: JSON.stringify({ filename: '业务结果.xlsx', sheets: [{ name: '每日', columns: ['stat_date', 'amount'] }] }) } },
-        { id: 'chart', type: 'function', function: { name: 'create_chart', arguments: JSON.stringify({ filename: '趋势.svg', title: '趋势', type: 'line', label_column: 'stat_date', value_column: 'amount' }) } },
-        { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ filename: '报告.pdf', title: '报告', sections: [{ heading: '结论', paragraphs: ['同一结果集。'] }], table_columns: ['stat_date', 'amount'] }) } },
-        { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ filename: '说明.md', title: '说明', sections: [{ heading: '口径', paragraphs: ['按日汇总。'] }], table_columns: ['stat_date', 'amount'] }) } },
+        { id: 'excel', type: 'function', function: { name: 'create_excel', arguments: JSON.stringify({ sheets: [{ columns: ['stat_date', 'amount'] }] }) } },
+        { id: 'chart', type: 'function', function: { name: 'create_chart', arguments: JSON.stringify({ type: 'line', label_column: 'stat_date', value_column: 'amount' }) } },
+        { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
+        { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
       ];
-      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ title: '受控分析结果', sections: [{ heading: '结论', paragraphs: ['合成记录。'] }], claims: [{ label: '金额合计', operation: 'sum', column: 'amount' }] }) } };
+      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
       const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: calls } }] }));
       return;
@@ -170,7 +170,7 @@ if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
 }
 if (queryCount !== 2) throw new Error(`each delivery must query exactly once; got ${queryCount} queries for 2 deliveries`);
 const botmuxRecords = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
-if (!botmuxRecords.some(row => row.content?.includes('金额合计（sum amount）：30'))) {
+if (!botmuxRecords.some(row => row.content?.includes('amount（sum）：30'))) {
   throw new Error('source-bound analysis was not sent to Feishu');
 }
 const fileRecord = botmuxRecords.find(row => row.args[0] === 'send' && row.args.includes('--files'));

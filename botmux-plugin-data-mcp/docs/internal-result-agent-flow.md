@@ -14,10 +14,12 @@ The dual-model delivery path has one owner for each responsibility:
 5. The result Agent interprets the requested output types and calls its own
    `create_excel`, `create_pdf`, `create_chart`, or `create_document` tools.
 6. Artifact tools bind values to the same protected rows and schema. The Agent
-   chooses filenames, structure, and source columns but cannot supply rewritten
-   raw values in tool arguments. Numeric narrative claims must declare a source
-   column and aggregation; the tool computes the value, and digit-bearing free
-   prose fails closed.
+   chooses columns, aggregations, chart type, and layout but cannot supply raw
+   values or any free-text title, paragraph, label, annotation, sheet name, or
+   filename. Controlled templates render every word. Numeric claims declare a
+   source column and aggregation and are calculated with arbitrary-precision
+   decimal arithmetic, preserving the source Decimal scale and deterministic
+   average rounding.
 7. The Agent process stages the artifacts, the trusted delivery layer verifies the
    caller/session/app binding, and Botmux sends them to the signed Lark turn.
 8. The calling model receives only a fixed delivery receipt. Rows, model text,

@@ -217,8 +217,10 @@ plugin should migrate from the process environment to that value.
 requested output types. It reuses the caller-bound stored rows/schema/context
 without rerunning the query. The internal result Agent must call the matching
 analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
-stored result. Model-authored prose cannot contain digits: numerical claims are
-structured as source-column plus aggregation and computed by the tool. Per
+stored result. Artifact tools accept no model-authored titles, paragraphs,
+labels, annotations, sheet names, or filenames. The model selects only columns,
+aggregations, chart type, and layout; controlled templates render every word,
+and arbitrary-precision decimal arithmetic computes every numerical claim. Per
 trusted turn id, only one follow-up call is accepted. Agent text and files are replied
 directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages

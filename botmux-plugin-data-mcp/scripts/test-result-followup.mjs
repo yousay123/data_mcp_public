@@ -91,10 +91,9 @@ const model = createServer((req, res) => {
           function: {
             name: analysis ? 'create_analysis' : 'create_excel',
             arguments: JSON.stringify(analysis ? {
-              title: '受控结果', sections: [{ heading: '结论', paragraphs: ['结果来自当前绑定快照。'] }],
+              claims: [{ operation: 'count' }],
             } : {
-              filename: 'followup-result.xlsx',
-              sheets: [{ name: '结果', columns: ['synthetic_value'] }],
+              sheets: [{ columns: ['synthetic_value'] }],
             }),
           },
         }],

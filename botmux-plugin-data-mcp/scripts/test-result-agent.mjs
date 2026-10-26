@@ -12,11 +12,11 @@ let responseMode = 'tools';
 let requests = [];
 
 const toolCalls = [
-  ['call_analysis', 'create_analysis', { title: '结果分析', sections: [{ heading: '结论', paragraphs: ['结果来自同一查询。'] }], claims: [{ label: '金额合计', operation: 'sum', column: 'amount' }] }],
-  ['call_excel', 'create_excel', { filename: '结果.xlsx', sheets: [{ name: '每日', columns: ['stat_date', 'amount'] }] }],
-  ['call_chart', 'create_chart', { filename: '趋势.svg', title: '每日趋势', type: 'line', label_column: 'stat_date', value_column: 'amount' }],
-  ['call_pdf', 'create_pdf', { filename: '报告.pdf', title: '结果报告', sections: [{ heading: '结论', paragraphs: ['结果来自同一查询。'] }], table_columns: ['stat_date', 'amount'] }],
-  ['call_doc', 'create_document', { filename: '说明.md', title: '结果说明', sections: [{ heading: '口径', paragraphs: ['按日汇总。'] }], table_columns: ['stat_date', 'amount'] }],
+  ['call_analysis', 'create_analysis', { claims: [{ operation: 'sum', column: 'amount' }] }],
+  ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
+  ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
+  ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
+  ['call_doc', 'create_document', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
 ].map(([id, name, args]) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }));
 
 const modelServer = createServer((req, res) => {
@@ -42,17 +42,41 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[1]] } }] }));
       return;
     }
-    if (responseMode === 'bogus-number') {
+    if (responseMode.startsWith('free-text-')) {
+      const injection = {
+        'free-text-chinese': { title: '总金额为九十九万' },
+        'free-text-english': { sections: [{ heading: 'total', paragraphs: ['total is nine hundred thousand'] }] },
+        'free-text-multiplier': { subtitle: '金额翻倍' },
+        'free-text-chart': { title: '总金额 999999' },
+      }[responseMode];
+      const chart = responseMode === 'free-text-chart';
       const call = {
         id: 'call_bogus', type: 'function',
         function: {
-          name: 'create_document',
+          name: chart ? 'create_chart' : 'create_document',
           arguments: JSON.stringify({
-            filename: 'bogus.md', title: '结果说明',
-            sections: [{ heading: '结论', paragraphs: ['总金额为 BOGUS_TOTAL_999999'] }],
+            ...(chart ? { type: 'line', label_column: 'stat_date', value_column: 'amount' } : { table_columns: ['stat_date', 'amount'] }),
+            ...injection,
           }),
         },
       };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'precision') {
+      const claims = ['sum', 'average', 'minimum', 'maximum'].map(operation => ({ operation, column: 'amount' }));
+      const calls = [
+        ['pa', 'create_analysis', { claims }],
+        ['pd', 'create_document', { claims, table_columns: ['stat_date', 'amount'] }],
+        ['pp', 'create_pdf', { claims, table_columns: ['stat_date', 'amount'] }],
+        ['pc', 'create_chart', { type: 'bar', label_column: 'stat_date', value_column: 'amount' }],
+        ['pe', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
+      ].map(([id, name, args]) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }));
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: calls } }] }));
+      return;
+    }
+    if (responseMode === 'invalid-decimal') {
+      const call = { id: 'bad', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
@@ -164,16 +188,106 @@ if (rowLimitError?.message !== 'result_agent_artifact_row_limit') {
   throw new Error(`artifact row limit must fail closed, got ${rowLimitError?.message}`);
 }
 
-responseMode = 'bogus-number';
+for (const [mode, output] of [
+  ['free-text-chinese', 'document'],
+  ['free-text-english', 'document'],
+  ['free-text-multiplier', 'document'],
+  ['free-text-chart', 'chart'],
+]) {
+  responseMode = mode;
+  requests = [];
+  let freeTextError;
+  try {
+    await runInternalResultAgent({
+      result, question: '生成产物', requestedOutputs: [output], runtimeConfig, pluginHome,
+    });
+  } catch (error) { freeTextError = error; }
+  if (freeTextError?.message !== 'result_agent_free_text_not_allowed') {
+    throw new Error(`${mode} must fail closed, got ${freeTextError?.message}`);
+  }
+}
+
+responseMode = 'precision';
 requests = [];
-let numericTextError;
-try {
-  await runInternalResultAgent({
-    result, question: '生成文档', requestedOutputs: ['document'], runtimeConfig, pluginHome,
-  });
-} catch (error) { numericTextError = error; }
-if (numericTextError?.message !== 'result_agent_unbound_numeric_text') {
-  throw new Error(`unbound numeric prose must fail closed, got ${numericTextError?.message}`);
+const precisionColumns = [{ name: 'stat_date', type: 'Date' }, { name: 'amount', type: 'Nullable(Decimal(38, 2))' }];
+const precisionResult = {
+  ...result,
+  row_count: 4,
+  columns: precisionColumns,
+  rows: [
+    { stat_date: '2026-03-01', amount: '9007199254740993.00' },
+    { stat_date: '2026-03-02', amount: '0.01' },
+    { stat_date: '2026-03-03', amount: '-3.50' },
+    { stat_date: '2026-03-04', amount: null },
+  ],
+  result_context: canonicalContext(precisionColumns),
+};
+const precision = await runInternalResultAgent({
+  result: precisionResult,
+  question: '生成高精度多产物',
+  requestedOutputs: ['analysis', 'document', 'pdf', 'chart', 'excel'],
+  runtimeConfig,
+  pluginHome,
+});
+const exactClaims = [
+  'amount（sum）：9007199254740989.51',
+  'amount（average）：3002399751580329.836667',
+  'amount（minimum）：-3.50',
+  'amount（maximum）：9007199254740993.00',
+];
+for (const claim of exactClaims) {
+  if (!precision.markdown.includes(claim)) throw new Error(`missing exact analysis claim: ${claim}`);
+  const document = precision.files.find(file => file.type === 'document');
+  if (!readFileSync(document.path, 'utf8').includes(claim)) throw new Error(`missing exact document claim: ${claim}`);
+  const pdf = precision.files.find(file => file.type === 'pdf');
+  const utf16 = Buffer.from(`\ufeff${claim}`, 'utf16le').swap16().toString('hex').toUpperCase();
+  if (!readFileSync(pdf.path).toString().includes(utf16)) throw new Error(`missing exact PDF claim: ${claim}`);
+}
+if (!readFileSync(precision.files.find(file => file.type === 'chart').path, 'utf8').includes('<svg')) {
+  throw new Error('high-precision chart was not generated from exact decimal inputs');
+}
+
+responseMode = 'invalid-decimal';
+requests = [];
+const decimalColumns = [{ name: 'stat_date', type: 'Date' }, { name: 'amount', type: 'Decimal(10, 2)' }];
+const decimalResult = {
+  ...result,
+  columns: decimalColumns,
+  rows: [{ stat_date: '2026-03-01', amount: '0.10' }, { stat_date: '2026-03-02', amount: '0.20' }],
+  result_context: canonicalContext(decimalColumns),
+};
+const decimalSum = await runInternalResultAgent({
+  result: decimalResult, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!decimalSum.markdown.includes('amount（sum）：0.30')) {
+  throw new Error(`decimal addition lost scale or precision: ${decimalSum.markdown}`);
+}
+const negativeSum = await runInternalResultAgent({
+  result: {
+    ...decimalResult,
+    row_count: 3,
+    rows: [
+      { stat_date: '2026-03-01', amount: '-1.00' },
+      { stat_date: '2026-03-02', amount: '-2.00' },
+      { stat_date: '2026-03-03', amount: '-2.00' },
+    ],
+  },
+  question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!negativeSum.markdown.includes('amount（sum）：-5.00')) {
+  throw new Error(`negative decimal aggregation is incorrect: ${negativeSum.markdown}`);
+}
+for (const invalid of ['not-a-number', 9007199254740992]) {
+  let invalidError;
+  try {
+    await runInternalResultAgent({
+      result: { ...result, rows: [{ stat_date: '2026-03-01', amount: invalid }] },
+      question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+    });
+  } catch (error) { invalidError = error; }
+  if (invalidError?.message !== 'result_agent_invalid_claim_value') {
+    throw new Error(`invalid decimal must fail closed, got ${invalidError?.message}`);
+  }
 }
 
 let contextError;
@@ -201,6 +315,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
 rmSync(isolated.files[0].path, { force: true });
 
 for (const file of delivered.files) rmSync(file.path, { force: true });
+for (const file of precision.files) rmSync(file.path, { force: true });
 modelServer.close();
 rmSync(root, { recursive: true, force: true });
 console.log('internal result Agent tool-call tests passed');

@@ -162,18 +162,19 @@ function boundedString(value, max, code, fallback = '') {
   return text;
 }
 
-function prose(value, max, code) {
-  const text = boundedString(value, max, code);
-  if (/\d/.test(text)) throw new Error('result_agent_unbound_numeric_text');
-  return text;
-}
-
 function selectedColumns(args, available, key = 'columns') {
   const values = Array.isArray(args[key]) ? args[key] : [];
   if (!values.length || values.length > 100 || values.some(value => typeof value !== 'string' || !available.includes(value))) {
     throw new Error('result_agent_invalid_column_selection');
   }
   return [...new Set(values)];
+}
+
+function assertOnlyKeys(value, allowed, code = 'result_agent_free_text_not_allowed') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some(key => !allowed.has(key))) {
+    throw new Error(code);
+  }
 }
 
 function scopeNotice(manifest) {
@@ -220,24 +221,27 @@ function xml(value) {
 }
 
 function executeExcel(args, envelope, pluginHome) {
+  assertOnlyKeys(args, new Set(['sheets']));
   if (envelope.rows.length > 9_999) throw new Error('result_agent_artifact_row_limit');
   const sheets = Array.isArray(args.sheets) ? args.sheets : [];
   if (!sheets.length || sheets.length > 4) throw new Error('result_agent_invalid_excel_plan');
   const spec = {
-    sheets: sheets.map(sheet => {
+    sheets: sheets.map((sheet, index) => {
+      assertOnlyKeys(sheet, new Set(['columns']));
       const columns = selectedColumns(sheet, envelope.columns);
       return {
-        name: boundedString(sheet.name, 31, 'result_agent_invalid_sheet_name'),
+        name: `数据${index + 1}`,
         rows: [columns, ...envelope.rows.map(row => columns.map(column => row[column]))],
       };
     }),
   };
-  const filename = safeFilename(args.filename, 'xlsx');
+  const filename = safeFilename('query-result', 'xlsx');
   const bytes = buildModelWorkbook(spec, scopeNotice(envelope.manifest));
   return { type: 'excel', filename, path: stageArtifact(pluginHome, filename, bytes), bytes: bytes.length };
 }
 
 function executeChart(args, envelope, pluginHome) {
+  assertOnlyKeys(args, new Set(['type', 'label_column', 'value_column', 'max_points']));
   const label = boundedString(args.label_column, 200, 'result_agent_invalid_chart_plan');
   const value = boundedString(args.value_column, 200, 'result_agent_invalid_chart_plan');
   if (!envelope.columns.includes(label) || !envelope.columns.includes(value) || !['bar', 'line'].includes(args.type)) {
@@ -245,25 +249,31 @@ function executeChart(args, envelope, pluginHome) {
   }
   const maxPoints = Number.isSafeInteger(args.max_points) ? args.max_points : 100;
   if (maxPoints < 2 || maxPoints > 200) throw new Error('result_agent_invalid_chart_plan');
-  const points = envelope.rows.slice(0, maxPoints).map(row => {
-    const number = Number(row[value]);
-    if (!Number.isFinite(number)) throw new Error('result_agent_invalid_chart_value');
-    return { label: String(row[label] ?? ''), value: number };
-  });
+  const points = envelope.rows.slice(0, maxPoints).map(row => ({
+    label: String(row[label] ?? ''),
+    value: parseDecimal(row[value], 'result_agent_invalid_chart_value'),
+  })).filter(point => point.value !== null);
   if (points.length < 2) throw new Error('result_agent_invalid_chart_plan');
   const width = 960; const height = 540; const left = 90; const top = 55; const bottom = 85; const right = 35;
   const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const maximum = Math.max(...points.map(point => point.value), 0) || 1;
+  const chartScale = Math.max(...points.map(point => point.value.scale));
+  const scaledValues = points.map(point => rescaleExact(point.value, chartScale, 'result_agent_invalid_chart_value'));
+  const zero = 0n;
+  const minimum = scaledValues.reduce((current, item) => item < current ? item : current, zero);
+  const maximum = scaledValues.reduce((current, item) => item > current ? item : current, zero);
+  const span = maximum - minimum || 1n;
+  const ratio = item => Number(((item - minimum) * 1_000_000_000n) / span) / 1_000_000_000;
+  const baselineY = top + plotHeight - ratio(zero) * plotHeight;
   const step = plotWidth / points.length;
-  const title = boundedString(args.title, 160, 'result_agent_invalid_chart_title', '查询结果图表');
+  const title = '查询结果图表';
   const elements = [`<rect width="100%" height="100%" fill="#fff"/>`, `<text x="${width / 2}" y="30" text-anchor="middle" font-size="20" fill="#173d67">${xml(title)}</text>`, `<line x1="${left}" y1="${top}" x2="${left}" y2="${top + plotHeight}" stroke="#789"/>`, `<line x1="${left}" y1="${top + plotHeight}" x2="${left + plotWidth}" y2="${top + plotHeight}" stroke="#789"/>`];
   const coordinates = points.map((point, index) => ({
     ...point,
     x: left + step * (index + 0.5),
-    y: top + plotHeight - (point.value / maximum) * plotHeight,
+    y: top + plotHeight - ratio(scaledValues[index]) * plotHeight,
   }));
   if (args.type === 'bar') {
-    for (const point of coordinates) elements.push(`<rect x="${point.x - Math.min(step * 0.32, 22)}" y="${point.y}" width="${Math.min(step * 0.64, 44)}" height="${top + plotHeight - point.y}" fill="#4276b8"/>`);
+    for (const point of coordinates) elements.push(`<rect x="${point.x - Math.min(step * 0.32, 22)}" y="${Math.min(point.y, baselineY)}" width="${Math.min(step * 0.64, 44)}" height="${Math.max(Math.abs(baselineY - point.y), 1)}" fill="#4276b8"/>`);
   } else {
     elements.push(`<polyline fill="none" stroke="#4276b8" stroke-width="3" points="${coordinates.map(point => `${point.x},${point.y}`).join(' ')}"/>`);
     for (const point of coordinates) elements.push(`<circle cx="${point.x}" cy="${point.y}" r="4" fill="#4276b8"/>`);
@@ -271,53 +281,126 @@ function executeChart(args, envelope, pluginHome) {
   for (const point of coordinates) elements.push(`<text x="${point.x}" y="${top + plotHeight + 20}" text-anchor="middle" font-size="10" fill="#496174">${xml(point.label.slice(0, 12))}</text>`);
   if (envelope.rows.length > points.length) elements.push(`<text x="${left}" y="${height - 20}" font-size="11" fill="#9a5a00">仅展示前 ${points.length} 个数据点，共 ${envelope.rows.length} 行。</text>`);
   const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${elements.join('')}</svg>`);
-  const filename = safeFilename(args.filename, 'svg');
+  const filename = safeFilename('query-result-chart', 'svg');
   return { type: 'chart', filename, path: stageArtifact(pluginHome, filename, svg), bytes: svg.length };
+}
+
+function powerOfTen(scale) {
+  if (!Number.isInteger(scale) || scale < 0 || scale > 100) throw new Error('result_agent_invalid_claim_value');
+  return 10n ** BigInt(scale);
+}
+
+function parseDecimal(value, errorCode = 'result_agent_invalid_claim_value') {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) throw new Error(errorCode);
+    value = String(value);
+  } else if (typeof value === 'bigint') {
+    return { coefficient: value, scale: 0 };
+  } else if (typeof value !== 'string') {
+    throw new Error(errorCode);
+  }
+  const match = value.trim().match(/^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
+  if (!match) throw new Error(errorCode);
+  const fraction = match[3] || '';
+  const exponent = Number.parseInt(match[4] || '0', 10);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 100) throw new Error(errorCode);
+  let coefficient = BigInt(`${match[1]}${match[2]}${fraction}`);
+  let scale = fraction.length - exponent;
+  if (scale < 0) {
+    coefficient *= powerOfTen(-scale);
+    scale = 0;
+  }
+  if (scale > 100) throw new Error(errorCode);
+  return { coefficient, scale };
+}
+
+function rescaleExact(decimal, targetScale, errorCode = 'result_agent_invalid_claim_value') {
+  if (decimal.scale === targetScale) return decimal.coefficient;
+  if (decimal.scale < targetScale) return decimal.coefficient * powerOfTen(targetScale - decimal.scale);
+  const divisor = powerOfTen(decimal.scale - targetScale);
+  if (decimal.coefficient % divisor !== 0n) throw new Error(errorCode);
+  return decimal.coefficient / divisor;
+}
+
+function declaredDecimalScale(column, envelope) {
+  const descriptors = [
+    envelope.manifest.columns.find(item => item?.name === column),
+    envelope.manifest.context.returned_columns.find(item => item?.name === column),
+  ];
+  for (const descriptor of descriptors) {
+    const type = typeof descriptor?.type === 'string' ? descriptor.type : '';
+    const decimal = type.match(/\bDecimal\s*\(\s*\d+\s*,\s*(\d+)\s*\)/i);
+    if (decimal) return Number.parseInt(decimal[1], 10);
+    const sized = type.match(/\bDecimal(?:32|64|128|256)\s*\(\s*(\d+)\s*\)/i);
+    if (sized) return Number.parseInt(sized[1], 10);
+    if (/\b(?:U?Int(?:8|16|32|64|128|256)?)\b/i.test(type)) return 0;
+  }
+  return null;
+}
+
+function formatDecimal(coefficient, scale, minimumScale = scale) {
+  const negative = coefficient < 0n;
+  let digits = (negative ? -coefficient : coefficient).toString();
+  if (scale > 0) digits = digits.padStart(scale + 1, '0');
+  let integer = scale > 0 ? digits.slice(0, -scale) : digits;
+  let fraction = scale > 0 ? digits.slice(-scale) : '';
+  while (fraction.length > minimumScale && fraction.endsWith('0')) fraction = fraction.slice(0, -1);
+  return `${negative ? '-' : ''}${integer}${fraction ? `.${fraction}` : ''}`;
+}
+
+function roundedDivide(numerator, denominator) {
+  if (denominator <= 0n) throw new Error('result_agent_invalid_claim_value');
+  const negative = numerator < 0n;
+  const absolute = negative ? -numerator : numerator;
+  let quotient = absolute / denominator;
+  const remainder = absolute % denominator;
+  if (remainder * 2n >= denominator) quotient += 1n;
+  return negative ? -quotient : quotient;
 }
 
 function computedClaims(args, envelope) {
   const claims = Array.isArray(args.claims) ? args.claims : [];
   if (claims.length > 20) throw new Error('result_agent_invalid_claims');
   return claims.map(claim => {
-    const label = prose(claim?.label, 160, 'result_agent_invalid_claim_label');
+    assertOnlyKeys(claim, new Set(['operation', 'column']));
     const operation = claim?.operation;
     if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(operation)) {
       throw new Error('result_agent_invalid_claim_operation');
     }
-    if (operation === 'count') return `${label}（count）：${envelope.rows.length}`;
+    if (operation === 'count') return `记录数（count）：${envelope.rows.length}`;
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
     if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
-    const values = envelope.rows.map(row => Number(row[column]));
-    if (!values.length || values.some(value => !Number.isFinite(value))) {
-      throw new Error('result_agent_invalid_claim_value');
+    const values = envelope.rows.map(row => parseDecimal(row[column])).filter(value => value !== null);
+    if (!values.length) throw new Error('result_agent_invalid_claim_value');
+    const inferredScale = Math.max(...values.map(value => value.scale));
+    const scale = declaredDecimalScale(column, envelope) ?? inferredScale;
+    if (!Number.isInteger(scale) || scale < 0 || scale > 100) throw new Error('result_agent_invalid_claim_value');
+    const exact = values.map(value => rescaleExact(value, scale));
+    let coefficient;
+    let outputScale = scale;
+    if (operation === 'sum' || operation === 'average') coefficient = exact.reduce((total, item) => total + item, 0n);
+    if (operation === 'minimum') coefficient = exact.reduce((current, item) => item < current ? item : current);
+    if (operation === 'maximum') coefficient = exact.reduce((current, item) => item > current ? item : current);
+    if (operation === 'average') {
+      outputScale = Math.min(100, Math.max(scale, 6));
+      coefficient = roundedDivide(coefficient * powerOfTen(outputScale - scale), BigInt(exact.length));
     }
-    let value;
-    if (operation === 'sum') value = values.reduce((total, item) => total + item, 0);
-    if (operation === 'average') value = values.reduce((total, item) => total + item, 0) / values.length;
-    if (operation === 'minimum') value = Math.min(...values);
-    if (operation === 'maximum') value = Math.max(...values);
-    return `${label}（${operation} ${column}）：${Number(value.toPrecision(15))}`;
+    const value = formatDecimal(coefficient, outputScale, scale);
+    return `${column}（${operation}）：${value}`;
   });
 }
 
 function narrativeLines(args, envelope) {
-  const title = prose(args.title, 160, 'result_agent_invalid_document_title');
-  const sections = Array.isArray(args.sections) ? args.sections : [];
-  if (!sections.length || sections.length > 12) throw new Error('result_agent_invalid_document_plan');
-  const lines = [title, ''];
-  for (const section of sections) {
-    lines.push(prose(section.heading, 160, 'result_agent_invalid_document_heading'));
-    const paragraphs = Array.isArray(section.paragraphs) ? section.paragraphs : [];
-    if (paragraphs.length > 8) throw new Error('result_agent_invalid_document_plan');
-    for (const paragraph of paragraphs) lines.push(prose(paragraph, 2500, 'result_agent_invalid_document_paragraph'));
-    lines.push('');
-  }
+  const lines = ['查询结果', ''];
   const claims = computedClaims(args, envelope);
   if (claims.length) lines.push('数据结论', ...claims, '');
   return lines;
 }
 
 function executeAnalysis(args, envelope) {
+  assertOnlyKeys(args, new Set(['claims']));
+  if (!Array.isArray(args.claims) || !args.claims.length) throw new Error('result_agent_invalid_claims');
   const lines = narrativeLines(args, envelope);
   const notice = scopeNotice(envelope.manifest);
   if (notice) lines.push(`数据范围说明：${notice}`);
@@ -340,11 +423,12 @@ function documentLines(args, envelope, maxRows) {
 }
 
 function executeDocument(args, envelope, pluginHome) {
+  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
   if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_document_plan');
   const lines = documentLines(args, envelope, maxRows);
   const markdown = Buffer.from(`# ${lines.shift()}\n\n${lines.map(line => line && !line.includes(' | ') && !line.startsWith('数据范围说明：') ? line : line).join('\n')}\n`);
-  const filename = safeFilename(args.filename, 'md');
+  const filename = safeFilename('query-result', 'md');
   return { type: 'document', filename, path: stageArtifact(pluginHome, filename, markdown), bytes: markdown.length };
 }
 
@@ -384,51 +468,38 @@ function simplePdf(lines) {
 }
 
 function executePdf(args, envelope, pluginHome) {
+  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 30;
   if (maxRows < 1 || maxRows > 100) throw new Error('result_agent_invalid_document_plan');
   const bytes = simplePdf(documentLines(args, envelope, maxRows));
-  const filename = safeFilename(args.filename, 'pdf');
+  const filename = safeFilename('query-result', 'pdf');
   return { type: 'pdf', filename, path: stageArtifact(pluginHome, filename, bytes), bytes: bytes.length };
 }
 
 function toolDefinitions() {
   const claims = {
-    type: 'array', maxItems: 20,
-    description: 'Numeric claims computed by the tool from protected rows. Never put numeric values in prose.',
+    type: 'array', minItems: 1, maxItems: 20,
+    description: 'Claims computed with arbitrary-precision decimal arithmetic from protected rows. No labels or prose are accepted.',
     items: {
       type: 'object', additionalProperties: false,
       properties: {
-        label: { type: 'string', maxLength: 160, pattern: '^\\D+$' },
         operation: { type: 'string', enum: ['count', 'sum', 'average', 'minimum', 'maximum'] },
         column: { type: 'string' },
       },
-      required: ['label', 'operation'],
+      required: ['operation'],
     },
   };
   const documentProperties = {
-    filename: { type: 'string', maxLength: 120 },
-    title: { type: 'string', maxLength: 160 },
-    sections: {
-      type: 'array', minItems: 1, maxItems: 12,
-      items: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          heading: { type: 'string', maxLength: 160 },
-          paragraphs: { type: 'array', maxItems: 8, items: { type: 'string', maxLength: 2500 } },
-        },
-        required: ['heading', 'paragraphs'],
-      },
-    },
     claims,
     table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
   return [
-    { type: 'function', function: { name: 'create_analysis', description: 'Create analysis from digit-free prose plus source-bound computed claims. Never write numbers in title, headings, or paragraphs.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['title', 'sections'] } } },
-    { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select structure and columns; never supply cell data.', parameters: { type: 'object', additionalProperties: false, properties: { filename: { type: 'string', maxLength: 120 }, title: { type: 'string', maxLength: 160 }, sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { name: { type: 'string', maxLength: 31 }, columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['name', 'columns'] } } }, required: ['filename', 'sheets'] } } },
-    { type: 'function', function: { name: 'create_chart', description: 'Create an SVG chart whose labels and values are read from exact source columns.', parameters: { type: 'object', additionalProperties: false, properties: { filename: { type: 'string', maxLength: 120 }, title: { type: 'string', maxLength: 160 }, type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['filename', 'title', 'type', 'label_column', 'value_column'] } } },
-    { type: 'function', function: { name: 'create_document', description: 'Create a Markdown document authored by the result Agent; table values are bound to exact source columns.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['filename', 'title', 'sections'] } } },
-    { type: 'function', function: { name: 'create_pdf', description: 'Create a PDF authored by the result Agent; table values are bound to exact source columns.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['filename', 'title', 'sections'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Select only source-bound computed claims. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { claims }, required: ['claims'] } } },
+    { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
+    { type: 'function', function: { name: 'create_chart', description: 'Create an SVG chart from exact source columns. The tool owns title, annotations, and filename; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
+    { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
+    { type: 'function', function: { name: 'create_pdf', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
   ];
 }
 
@@ -477,7 +548,7 @@ export async function runInternalResultAgent(options) {
         '分析与文件产物都必须由你调用对应工具生成；Data MCP 不生成最终文件。',
         '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
-        '标题、段落和标签不得写任何数字；所有数字结论必须用 claims 指定源列和聚合，由工具计算。',
+        '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
       ].join('\n'),
     },

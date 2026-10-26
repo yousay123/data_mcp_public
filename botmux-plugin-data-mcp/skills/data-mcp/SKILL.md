@@ -81,9 +81,11 @@ When the user names a table directly:
    quoted-message tools, so direct delivery is limited to synthetic test data
    until host-side filtering or the protected result-page flow is restored.
 5. All artifacts from one request must bind values to the same protected rows
-   and schema; the Agent chooses structure and source columns but never rewrites
-   raw values in tool arguments. Numeric prose claims must use structured
-   source-bound aggregations computed by the tool.
+   and schema. The Agent chooses columns, aggregations, chart type, and layout,
+   but tool arguments accept no free-text titles, paragraphs, labels,
+   annotations, sheet names, filenames, or rewritten raw values. Controlled
+   templates render all wording, and source-bound numeric claims use
+   arbitrary-precision decimal computation.
 6. When the user asks for one or more files, use `requested_outputs` in
    dual-model mode. In single-model mode, use the calling model's own artifact
    skill/tool after `run_query_for_user`.
