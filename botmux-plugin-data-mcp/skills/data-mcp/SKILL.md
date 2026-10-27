@@ -32,9 +32,21 @@ per-turn identity.
 
 ## Default Data Workflow
 
+Choose the data source before metadata discovery or SQL generation:
+
+1. When the user explicitly names DLC, use `datasource=dlc`. When the user
+   explicitly names ClickHouse, CK, or TChouse-C, use `datasource=tchouse-c`.
+2. Never rely on the tool schema's default data source when more than one data
+   source is enabled. Never silently retry or fall back to a different source.
+3. If the user does not identify a data source and the confirmed context does
+   not determine one uniquely, ask which source to use.
+
 When the user describes a metric, topic, or business object instead of a table:
 
-1. Call `search_metadata_snapshot` first; never query the online metadata dictionary as an automatic fallback.
+1. For `tchouse-c`, call `search_metadata_snapshot` first; never query the
+   online metadata dictionary as an automatic fallback. For `dlc`, ask for a
+   fully qualified table when one has not been supplied; the CK snapshot is not
+   a DLC discovery source.
 2. Identify candidate tables, fields, partitions, and metric definitions.
 3. Ask for clarification when the business scope, date range, region, or metric
    definition is ambiguous.
@@ -50,10 +62,20 @@ When the user describes a metric, topic, or business object instead of a table:
 
 When the user names a table directly:
 
-1. Inspect metadata and available fields through `search_metadata_snapshot` first.
-2. Check partitions and row scale before large reads.
-3. Apply explicit date, region, and business filters.
-4. Prefer small previews before exports.
+1. For `tchouse-c`, inspect metadata and available fields through
+   `search_metadata_snapshot` first.
+2. For `dlc` with a fully qualified table, do not call
+   `search_metadata_snapshot`. Generate read-only SQL from the confirmed table
+   and filters, then call `validate_sql_for_user` with `datasource=dlc`. Service
+   validation performs live DLC principal, table metadata, partition, engine,
+   and table-permission checks before any query executes.
+3. If the requested DLC partition cannot be expressed because its field is
+   unknown, ask for the partition field or use the validation issue to correct
+   the SQL. Do not guess a field and do not treat CK snapshot unavailability as
+   a DLC query failure.
+4. Check partitions and row scale before large reads.
+5. Apply explicit date, region, and business filters.
+6. Prefer small previews before exports.
 
 ## Export
 
