@@ -154,6 +154,16 @@ if (!readmeSource.includes('_meta.botmuxTrustedCaller')) {
   fail('README must document _meta.botmuxTrustedCaller as the trusted identity source');
 }
 const skillSource = readFileSync(join(repoRoot, 'skills', 'data-mcp', 'SKILL.md'), 'utf-8');
+const skillDescription = skillSource.match(/^description:\s*(.+)$/m)?.[1] ?? '';
+for (const requiredDescriptionRule of [
+  'explicit DLC request with a fully qualified table',
+  'never call search_metadata_snapshot',
+  'validate_sql_for_user with datasource=dlc',
+]) {
+  if (!skillDescription.includes(requiredDescriptionRule)) {
+    fail(`Data MCP skill description is missing DLC routing rule: ${requiredDescriptionRule}`);
+  }
+}
 for (const requiredRule of [
   'Never rely on the tool schema\'s default data source',
   'For `dlc` with a fully qualified table, do not call',
@@ -177,6 +187,11 @@ assertNoSymlinks(runtimeRoot);
 const mcp = readJson(join(runtimeRoot, 'mcp', 'index.json'));
 const mcpServerSource = readFileSync(join(runtimeRoot, 'mcp', 'server.js'), 'utf-8');
 const mcpServerSourceFile = readFileSync(join(repoRoot, 'src', 'mcp', 'server.js'), 'utf-8');
+for (const source of [mcpServerSourceFile, mcpServerSource]) {
+  if (!source.includes('Never call this tool for an explicit DLC request with a fully qualified table')) {
+    fail('search_metadata_snapshot tool description must forbid explicit fully-qualified DLC routing');
+  }
+}
 const trustedCallerStart = mcpServerSourceFile.indexOf('function trustedCallerFrom(request) {');
 const trustedCallerEnd = mcpServerSourceFile.indexOf('\n}\n\nfunction normalizeTrustedCaller', trustedCallerStart);
 if (trustedCallerStart < 0 || trustedCallerEnd < 0) {

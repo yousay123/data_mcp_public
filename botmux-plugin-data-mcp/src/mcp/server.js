@@ -1034,7 +1034,7 @@ function toolSchemas() {
     },
     {
       name: 'search_metadata_snapshot',
-      description: 'Search the verified signed local metadata snapshot for candidate tables, fields, partitions, and metric definitions. Never falls back to online metadata.',
+      description: 'TChouse-C/ClickHouse discovery only: search the verified signed local metadata snapshot for candidate tables, fields, partitions, and metric definitions. Never call this tool for an explicit DLC request with a fully qualified table; use validate_sql_for_user with datasource=dlc so the service performs live DLC metadata and permission checks. Never falls back to online metadata.',
       inputSchema: {
         type: 'object',
         properties: {

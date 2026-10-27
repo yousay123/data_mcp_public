@@ -1,6 +1,6 @@
 ---
 name: data-mcp
-description: Use when a user asks to query data, locate a metric/table, inspect metadata, generate SQL, export query results, or reason about Data MCP access through Botmux. This private skill requires host-owned trusted identity from Botmux Gateway metadata.
+description: Use when a user asks to query data, locate a metric/table, inspect metadata, generate SQL, export query results, or reason about Data MCP access through Botmux. For an explicit DLC request with a fully qualified table, never call search_metadata_snapshot; go directly to validate_sql_for_user with datasource=dlc because live DLC validation supplies table, partition, engine, and permission checks. This private skill requires host-owned trusted identity from Botmux Gateway metadata.
 ---
 
 # Data MCP
