@@ -77,6 +77,11 @@ ProjectId 不参与 DLC 查询；`DATA_MCP_DLC_PROJECT_ID` 仅为可选审计标
 尚未安全支持的行级过滤或数据脱敏策略，服务会 fail-closed，不会用签名代理的服务
 身份绕过细粒度策略。
 
+执行器会先通过 `DescribeDataEngines` 解析配置引擎的真实类型，再按 Spark/Presto 分别
+提交 `SparkSQLTask`/`SQLTask`。只读 SQL 统一走
+`CreateTasks → DescribeTasks → DescribeTaskResult`，未知引擎类型或找不到精确引擎名称时
+失败关闭，不根据引擎名称猜测任务类型。
+
 ## Amber 受信调用入口
 
 Amber 可通过独立的 loopback HTTP 进程调用只读 `/amber/query`，不复用内部

@@ -240,6 +240,7 @@ class DlcPrincipalResolver(CredentialResolver):
             data_info = self._all_user_info(cam_uin, "DataAuth")
             engine_info = self._all_user_info(cam_uin, "EngineAuth")
             row_filter_info = self._all_user_info(cam_uin, "RowFilter")
+            data_engine_type = self._data_engine_type(self.settings.dlc_data_engine_name)
         except DlcApiError as exc:
             raise CredentialBackendUnavailable(exc.code) from exc
 
@@ -262,6 +263,7 @@ class DlcPrincipalResolver(CredentialResolver):
             "user_type": user_type,
             "policies": [item.model_dump() for item in policies],
             "engine_policies": [item.model_dump() for item in engine_policies],
+            "data_engine_type": data_engine_type,
             "has_row_filters": has_row_filters,
             "has_data_masks": has_data_masks,
         }
@@ -276,6 +278,7 @@ class DlcPrincipalResolver(CredentialResolver):
             catalog=self.settings.dlc_catalog,
             default_database=self.settings.dlc_default_database,
             data_engine_name=self.settings.dlc_data_engine_name,
+            data_engine_type=data_engine_type,
             user_type=user_type,
             policies=policies,
             engine_allowed=engine_allowed,
@@ -315,6 +318,36 @@ class DlcPrincipalResolver(CredentialResolver):
         result_user[info_key] = {"PolicySet": merged, "TotalCount": len(merged)}
         result["UserInfo"] = result_user
         return result
+
+    def _data_engine_type(self, engine_name: str) -> str:
+        offset = 0
+        while True:
+            response = self.client.call(
+                "DescribeDataEngines",
+                {"Limit": 100, "Offset": offset},
+            )
+            engines = [
+                item for item in (response.get("DataEngines") or []) if isinstance(item, dict)
+            ]
+            for engine in engines:
+                if str(engine.get("DataEngineName") or "") != engine_name:
+                    continue
+                raw_type = str(
+                    engine.get("EngineType") or engine.get("EngineTypeDetail") or ""
+                ).lower()
+                if "spark" in raw_type:
+                    return "spark"
+                if "presto" in raw_type:
+                    return "presto"
+                raise DlcApiError(
+                    "unsupported_engine_type",
+                    "DLC 数据引擎类型不受支持",
+                )
+            total = int(response.get("TotalCount") or len(engines))
+            offset += len(engines)
+            if not engines or offset >= total:
+                break
+        raise DlcApiError("data_engine_not_found", "DLC 数据引擎不存在")
 
 
 class DlcMetadataCatalog(MetadataCatalog):
@@ -437,11 +470,14 @@ class DlcQueryExecutor(QueryExecutor):
             )
         task_id: str | None = None
         try:
+            task_type = _task_type_for_engine(credential.data_engine_type)
             created = self.client.call(
-                "CreateTask",
+                "CreateTasks",
                 {
-                    "Task": {
-                        "SQLTask": {"SQL": base64.b64encode(sql.encode("utf-8")).decode("ascii")}
+                    "Tasks": {
+                        "TaskType": task_type,
+                        "FailureTolerance": "Terminate",
+                        "SQL": base64.b64encode(sql.encode("utf-8")).decode("ascii"),
                     },
                     "DatabaseName": credential.default_database,
                     "DatasourceConnectionName": credential.catalog,
@@ -453,7 +489,8 @@ class DlcQueryExecutor(QueryExecutor):
                 },
                 timeout=min(timeout_seconds, 90),
             )
-            task_id = str(created.get("TaskId") or "")
+            task_ids = created.get("TaskIdSet") or []
+            task_id = str(task_ids[0]) if isinstance(task_ids, list) and task_ids else ""
             if not task_id:
                 raise DlcApiError("task_id_missing", "DLC 未返回任务 ID")
             return self._wait_result(credential, task_id, sql, started, timeout_seconds, max_rows)
@@ -481,40 +518,78 @@ class DlcQueryExecutor(QueryExecutor):
     ) -> QueryResult:
         deadline = time.monotonic() + min(timeout_seconds, self.settings.query_timeout_seconds)
         limit = max_rows or self.settings.max_rows
+        task_info = self._wait_for_completion(task_id, sql, started, deadline)
+        if isinstance(task_info, QueryResult):
+            return task_info
+        return self._read_result(task_id, sql, started, deadline, limit, task_info)
+
+    def _wait_for_completion(
+        self,
+        task_id: str,
+        sql: str,
+        started: float,
+        deadline: float,
+    ) -> dict[str, Any] | QueryResult:
+        while time.monotonic() < deadline:
+            response = self.client.call(
+                "DescribeTasks",
+                {
+                    "Limit": 1,
+                    "Offset": 0,
+                    "Filters": [{"Name": "task-id", "Values": [task_id]}],
+                },
+                timeout=min(max(deadline - time.monotonic(), 1), 90),
+            )
+            tasks = [item for item in (response.get("TaskList") or []) if isinstance(item, dict)]
+            task_info = next(
+                (item for item in tasks if str(item.get("Id") or "") == task_id),
+                None,
+            )
+            if task_info is not None:
+                state = int(task_info.get("State", 0))
+                if state in _FAILURE_STATES:
+                    code = "query_cancelled" if state == -3 else "query_failed"
+                    result_class = (
+                        ResultClass.INCONCLUSIVE if state == -3 else ResultClass.CK_QUERY_ERROR
+                    )
+                    return _dlc_error(task_id, sql, started, code, result_class)
+                if state == _SUCCESS_STATE:
+                    return task_info
+            time.sleep(
+                min(self.settings.dlc_poll_interval_seconds, max(deadline - time.monotonic(), 0))
+            )
+        self._cancel_task(task_id)
+        return _dlc_error(task_id, sql, started, "query_timeout", ResultClass.INCONCLUSIVE)
+
+    def _read_result(
+        self,
+        task_id: str,
+        sql: str,
+        started: float,
+        deadline: float,
+        limit: int,
+        completed_task: dict[str, Any],
+    ) -> QueryResult:
         next_token = ""
         rows: list[dict[str, Any]] = []
         columns: list[ColumnMeta] = []
-        task_info: dict[str, Any] = {}
+        result_info: dict[str, Any] = {}
         while time.monotonic() < deadline:
             page = self.client.call(
                 "DescribeTaskResult",
                 {"TaskId": task_id, "NextToken": next_token, "MaxResults": min(1000, limit + 1)},
                 timeout=min(max(deadline - time.monotonic(), 1), 90),
             )
-            task_info = page.get("TaskInfo") or {}
-            state = int(task_info.get("State", 0))
-            if state in _FAILURE_STATES:
-                code = "query_cancelled" if state == -3 else "query_failed"
-                result_class = (
-                    ResultClass.INCONCLUSIVE if state == -3 else ResultClass.CK_QUERY_ERROR
-                )
-                return _dlc_error(task_id, sql, started, code, result_class)
-            if state != _SUCCESS_STATE:
-                time.sleep(
-                    min(
-                        self.settings.dlc_poll_interval_seconds, max(deadline - time.monotonic(), 0)
-                    )
-                )
-                continue
+            result_info = page.get("TaskInfo") or {}
             if not columns:
                 columns = [
                     ColumnMeta(
                         name=str(item.get("Name") or ""), type=str(item.get("Type") or "UNKNOWN")
                     )
-                    for item in (task_info.get("ResultSchema") or [])
+                    for item in (result_info.get("ResultSchema") or [])
                     if item.get("Name")
                 ]
-            result_set = task_info.get("ResultSet") or "[]"
+            result_set = result_info.get("ResultSet") or "[]"
             try:
                 decoded_rows = json.loads(result_set) if isinstance(result_set, str) else result_set
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -528,14 +603,11 @@ class DlcQueryExecutor(QueryExecutor):
                 )
                 if len(rows) > limit:
                     break
-            next_token = str(task_info.get("NextToken") or "")
+            next_token = str(result_info.get("NextToken") or "")
             if len(rows) > limit or not next_token:
                 break
         else:
-            try:
-                self.client.call("CancelTask", {"TaskId": task_id}, timeout=15)
-            except DlcApiError:
-                pass
+            self._cancel_task(task_id)
             return _dlc_error(task_id, sql, started, "query_timeout", ResultClass.INCONCLUSIVE)
 
         truncated = len(rows) > limit or bool(next_token)
@@ -548,11 +620,19 @@ class DlcQueryExecutor(QueryExecutor):
             columns=columns,
             rows=bounded_rows,
             row_count=len(bounded_rows),
-            read_bytes=_optional_int(task_info.get("DataAmount")),
+            read_bytes=_optional_int(
+                result_info.get("DataAmount", completed_task.get("DataAmount"))
+            ),
             truncated=truncated,
             quality_warnings=["DLC 查询结果达到服务行数上限，可能已截断"] if truncated else [],
             execution_ms=int((time.perf_counter() - started) * 1000),
         )
+
+    def _cancel_task(self, task_id: str) -> None:
+        try:
+            self.client.call("CancelTask", {"TaskId": task_id}, timeout=15)
+        except DlcApiError:
+            pass
 
 
 def _load_principal_mapping(path: Path | None) -> dict[str, str]:
@@ -702,6 +782,15 @@ def _safe_dlc_error(code: str) -> str:
 
 def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _task_type_for_engine(engine_type: str) -> str:
+    normalized = engine_type.strip().lower()
+    if normalized == "spark":
+        return "SparkSQLTask"
+    if normalized == "presto":
+        return "SQLTask"
+    raise DlcApiError("unsupported_engine_type", "DLC 数据引擎类型不受支持")
 
 
 def _optional_int(value: Any) -> int | None:

@@ -71,6 +71,7 @@ class DlcPrincipalRef(BaseModel):
     catalog: str = "DataLakeCatalog"
     default_database: str
     data_engine_name: str
+    data_engine_type: str
     user_type: str = "COMMON"
     policies: list[DlcPolicy] = Field(default_factory=list)
     engine_allowed: bool = False
@@ -91,6 +92,7 @@ class DlcPrincipalRef(BaseModel):
             "region": self.region,
             "project_id": self.project_id or "",
             "engine": self.data_engine_name,
+            "engine_type": self.data_engine_type,
             "permission_version": self.permission_version,
         }
 
