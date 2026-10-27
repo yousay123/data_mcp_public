@@ -184,6 +184,30 @@ class Settings(BaseSettings):
     dlc_poll_interval_seconds: float = Field(
         default=0.5, alias="DATA_MCP_DLC_POLL_INTERVAL_SECONDS", gt=0, le=10
     )
+    dlc_permission_timeout_seconds: float = Field(
+        default=20,
+        alias="DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS",
+        gt=0,
+        le=45,
+    )
+    dlc_operation_timeout_seconds: float = Field(
+        default=45,
+        alias="DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS",
+        gt=1,
+        le=50,
+    )
+    dlc_api_call_timeout_seconds: float = Field(
+        default=6,
+        alias="DATA_MCP_DLC_API_CALL_TIMEOUT_SECONDS",
+        gt=0,
+        le=30,
+    )
+    dlc_api_max_attempts: int = Field(
+        default=2,
+        alias="DATA_MCP_DLC_API_MAX_ATTEMPTS",
+        ge=1,
+        le=3,
+    )
 
 
 @lru_cache(maxsize=1)

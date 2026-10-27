@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ksher_agent_data_mcp.config import Settings
+from ksher_agent_data_mcp.credentials.base import CredentialBackendUnavailable
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.models.contracts import (
     CredentialRef,
@@ -427,6 +428,69 @@ def test_compare_plan_allows_exactly_two_runs_and_audits_each_run(monkeypatch) -
     )
 
 
+def test_query_plan_execution_audits_single_policy_issue_as_safe_error_code(
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = build_service()
+    plan_id = issue_baseline_plan(service)
+    credential_error = service._credential_resolution_error(
+        DATASOURCE,
+        code="credential_backend_unavailable",
+        message="backend unavailable",
+        suggested_action="retry later",
+    )
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: credential_error,
+    )
+
+    result = run_with_plan(service, plan_id)
+
+    assert result["status"] == Status.NOT_FOUND
+    execution = [event for event in events if event.event_type == "query_plan_execution"][-1]
+    assert execution.detail["issue_codes"] == ["credential_backend_unavailable"]
+    assert execution.detail["error_code"] == "credential_backend_unavailable"
+
+
+def test_credential_backend_failure_emits_action_level_audit_without_public_detail(
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = build_service()
+    monkeypatch.setattr(
+        service.container.credentials,
+        "resolve",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            CredentialBackendUnavailable(
+                "tc_call_timeout",
+                operation="DescribeUserInfo",
+                retryable=True,
+                elapsed_ms=6200,
+            )
+        ),
+    )
+
+    user = service._build_user_context(UNION_ID, OPEN_ID, APP_ID)
+    assert not isinstance(user, dict)
+    result = service._resolve_credential(
+        user,
+        DATASOURCE,
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["issues"][0]["code"] == "credential_backend_unavailable"
+    assert "tc_call_timeout" not in str(result)
+    audit = [event for event in events if event.event_type == "credential_resolution_failed"][-1]
+    assert audit.detail["backend_error_code"] == "tc_call_timeout"
+    assert audit.detail["backend_action"] == "DescribeUserInfo"
+    assert audit.detail["retryable"] is True
+    assert audit.detail["elapsed_ms"] == 6200
+
+
 def test_compare_plan_uses_independent_bounded_ttl() -> None:
     store = QueryPlanStore(ttl_seconds=300, compare_ttl_seconds=900)
     single = store.issue(
@@ -695,7 +759,7 @@ def test_validate_audits_credential_resolution_failure(monkeypatch) -> None:
     monkeypatch.setattr(
         service,
         "_resolve_validation_credential",
-        lambda user, datasource: credential_error,
+        lambda user, datasource, audit_context=None: credential_error,
     )
 
     result = service.validate_sql_for_user(
@@ -728,7 +792,7 @@ def test_validate_audits_account_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(
         service,
         "_resolve_validation_credential",
-        lambda user, datasource: credential,
+        lambda user, datasource, audit_context=None: credential,
     )
 
     result = service.validate_sql_for_user(

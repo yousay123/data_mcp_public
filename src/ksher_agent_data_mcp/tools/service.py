@@ -407,7 +407,7 @@ class DataMcpService:
                 audit_context,
             )
             return chain_error
-        credential = self._resolve_validation_credential(user, datasource)
+        credential = self._resolve_validation_credential(user, datasource, audit_context)
         if isinstance(credential, dict):
             self._audit_query_plan_rejection(
                 user,
@@ -1067,6 +1067,17 @@ class DataMcpService:
         response: dict[str, Any],
         audit_context: AuditContext | None,
     ) -> None:
+        issue_codes = [
+            issue.get("code")
+            for issue in response.get("issues", [])
+            if isinstance(issue, dict) and isinstance(issue.get("code"), str)
+        ]
+        response_error_code = response.get("error_code")
+        safe_error_code = (
+            response_error_code
+            if isinstance(response_error_code, str) and response_error_code
+            else issue_codes[0] if len(issue_codes) == 1 else None
+        )
         audit_logger.emit(
             AuditEvent(
                 event_type="query_plan_execution",
@@ -1084,7 +1095,8 @@ class DataMcpService:
                     "datasource": datasource,
                     "tables": response.get("tables", []),
                     "result_class": response.get("result_class"),
-                    "error_code": response.get("error_code"),
+                    "issue_codes": issue_codes,
+                    "error_code": safe_error_code,
                     **self._audit_detail(audit_context),
                 },
             )
@@ -1162,7 +1174,8 @@ class DataMcpService:
         repair_chain_id: str | None = None,
         result_max_rows: int | None = None,
     ) -> dict[str, Any]:
-        credential = self._resolve_credential(user, datasource)
+        operation_started = datetime.now(UTC)
+        credential = self._resolve_credential(user, datasource, audit_context=audit_context)
         if isinstance(credential, dict):
             return credential
         account_error = self._validate_expected_account(credential, request_user_tchouse_account)
@@ -1210,10 +1223,20 @@ class DataMcpService:
             self._attach_sql_account_binding(response, credential)
             return response
 
+        executor_timeout = float(self.container.settings.query_timeout_seconds)
+        if datasource == "dlc":
+            elapsed = (datetime.now(UTC) - operation_started).total_seconds()
+            executor_timeout = max(
+                0.1,
+                min(
+                    executor_timeout,
+                    self.container.settings.dlc_operation_timeout_seconds - elapsed,
+                ),
+            )
         executor_kwargs: dict[str, Any] = {
             "credential": credential,
             "sql": validation.normalized_sql,
-            "timeout_seconds": self.container.settings.query_timeout_seconds,
+            "timeout_seconds": executor_timeout,
         }
         if result_max_rows is not None:
             executor_kwargs["max_rows"] = result_max_rows
@@ -1348,11 +1371,19 @@ class DataMcpService:
         }
 
     def _resolve_validation_credential(
-        self, user: UserContext, datasource: str
+        self,
+        user: UserContext,
+        datasource: str,
+        audit_context: AuditContext | None = None,
     ) -> ResolvedPrincipal | None | dict[str, Any]:
         if datasource == "tchouse-c" and self.container.settings.metadata_provider != "tchouse_c":
             return None
-        return self._resolve_credential(user, datasource, for_catalog_probe=True)
+        return self._resolve_credential(
+            user,
+            datasource,
+            for_catalog_probe=True,
+            audit_context=audit_context,
+        )
 
     def _resolve_credential(
         self,
@@ -1360,6 +1391,7 @@ class DataMcpService:
         datasource: str,
         *,
         for_catalog_probe: bool = False,
+        audit_context: AuditContext | None = None,
     ) -> ResolvedPrincipal | dict[str, Any]:
         adapter = self._data_source_adapter(datasource)
         if adapter is None:
@@ -1389,7 +1421,26 @@ class DataMcpService:
                 message=f"Data MCP 缺少 {datasource} 凭证配置，无法解析数据库账号",
                 suggested_action="请联系 Data MCP 维护方检查服务端凭证配置",
             )
-        except CredentialBackendUnavailable:
+        except CredentialBackendUnavailable as exc:
+            audit_logger.emit(
+                AuditEvent(
+                    event_type="credential_resolution_failed",
+                    union_id=user.union_id,
+                    feishu_user_id=user.feishu_user_id,
+                    lark_app_id=user.lark_app_id,
+                    email=user.email,
+                    status=Status.ERROR,
+                    detail={
+                        "datasource": datasource,
+                        "error_code": "credential_backend_unavailable",
+                        "backend_error_code": exc.backend_code,
+                        "backend_action": exc.operation,
+                        "retryable": exc.retryable,
+                        "elapsed_ms": exc.elapsed_ms,
+                        **self._audit_detail(audit_context),
+                    },
+                )
+            )
             return self._credential_resolution_error(
                 datasource,
                 code="credential_backend_unavailable",

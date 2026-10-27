@@ -122,6 +122,23 @@ def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
         Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=901)
 
 
+def test_dlc_permission_resolution_has_bounded_default_timeouts() -> None:
+    settings = Settings()
+
+    assert settings.dlc_permission_timeout_seconds == 20
+    assert settings.dlc_operation_timeout_seconds == 45
+    assert settings.dlc_api_call_timeout_seconds == 6
+    assert settings.dlc_api_max_attempts == 2
+    assert settings.dlc_permission_timeout_seconds < settings.query_timeout_seconds
+
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS=46)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=51)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_API_MAX_ATTEMPTS=4)
+
+
 def test_tchouse_d_provider_requires_explicit_warehouse_endpoints(monkeypatch) -> None:
     monkeypatch.delenv("TCHOUSE_C_JDBC_BASE_URL", raising=False)
     monkeypatch.delenv("TCHOUSE_D_JDBC_URL", raising=False)

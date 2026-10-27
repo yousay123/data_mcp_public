@@ -115,6 +115,26 @@ class FakeDlcClient:
         raise AssertionError(action)
 
 
+class TransientPermissionClient(FakeDlcClient):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    def call(self, action, payload, timeout=90):
+        self.calls.append((action, payload, timeout))
+        if self.failures > 0:
+            self.failures -= 1
+            raise DlcApiError(
+                "tc_call_timeout",
+                "temporary timeout",
+                retryable=True,
+                action=action,
+            )
+        # Avoid recording the successful attempt twice.
+        self.calls.pop()
+        return super().call(action, payload, timeout)
+
+
 def dlc_settings(tmp_path):
     mapping = tmp_path / "principals.json"
     mapping.write_text(
@@ -288,6 +308,45 @@ def test_dlc_fails_closed_for_unknown_engine_type(tmp_path):
         DlcPrincipalResolver(settings, FakeDlcClient(engine_type="hive")).resolve(
             UserContext(union_id="on_user")
         )
+
+
+def test_dlc_permission_resolution_retries_only_within_configured_budget(tmp_path):
+    settings = dlc_settings(tmp_path).model_copy(
+        update={
+            "dlc_permission_timeout_seconds": 2,
+            "dlc_api_call_timeout_seconds": 0.5,
+            "dlc_api_max_attempts": 2,
+        }
+    )
+    client = TransientPermissionClient(failures=1)
+
+    principal = DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+
+    assert principal is not None
+    first_two = client.calls[:2]
+    assert [action for action, _, _ in first_two] == ["DescribeUserInfo", "DescribeUserInfo"]
+    assert all(0 < timeout <= 0.5 for _, _, timeout in client.calls)
+
+
+def test_dlc_permission_resolution_exposes_safe_failure_diagnostics(tmp_path):
+    settings = dlc_settings(tmp_path).model_copy(
+        update={
+            "dlc_permission_timeout_seconds": 2,
+            "dlc_api_call_timeout_seconds": 0.5,
+            "dlc_api_max_attempts": 2,
+        }
+    )
+    client = TransientPermissionClient(failures=2)
+
+    with pytest.raises(CredentialBackendUnavailable) as exc_info:
+        DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+
+    error = exc_info.value
+    assert error.backend_code == "tc_call_timeout"
+    assert error.operation == "DescribeUserInfo"
+    assert error.retryable is True
+    assert isinstance(error.elapsed_ms, int)
+    assert len(client.calls) == 2
 
 
 def test_dlc_failed_task_does_not_fetch_result(tmp_path):

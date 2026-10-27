@@ -44,10 +44,18 @@ _FAILURE_STATES = {-1, -3}
 
 
 class DlcApiError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        action: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.action = action
 
 
 class DlcApiClient:
@@ -69,9 +77,14 @@ class DlcApiClient:
         self.tc_call_shell = settings.dlc_tc_call_shell
 
     def call(self, action: str, payload: dict[str, Any], timeout: float = 90) -> dict[str, Any]:
-        return self.call_service(
-            "dlc", action, DLC_API_VERSION, payload, region=self.region, timeout=timeout
-        )
+        try:
+            return self.call_service(
+                "dlc", action, DLC_API_VERSION, payload, region=self.region, timeout=timeout
+            )
+        except DlcApiError as exc:
+            if exc.action is None:
+                exc.action = action
+            raise
 
     def call_service(
         self,
@@ -236,13 +249,22 @@ class DlcPrincipalResolver(CredentialResolver):
         cam_uin = self._mapping.get(user.union_id.lower())
         if not cam_uin:
             raise CredentialMappingUnavailable(user.union_id)
+        started = time.monotonic()
+        deadline = started + self.settings.dlc_permission_timeout_seconds
         try:
-            data_info = self._all_user_info(cam_uin, "DataAuth")
-            engine_info = self._all_user_info(cam_uin, "EngineAuth")
-            row_filter_info = self._all_user_info(cam_uin, "RowFilter")
-            data_engine_type = self._data_engine_type(self.settings.dlc_data_engine_name)
+            data_info = self._all_user_info(cam_uin, "DataAuth", deadline)
+            engine_info = self._all_user_info(cam_uin, "EngineAuth", deadline)
+            row_filter_info = self._all_user_info(cam_uin, "RowFilter", deadline)
+            data_engine_type = self._data_engine_type(
+                self.settings.dlc_data_engine_name, deadline
+            )
         except DlcApiError as exc:
-            raise CredentialBackendUnavailable(exc.code) from exc
+            raise CredentialBackendUnavailable(
+                exc.code,
+                operation=exc.action,
+                retryable=exc.retryable,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            ) from exc
 
         user_info = data_info.get("UserInfo") or {}
         policies = [_policy(item) for item in _policy_set(user_info, "DataPolicyInfo")]
@@ -287,7 +309,42 @@ class DlcPrincipalResolver(CredentialResolver):
             permission_version=permission_version,
         )
 
-    def _all_user_info(self, cam_uin: str, info_type: str) -> dict[str, Any]:
+    def _permission_call(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        last_error: DlcApiError | None = None
+        for attempt in range(self.settings.dlc_api_max_attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DlcApiError(
+                    "credential_resolution_timeout",
+                    "DLC 权限解析超过总时限",
+                    retryable=True,
+                    action=action,
+                ) from last_error
+            try:
+                return self.client.call(
+                    action,
+                    payload,
+                    timeout=min(self.settings.dlc_api_call_timeout_seconds, remaining),
+                )
+            except DlcApiError as exc:
+                last_error = exc
+                if not exc.retryable or attempt + 1 >= self.settings.dlc_api_max_attempts:
+                    raise
+                # Keep retries bounded by the same total deadline. The small
+                # deterministic backoff avoids retry storms without making
+                # caller latency unpredictable.
+                time.sleep(min(0.2 * (attempt + 1), max(0, deadline - time.monotonic())))
+        assert last_error is not None
+        raise last_error
+
+    def _all_user_info(
+        self, cam_uin: str, info_type: str, deadline: float
+    ) -> dict[str, Any]:
         # The API caps each page at 100. Requesting later pages preserves
         # workgroup-derived policy entries instead of silently authorizing from
         # an incomplete first page.
@@ -300,9 +357,10 @@ class DlcPrincipalResolver(CredentialResolver):
             "RowFilter": "RowFilterInfo",
         }[info_type]
         while True:
-            response = self.client.call(
+            response = self._permission_call(
                 "DescribeUserInfo",
                 {"UserId": cam_uin, "Type": info_type, "Limit": 100, "Offset": offset},
+                deadline,
             )
             if first is None:
                 first = response
@@ -319,12 +377,13 @@ class DlcPrincipalResolver(CredentialResolver):
         result["UserInfo"] = result_user
         return result
 
-    def _data_engine_type(self, engine_name: str) -> str:
+    def _data_engine_type(self, engine_name: str, deadline: float) -> str:
         offset = 0
         while True:
-            response = self.client.call(
+            response = self._permission_call(
                 "DescribeDataEngines",
                 {"Limit": 100, "Offset": offset},
+                deadline,
             )
             engines = [
                 item for item in (response.get("DataEngines") or []) if isinstance(item, dict)

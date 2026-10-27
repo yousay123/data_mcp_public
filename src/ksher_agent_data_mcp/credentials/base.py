@@ -22,6 +22,20 @@ class UnsupportedCredentialDatasource(CredentialResolutionError):
 class CredentialBackendUnavailable(CredentialResolutionError):
     """The identity or permission backend could not produce a current decision."""
 
+    def __init__(
+        self,
+        backend_code: str,
+        *,
+        operation: str | None = None,
+        retryable: bool = False,
+        elapsed_ms: int | None = None,
+    ) -> None:
+        super().__init__(backend_code)
+        self.backend_code = backend_code
+        self.operation = operation
+        self.retryable = retryable
+        self.elapsed_ms = elapsed_ms
+
 
 class CredentialResolver(ABC):
     @abstractmethod

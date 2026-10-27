@@ -22,6 +22,7 @@ const SENSITIVE_PROCESS_ENV_KEYS = [
 ];
 const OUTBOUND_ARTIFACT_PREFIXES = ['data-mcp-', 'result-agent-'];
 const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
+const DELIVERY_BUDGET_MS = 55_000;
 const stagedOutboundArtifacts = new Set();
 let hostEnvCache;
 let packageVersionCache;
@@ -649,7 +650,7 @@ function requestedOutputs(args) {
   return ['analysis'];
 }
 
-async function runResultAgent(result, args, runtimeConfig) {
+async function runResultAgent(result, args, runtimeConfig, timeoutMs) {
   return runIsolatedResultAgent({
     result,
     question: typeof args.question === 'string' && args.question.trim()
@@ -659,7 +660,21 @@ async function runResultAgent(result, args, runtimeConfig) {
     runtimeConfig,
     pluginHome: nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
     onTestExceptionUsed: hostname => resultStoreFor().auditModelEndpointException(hostname),
+    timeoutMs,
   });
+}
+
+function resultAgentAuditStatus(error) {
+  const code = error instanceof Error ? error.message : '';
+  const safeCodes = new Set([
+    'result_agent_timeout',
+    'result_agent_ipc_payload_too_large',
+    'result_agent_ipc_invalid_response',
+    'result_agent_worker_failed',
+    'result_agent_process_isolation_failed',
+    'result_agent_context_missing',
+  ]);
+  return safeCodes.has(code) ? code : 'result_agent_failed';
 }
 
 function storableQueryResult(result) {
@@ -704,6 +719,7 @@ function fixedFollowupResult(code) {
 }
 
 async function deliverQueryResult(caller, args, runtimeConfig) {
+  const deliveryStartedAt = Date.now();
   let identity;
   let store;
   if (caller.senderType === 'user') {
@@ -723,7 +739,28 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
   }
   const result = await callDataMcpService('run', caller, args, runtimeConfig);
   if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
-  const authored = await runResultAgent(result, args, runtimeConfig);
+  let authored;
+  try {
+    authored = await runResultAgent(
+      result,
+      args,
+      runtimeConfig,
+      DELIVERY_BUDGET_MS - (Date.now() - deliveryStartedAt),
+    );
+  } catch (error) {
+    if (store && identity) {
+      try {
+        store.audit(
+          identity,
+          caller.turnId || 'initial',
+          args.question || '',
+          null,
+          resultAgentAuditStatus(error),
+        );
+      } catch { /* best-effort non-sensitive audit */ }
+    }
+    return { error: isolatedDeliveryFailure() };
+  }
   if (store) {
     try { store.put(identity, storedPayload(args, result)); }
     catch {
@@ -1416,7 +1453,7 @@ function toolSchemas() {
     },
     {
       name: 'search_metadata_snapshot',
-      description: 'Search the verified signed local metadata snapshot for candidate tables, fields, partitions, and metric definitions. Never falls back to online metadata.',
+      description: 'TChouse-C/ClickHouse discovery only: search the verified signed local metadata snapshot for candidate tables, fields, partitions, and metric definitions. Never call this tool for an explicit DLC request with a fully qualified table; use validate_sql_for_user with datasource=dlc so the service performs live DLC metadata and permission checks. Never falls back to online metadata.',
       inputSchema: {
         type: 'object',
         properties: {

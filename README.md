@@ -82,6 +82,15 @@ ProjectId 不参与 DLC 查询；`DATA_MCP_DLC_PROJECT_ID` 仅为可选审计标
 `CreateTasks → DescribeTasks → DescribeTaskResult`，未知引擎类型或找不到精确引擎名称时
 失败关闭，不根据引擎名称猜测任务类型。
 
+权限解析使用统一的总时限和有界重试：默认权限预算 20 秒、一次 DLC 执行调用（含权限
+复核）总预算 45 秒、单次腾讯云调用 6 秒、最多 2 次，仅对明确标记为可重试的传输/限流
+错误重试。可分别通过
+`DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS`、`DATA_MCP_DLC_API_CALL_TIMEOUT_SECONDS` 和
+`DATA_MCP_DLC_API_MAX_ATTEMPTS` 调整；执行总预算可通过
+`DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS` 调整。预算到期后失败关闭。服务端审计
+记录失败 action、安全错误码、是否可重试和耗时，但公开工具响应仍只返回统一错误，避免
+把权限后端细节暴露给调用模型。
+
 ## Amber 受信调用入口
 
 Amber 可通过独立的 loopback HTTP 进程调用只读 `/amber/query`，不复用内部

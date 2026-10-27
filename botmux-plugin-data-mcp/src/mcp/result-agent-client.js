@@ -2,7 +2,10 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const MAX_IPC_BYTES = 6 * 1024 * 1024;
-const AGENT_TIMEOUT_MS = 70_000;
+// Keep the inner model deadline below the host tool-call deadline. This makes
+// failures observable here instead of leaving the caller with an ambiguous
+// 60-second timeout while the isolated child is still running.
+const AGENT_TIMEOUT_MS = 30_000;
 const workerPath = fileURLToPath(new URL('../result-agent/worker.js', import.meta.url));
 const CONFIG_KEYS = [
   'DATA_MCP_RESULT_MODEL_ENDPOINT',
@@ -31,7 +34,14 @@ export function runIsolatedResultAgent(options) {
     });
     let stdout = '';
     let stderrBytes = 0;
-    const timer = setTimeout(() => child.kill('SIGKILL'), AGENT_TIMEOUT_MS);
+    let timedOut = false;
+    const timeoutMs = Number.isFinite(options.timeoutMs)
+      ? Math.max(1_000, Math.min(AGENT_TIMEOUT_MS, options.timeoutMs))
+      : AGENT_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
       stdout += chunk;
@@ -44,6 +54,10 @@ export function runIsolatedResultAgent(options) {
     });
     child.once('close', code => {
       clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error('result_agent_timeout'));
+        return;
+      }
       let response;
       try { response = JSON.parse(stdout.trim()); } catch { reject(new Error('result_agent_ipc_invalid_response')); return; }
       if (code !== 0 || !response?.ok) {

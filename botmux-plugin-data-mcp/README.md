@@ -159,6 +159,11 @@ Environment contract:
 - `DATA_MCP_RESULT_MODEL`
   - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`
+
+结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
+55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
+使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
+首轮结果代理失败会写入绑定身份的非敏感审计状态，调用模型仍只收到统一的隔离错误。
   - Optional internal endpoint credential. Keep it only in the host-only file
     selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
     process environment.

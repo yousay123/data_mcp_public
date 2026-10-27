@@ -18,6 +18,7 @@ let modelSawSentinel = false;
 let modelSawAuth = false;
 let modelSawLimitEvidence = false;
 let queryCount = 0;
+let failNextModelCall = false;
 
 const runResult = {
   status: 'success', query_id: 'q_internal', row_count: 2,
@@ -51,6 +52,12 @@ const modelServer = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
+    if (failNextModelCall) {
+      failNextModelCall = false;
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'synthetic provider failure' }));
+      return;
+    }
     const body = Buffer.concat(chunks).toString('utf8');
     modelSawSentinel = body.includes(sentinel);
     modelSawAuth = req.headers.authorization === 'Bearer internal-test-key';
@@ -204,6 +211,26 @@ const transportFailure = await runPlugin([{
 const failedVisible = JSON.stringify(transportFailure[0].result ?? {});
 if (!failedVisible.includes('direct_reply_transport_failed') || failedVisible.includes(modelOutput) || failedVisible.includes(sentinel)) {
   throw new Error('transport failure did not return a fixed, redacted error');
+}
+
+failNextModelCall = true;
+const agentFailure = await runPlugin([{
+  name: 'deliver_query_result_for_user',
+  arguments: {
+    sql: 'SELECT amount FROM fixture', query_plan_id: 'failed-agent',
+    output_mode: 'analysis', question: '触发受控模型故障',
+  },
+  _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_failed' } },
+}]);
+const agentFailureVisible = JSON.stringify(agentFailure[0].result ?? {});
+if (!agentFailureVisible.includes('isolated_data_operation_failed')
+  || agentFailureVisible.includes('synthetic provider failure')) {
+  throw new Error('result Agent failure did not remain isolated');
+}
+const auditRows = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8')
+  .trim().split('\n').filter(Boolean).map(JSON.parse);
+if (!auditRows.some(row => row.status === 'result_agent_failed')) {
+  throw new Error('first-turn result Agent failure did not emit a safe audit status');
 }
 
 modelServer.close();
