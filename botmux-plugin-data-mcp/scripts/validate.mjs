@@ -153,6 +153,16 @@ const readmeSource = readFileSync(join(repoRoot, 'README.md'), 'utf-8');
 if (!readmeSource.includes('_meta.botmuxTrustedCaller')) {
   fail('README must document _meta.botmuxTrustedCaller as the trusted identity source');
 }
+const skillSource = readFileSync(join(repoRoot, 'skills', 'data-mcp', 'SKILL.md'), 'utf-8');
+for (const requiredRule of [
+  'Never rely on the tool schema\'s default data source',
+  'For `dlc` with a fully qualified table, do not call',
+  'validation performs live DLC principal, table metadata, partition, engine,',
+]) {
+  if (!skillSource.includes(requiredRule)) {
+    fail(`Data MCP skill is missing datasource routing rule: ${requiredRule}`);
+  }
+}
 if (!pkg.keywords?.includes('botmux-plugin')) fail('package.json must include keywords: ["botmux-plugin"]');
 if (!/^[a-z][a-z0-9._-]{0,63}$/.test(pkg.botmux?.id ?? '')) fail('package.json#botmux.id is invalid');
 if (!Array.isArray(pkg.files) || pkg.files.length !== 1 || pkg.files[0] !== 'dist/') {
