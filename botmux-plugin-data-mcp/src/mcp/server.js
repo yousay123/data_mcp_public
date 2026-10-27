@@ -250,6 +250,14 @@ const hostRuntimeConfig = Object.freeze({
   value: configValue,
 });
 
+function enabledDatasourceIds() {
+  const configured = configValue('DATA_MCP_ENABLED_DATASOURCES') || 'tchouse-c';
+  const values = configured
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => /^[a-z0-9][a-z0-9-]*$/.test(value));
+  return [...new Set(values.length ? values : ['tchouse-c'])];
+}
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
   // process environment. Do not replace this with configValue(), whose local
@@ -1000,18 +1008,19 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
     };
   }
 
+  const enabledDatasources = enabledDatasourceIds();
   const datasource = typeof args.datasource === 'string' && args.datasource.trim()
     ? args.datasource.trim()
-    : 'tchouse-c';
-  if (datasource !== 'tchouse-c') {
+    : enabledDatasources[0];
+  if (!enabledDatasources.includes(datasource)) {
     return {
       status: 'validation_error',
       result_class: 'policy_error',
-      message: '当前公开查询入口仅支持 tchouse-c 数据源',
+      message: `当前公开查询入口未启用数据源：${datasource}`,
       issues: [{
         code: 'unsupported_datasource',
         severity: 'error',
-        message: 'validate/run 仅允许 tchouse-c',
+        message: `validate/run/deliver 仅允许已配置数据源：${enabledDatasources.join(', ')}`,
       }],
       permission_scope: 'datasource',
     };
@@ -1301,6 +1310,7 @@ async function handleToolCall(request) {
 }
 
 function toolSchemas() {
+  const datasourceIds = enabledDatasourceIds();
   const tools = [
     {
       name: 'data_mcp_identity_probe',
@@ -1329,7 +1339,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
+          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
           execution_mode: { type: 'string', enum: ['single', 'compare'], default: 'single' },
           repair_chain_id: { type: 'string', description: 'Reuse only when correcting the same failed SQL attempt.' },
         },
@@ -1344,7 +1354,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
+          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
           query_plan_id: { type: 'string' },
         },
         required: ['sql', 'query_plan_id'],
@@ -1358,7 +1368,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: ['tchouse-c'], default: 'tchouse-c' },
+          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
           query_plan_id: { type: 'string' },
           question: { type: 'string', minLength: 1, maxLength: 4000 },
           requested_outputs: {

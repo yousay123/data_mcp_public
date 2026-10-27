@@ -62,7 +62,10 @@ def test_get_settings_reads_explicit_private_env_without_copying_secrets_to_envi
 
 @pytest.mark.parametrize(
     "sensitive_key",
-    ["DATA_MCP_INTERNAL_AUTH_TOKEN", "TCHOUSE_D_PASSWORD"],
+    [
+        "DATA_MCP_INTERNAL_AUTH_TOKEN",
+        "TCHOUSE_D_PASSWORD",
+    ],
 )
 def test_get_settings_rejects_secrets_in_process_environment(
     tmp_path, monkeypatch, sensitive_key: str

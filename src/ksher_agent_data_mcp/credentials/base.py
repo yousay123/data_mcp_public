@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from ksher_agent_data_mcp.models.contracts import CredentialRef, UserContext
+from ksher_agent_data_mcp.models.contracts import ResolvedPrincipal, UserContext
 
 
 class CredentialResolutionError(Exception):
@@ -19,7 +19,13 @@ class UnsupportedCredentialDatasource(CredentialResolutionError):
     """The credential resolver does not support the requested datasource."""
 
 
+class CredentialBackendUnavailable(CredentialResolutionError):
+    """The identity or permission backend could not produce a current decision."""
+
+
 class CredentialResolver(ABC):
     @abstractmethod
-    def resolve(self, user: UserContext, datasource: str = "tchouse-c") -> CredentialRef | None:
-        """Resolve a verified user to a warehouse credential reference."""
+    def resolve(
+        self, user: UserContext, datasource: str = "tchouse-c"
+    ) -> ResolvedPrincipal | None:
+        """Resolve a host-verified user to a data-source principal."""

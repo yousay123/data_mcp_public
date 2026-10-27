@@ -15,6 +15,7 @@ from ksher_agent_data_mcp.models.contracts import (
     ColumnMeta,
     CredentialRef,
     QueryResult,
+    ResolvedPrincipal,
     ResultClass,
     Status,
 )
@@ -39,7 +40,7 @@ class QueryExecutor(ABC):
     @abstractmethod
     def run(
         self,
-        credential: CredentialRef,
+        credential: ResolvedPrincipal,
         sql: str,
         timeout_seconds: int,
         max_rows: int | None = None,
