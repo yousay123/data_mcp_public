@@ -1008,6 +1008,7 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
+        DATA_MCP_ENABLED_DATASOURCES: 'tchouse-c,dlc',
         DATA_MCP_EXPORT_QUERY_ENDPOINT: 'data:application/json,%7B%22ok%22%3Atrue%7D',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
@@ -1070,8 +1071,11 @@ try {
       ['run_query_for_user', visibleRunSchema],
       ['export_query_to_excel_file', visibleExportSchema],
     ]) {
-      if (JSON.stringify(schema?.properties?.datasource?.enum) !== JSON.stringify(['tchouse-c'])) {
-        fail(`${name} datasource schema must allow only tchouse-c`);
+      if (
+        JSON.stringify(schema?.properties?.datasource?.enum)
+        !== JSON.stringify(['tchouse-c', 'dlc'])
+      ) {
+        fail(`${name} datasource schema must expose the configured datasource registry`);
       }
     }
     if (

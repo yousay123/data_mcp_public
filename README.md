@@ -51,6 +51,32 @@ host-only 路径（默认 `~/.config/ksher-agent-data-mcp/env`），不要把凭
 导出 sidecar 的字段、原子发布顺序与信任边界见
 [`docs/export-receipt.md`](docs/export-receipt.md)。
 
+### 可配置数据源与腾讯云 DLC
+
+`DATA_MCP_ENABLED_DATASOURCES` 是逗号分隔的数据源注册表。默认仅启用
+`tchouse-c`；当前还实现了 `dlc` 适配器。新增 TCHouse-D、MySQL 等数据源时，
+应增加独立的身份解析、元数据、SQL 方言和执行适配器，不能复用另一个数据源的
+权限判断。
+
+DLC 入口只接受 BotMux 注入的可信身份，并从 host-only 文件按 `union_id` 取 CAM UIN。
+映射文件可由人工维护的飞书多维表格导出，
+但运行时只读取本机私有快照，不向模型暴露 CAM UIN。每条记录必须显式标记
+`enabled=true`（或 `status="启用"`），空白/停用记录拒绝使用；同一 `union_id` 对应多个
+UIN、或同一 UIN 对应多个 `union_id` 时服务启动失败。解析后再查询该主体的 DLC 数据权限和
+引擎权限；模型不能提交或覆盖 CAM UIN。执行前会按当前权限重新检查 SQL 涉及的表。
+
+腾讯云鉴权可选隔离更强的本机 `signer`（长期密钥不进入 Data MCP），或
+`skill_tc_call` 复用配置的 WeData Skill `scripts/tc_call.py`，并沿用该 Skill 已有的
+凭据选择（现有签名通道或环境变量回退），Data MCP 不再实现或配置另一套签名逻辑。
+部署机把 Skill 凭据放在交互式 zsh 配置中时，可使用
+`DATA_MCP_DLC_TC_CALL_ENV_MODE=zsh_interactive`；Data MCP 只启动 Skill 脚本，不读取、
+保存或回传云密钥。
+SQL 请求载荷通过权限为 600 的临时文件交给 Skill 脚本，不进入进程命令行、MCP 参数或
+模型上下文。首版 DLC 适配限定 `ap-hongkong`、只读 SELECT、显式数据库/引擎配置。WeData
+ProjectId 不参与 DLC 查询；`DATA_MCP_DLC_PROJECT_ID` 仅为可选审计标签。若主体带有
+尚未安全支持的行级过滤或数据脱敏策略，服务会 fail-closed，不会用签名代理的服务
+身份绕过细粒度策略。
+
 ## Amber 受信调用入口
 
 Amber 可通过独立的 loopback HTTP 进程调用只读 `/amber/query`，不复用内部

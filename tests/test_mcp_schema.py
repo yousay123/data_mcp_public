@@ -108,7 +108,8 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                 "run_query_for_user",
                 "export_query_to_excel_file",
             }:
-                assert properties["datasource"]["const"] == "tchouse-c"
+                assert properties["datasource"]["type"] == "string"
+                assert properties["datasource"]["default"] == "tchouse-c"
         validate_tool = next(tool for tool in tools if tool.name == "validate_sql_for_user")
         assert validate_tool.input_schema["properties"]["execution_mode"]["enum"] == [
             "single",

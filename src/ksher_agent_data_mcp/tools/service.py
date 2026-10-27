@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from ksher_agent_data_mcp.audit.logger import AuditEvent, audit_logger
 from ksher_agent_data_mcp.credentials.base import (
+    CredentialBackendUnavailable,
     CredentialConfigurationMissing,
     CredentialMappingUnavailable,
     UnsupportedCredentialDatasource,
@@ -29,6 +30,8 @@ from ksher_agent_data_mcp.metadata.snapshot import (
 )
 from ksher_agent_data_mcp.models.contracts import (
     CredentialRef,
+    DlcPrincipalRef,
+    ResolvedPrincipal,
     Status,
     UserContext,
     ValidationIssue,
@@ -423,13 +426,17 @@ class DataMcpService:
                         request_user_tchouse_account or ""
                     ),
                     "resolved_account_ref": _account_audit_ref(
-                        credential.tchouse_account if credential else ""
+                        credential.tchouse_account
+                        if isinstance(credential, CredentialRef)
+                        else ""
                     ),
                 },
             )
             return account_error
 
-        result = self.container.sql_guard.validate(
+        adapter = self._data_source_adapter(datasource)
+        assert adapter is not None
+        result = adapter.sql_guard.validate(
             user,
             sql,
             datasource,
@@ -1008,18 +1015,19 @@ class DataMcpService:
         return session_id, trust_domain, task_id
 
     def _validate_public_query_datasource(self, datasource: str) -> dict[str, Any] | None:
-        if datasource == "tchouse-c":
+        if self._data_source_adapter(datasource) is not None:
             return None
+        supported = ", ".join(self._enabled_datasource_ids())
         return {
             "status": Status.VALIDATION_ERROR,
             "result_class": "policy_error",
-            "message": "当前公开查询入口仅支持 tchouse-c 数据源",
+            "message": f"当前公开查询入口未启用数据源：{datasource}",
             "issues": [
                 ValidationIssue(
                     code="unsupported_datasource",
                     severity="error",
-                    message="validate/run/export 仅允许 tchouse-c，已在凭证解析前拒绝",
-                    suggested_action="请将 datasource 改为 tchouse-c",
+                    message=f"validate/run/export 仅允许已配置数据源：{supported}",
+                    suggested_action=f"请将 datasource 改为以下值之一：{supported}",
                 ).model_dump()
             ],
             "permission_scope": "datasource",
@@ -1155,7 +1163,10 @@ class DataMcpService:
         if result_max_rows is not None:
             guard_kwargs["max_rows_ceiling"] = result_max_rows
             guard_kwargs["default_rows"] = result_max_rows
-        validation = self.container.sql_guard.validate(
+        adapter = self._data_source_adapter(datasource)
+        if adapter is None:
+            return self._validate_public_query_datasource(datasource) or {}
+        validation = adapter.sql_guard.validate(
             user,
             sql,
             datasource,
@@ -1191,7 +1202,7 @@ class DataMcpService:
         }
         if result_max_rows is not None:
             executor_kwargs["max_rows"] = result_max_rows
-        result = self.container.executor.run(**executor_kwargs)
+        result = adapter.executor.run(**executor_kwargs)
         issue_codes = {issue.code for issue in validation.issues}
         result.limit_injected = "limit_injected" in issue_codes
         result.limit_capped = "limit_capped" in issue_codes
@@ -1271,7 +1282,7 @@ class DataMcpService:
     def _attach_sql_account_binding(
         self,
         response: dict[str, Any],
-        credential: CredentialRef | None,
+        credential: ResolvedPrincipal | None,
     ) -> None:
         if credential is None:
             return
@@ -1285,13 +1296,20 @@ class DataMcpService:
 
     def _validate_expected_account(
         self,
-        credential: CredentialRef | None,
+        credential: ResolvedPrincipal | None,
         expected_account: str | None,
     ) -> dict[str, Any] | None:
         if credential is None or not expected_account or not expected_account.strip():
             return None
 
         expected = expected_account.strip().lower()
+        if not isinstance(credential, CredentialRef):
+            return self._credential_resolution_error(
+                credential.datasource,
+                code="unexpected_tchouse_account",
+                message="非 TChouse 数据源不接受 request_user_tchouse_account",
+                suggested_action="请移除 TChouse 账号参数，由 BotMux 可信身份解析数据源主体",
+            )
         actual = credential.tchouse_account.strip().lower()
         if expected == actual:
             return None
@@ -1315,10 +1333,9 @@ class DataMcpService:
 
     def _resolve_validation_credential(
         self, user: UserContext, datasource: str
-    ) -> CredentialRef | None | dict[str, Any]:
-        if self.container.settings.metadata_provider != "tchouse_c":
+    ) -> ResolvedPrincipal | None | dict[str, Any]:
+        if datasource == "tchouse-c" and self.container.settings.metadata_provider != "tchouse_c":
             return None
-
         return self._resolve_credential(user, datasource, for_catalog_probe=True)
 
     def _resolve_credential(
@@ -1327,9 +1344,17 @@ class DataMcpService:
         datasource: str,
         *,
         for_catalog_probe: bool = False,
-    ) -> CredentialRef | dict[str, Any]:
+    ) -> ResolvedPrincipal | dict[str, Any]:
+        adapter = self._data_source_adapter(datasource)
+        if adapter is None:
+            return self._credential_resolution_error(
+                datasource,
+                code="unsupported_datasource",
+                message=f"当前 MCP 未启用数据源：{datasource}",
+                suggested_action="请使用部署配置中已启用的数据源",
+            )
         try:
-            credential = self.container.credentials.resolve(user, datasource)
+            credential = adapter.credentials.resolve(user, datasource)
         except CredentialMappingUnavailable:
             return self._credential_resolution_error(
                 datasource,
@@ -1347,6 +1372,13 @@ class DataMcpService:
                 code="credential_config_missing",
                 message=f"Data MCP 缺少 {datasource} 凭证配置，无法解析数据库账号",
                 suggested_action="请联系 Data MCP 维护方检查服务端凭证配置",
+            )
+        except CredentialBackendUnavailable:
+            return self._credential_resolution_error(
+                datasource,
+                code="credential_backend_unavailable",
+                message=f"{datasource} 权限解析后端暂时不可用，未执行查询",
+                suggested_action="请稍后重试；若持续失败，请维护方检查权限解析链路",
             )
         except UnsupportedCredentialDatasource:
             return self._credential_resolution_error(
@@ -1369,6 +1401,28 @@ class DataMcpService:
             suggested_action=f"确认飞书 union_id 和 {datasource} 账号映射是否存在",
             required_permission=f"{datasource} account mapping",
         )
+
+    def _enabled_datasource_ids(self) -> tuple[str, ...]:
+        registry = self.container.data_sources
+        return registry.ids if registry is not None else ("tchouse-c",)
+
+    def _data_source_adapter(self, datasource: str) -> Any:
+        registry = self.container.data_sources
+        if datasource == "tchouse-c":
+            if registry is not None and registry.get(datasource) is None:
+                return None
+            from ksher_agent_data_mcp.datasources.registry import DataSourceAdapter
+
+            return DataSourceAdapter(
+                datasource="tchouse-c",
+                adapter="legacy",
+                credentials=self.container.credentials,
+                sql_guard=self.container.sql_guard,
+                executor=self.container.executor,
+            )
+        if registry is not None:
+            return registry.get(datasource)
+        return None
 
     def _credential_resolution_error(
         self,
@@ -1811,7 +1865,9 @@ def _export_sql_account_binding(binding: Any) -> dict[str, Any] | None:
     return exported
 
 
-def _credential_resolution_source(credential: CredentialRef) -> str:
+def _credential_resolution_source(credential: ResolvedPrincipal) -> str:
+    if isinstance(credential, DlcPrincipalRef):
+        return "botmux_union_id_to_cam_mapping"
     if credential.datasource == "tchouse-d":
         return "configured_env_credential"
     return "mcp_union_id_mapping"
