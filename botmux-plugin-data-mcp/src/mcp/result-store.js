@@ -207,8 +207,19 @@ export class ResultStore {
     }
   }
 
-  audit(identity, turnId, question, version, status, now = Date.now()) {
+  audit(identity, turnId, question, version, status, now = Date.now(), detail = {}) {
     const { bindingKey } = this.binding(identity);
+    const safeDetail = {};
+    if (detail?.stage === 'result_agent') safeDetail.stage = detail.stage;
+    if (typeof detail?.action === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(detail.action)) {
+      safeDetail.action = detail.action;
+    }
+    if (typeof detail?.errorCode === 'string' && /^result_agent_[a-z0-9_]{1,80}$/.test(detail.errorCode)) {
+      safeDetail.error_code = detail.errorCode;
+    }
+    if (typeof detail?.queryId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(detail.queryId)) {
+      safeDetail.query_id = detail.queryId;
+    }
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),
@@ -216,6 +227,7 @@ export class ResultStore {
       question: this.digest('audit-question-v1', [question]).slice(0, 16),
       version,
       status,
+      ...safeDetail,
     };
     appendFileSync(this.auditPath, `${JSON.stringify(event)}\n`, { encoding: 'utf8', mode: 0o600 });
     chmodSync(this.auditPath, 0o600);

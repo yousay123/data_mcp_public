@@ -667,6 +667,14 @@ async function runResultAgent(result, args, runtimeConfig, timeoutMs) {
 function resultAgentAuditStatus(error) {
   const code = error instanceof Error ? error.message : '';
   const safeCodes = new Set([
+    'result_agent_not_configured',
+    'result_agent_endpoint_not_allowed',
+    'result_agent_payload_too_large',
+    'result_agent_invalid_json',
+    'result_agent_invalid_response',
+    'result_agent_context_invalid',
+    'result_agent_schema_missing',
+    'result_agent_invalid_rows',
     'result_agent_timeout',
     'result_agent_ipc_payload_too_large',
     'result_agent_ipc_invalid_response',
@@ -674,7 +682,67 @@ function resultAgentAuditStatus(error) {
     'result_agent_process_isolation_failed',
     'result_agent_context_missing',
   ]);
+  if (/^result_agent_http_[1-5][0-9]{2}$/.test(code)) return code;
   return safeCodes.has(code) ? code : 'result_agent_failed';
+}
+
+function resultAgentAuditAction(errorCode) {
+  if (errorCode === 'result_agent_not_configured') return 'model_config';
+  if (errorCode === 'result_agent_endpoint_not_allowed') return 'endpoint_validation';
+  if (errorCode === 'result_agent_timeout' || errorCode.startsWith('result_agent_http_')) return 'model_request';
+  if (errorCode.includes('context') || errorCode.includes('schema') || errorCode.includes('rows')) {
+    return 'result_validation';
+  }
+  if (errorCode.includes('ipc') || errorCode.includes('worker') || errorCode.includes('process_isolation')) {
+    return 'worker_isolation';
+  }
+  return 'result_processing';
+}
+
+function resultAgentMayUseDeterministicFallback(errorCode) {
+  return errorCode === 'result_agent_not_configured'
+    || errorCode === 'result_agent_timeout'
+    || /^result_agent_http_5[0-9]{2}$/.test(errorCode);
+}
+
+function markdownCell(value) {
+  if (value === null || value === undefined) return 'NULL';
+  if (!['string', 'number', 'boolean', 'bigint'].includes(typeof value)) {
+    throw new Error('deterministic_fallback_unsupported_value');
+  }
+  const text = String(value);
+  if (text.length > 500) throw new Error('deterministic_fallback_value_too_large');
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('|', '\\|')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+function deterministicAnalysisFallback(result, args) {
+  const outputs = requestedOutputs(args);
+  if (outputs.length !== 1 || outputs[0] !== 'analysis') return null;
+  const columns = (Array.isArray(result.columns) ? result.columns : [])
+    .map(column => typeof column === 'string' ? column : column?.name)
+    .filter(column => typeof column === 'string' && column.trim())
+    .map(column => column.trim());
+  const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.data) ? result.data : [];
+  if (columns.length < 1 || columns.length > 20 || rows.length < 1 || rows.length > 20) return null;
+  const renderedRows = rows.map(row => {
+    if (Array.isArray(row)) return columns.map((_, index) => markdownCell(row[index]));
+    if (row && typeof row === 'object') return columns.map(column => markdownCell(row[column]));
+    throw new Error('deterministic_fallback_invalid_row');
+  });
+  const markdown = [
+    '查询已完成。结果代理暂不可用，以下为受控查询返回的原始结果，未作额外口径推断：',
+    '',
+    `| ${columns.map(markdownCell).join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+    ...renderedRows.map(row => `| ${row.join(' | ')} |`),
+  ].join('\n');
+  if (Buffer.byteLength(markdown) > 16 * 1024) return null;
+  return { markdown, files: [] };
 }
 
 function storableQueryResult(result) {
@@ -748,6 +816,14 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       DELIVERY_BUDGET_MS - (Date.now() - deliveryStartedAt),
     );
   } catch (error) {
+    const errorCode = resultAgentAuditStatus(error);
+    let fallback;
+    try {
+      fallback = resultAgentMayUseDeterministicFallback(errorCode)
+        ? deterministicAnalysisFallback(result, args)
+        : null;
+    }
+    catch { fallback = null; }
     if (store && identity) {
       try {
         store.audit(
@@ -755,11 +831,19 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
           caller.turnId || 'initial',
           args.question || '',
           null,
-          resultAgentAuditStatus(error),
+          fallback ? 'deterministic_fallback_used' : errorCode,
+          Date.now(),
+          {
+            stage: 'result_agent',
+            action: resultAgentAuditAction(errorCode),
+            errorCode,
+            queryId: result.query_id,
+          },
         );
       } catch { /* best-effort non-sensitive audit */ }
     }
-    return { error: isolatedDeliveryFailure() };
+    if (!fallback) return { error: isolatedDeliveryFailure() };
+    authored = fallback;
   }
   if (store) {
     try { store.put(identity, storedPayload(args, result)); }

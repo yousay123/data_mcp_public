@@ -11,6 +11,7 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-delivery-'));
 const pluginHome = join(root, 'plugin-home');
 const hostEnvFile = join(root, 'host.env');
+const missingModelEnvFile = join(root, 'host-missing-model.env');
 const botmuxLog = join(root, 'botmux.jsonl');
 const sentinel = 'CONFIDENTIAL_BUSINESS_ROW_7319';
 const modelOutput = '受控分析结果：合成记录。';
@@ -92,6 +93,12 @@ writeFileSync(hostEnvFile, [
   `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
   'DATA_MCP_RESULT_MODEL=internal-test-model',
+  'DATA_MCP_RESULT_MODEL_API_KEY=internal-test-key',
+  'DATA_MCP_RESULT_BINDING_HMAC_KEY=0123456789abcdef0123456789abcdef',
+].join('\n') + '\n', { mode: 0o600 });
+writeFileSync(missingModelEnvFile, [
+  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
+  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
   'DATA_MCP_RESULT_MODEL_API_KEY=internal-test-key',
   'DATA_MCP_RESULT_BINDING_HMAC_KEY=0123456789abcdef0123456789abcdef',
 ].join('\n') + '\n', { mode: 0o600 });
@@ -223,14 +230,43 @@ const agentFailure = await runPlugin([{
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_failed' } },
 }]);
 const agentFailureVisible = JSON.stringify(agentFailure[0].result ?? {});
-if (!agentFailureVisible.includes('isolated_data_operation_failed')
-  || agentFailureVisible.includes('synthetic provider failure')) {
-  throw new Error('result Agent failure did not remain isolated');
+if (!agentFailureVisible.includes('delivered')
+  || agentFailureVisible.includes('synthetic provider failure')
+  || agentFailureVisible.includes(sentinel)) {
+  throw new Error('result Agent failure did not use the safe deterministic fallback');
+}
+
+const missingModel = await runPlugin([{
+  name: 'deliver_query_result_for_user',
+  arguments: {
+    sql: 'SELECT amount FROM fixture', query_plan_id: 'missing-model',
+    output_mode: 'analysis', question: '验证配置缺失降级',
+  },
+  _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_missing_model' } },
+}], { KSHER_AGENT_DATA_MCP_ENV_FILE: missingModelEnvFile });
+if (!JSON.stringify(missingModel[0].result ?? {}).includes('delivered')) {
+  throw new Error('missing result model did not use the safe deterministic fallback');
 }
 const auditRows = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8')
   .trim().split('\n').filter(Boolean).map(JSON.parse);
-if (!auditRows.some(row => row.status === 'result_agent_failed')) {
-  throw new Error('first-turn result Agent failure did not emit a safe audit status');
+if (!auditRows.some(row => row.status === 'deterministic_fallback_used'
+  && row.stage === 'result_agent'
+  && row.action === 'model_request'
+  && row.error_code === 'result_agent_http_503'
+  && row.query_id === 'q_internal')) {
+  throw new Error('first-turn result Agent failure did not emit actionable safe audit detail');
+}
+if (!auditRows.some(row => row.status === 'deterministic_fallback_used'
+  && row.stage === 'result_agent'
+  && row.action === 'model_config'
+  && row.error_code === 'result_agent_not_configured'
+  && row.query_id === 'q_internal')) {
+  throw new Error('missing result model did not emit its exact safe audit detail');
+}
+const fallbackBotmuxRecords = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
+if (!fallbackBotmuxRecords.some(row => row.content?.includes('受控查询返回的原始结果')
+  && row.content?.includes('CONFIDENTIAL_BUSINESS_ROW_7319'))) {
+  throw new Error('safe deterministic fallback was not delivered through the trusted reply path');
 }
 
 modelServer.close();

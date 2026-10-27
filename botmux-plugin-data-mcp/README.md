@@ -163,7 +163,12 @@ Environment contract:
 结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
 55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
 使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
-首轮结果代理失败会写入绑定身份的非敏感审计状态，调用模型仍只收到统一的隔离错误。
+首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
+`stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
+混成同一个不可定位错误。仅当请求输出为 `analysis`、结果不超过 20 行 × 20 列、
+每个单元格都是有界标量，且失败属于模型未配置、超时或 5xx 时，插件才会通过既有
+可信飞书回复通道确定性展示原始查询表格；不做口径推断。模型 endpoint/重定向、
+上下文完整性、进程隔离、附件产物等安全边界失败仍然 fail closed。
   - Optional internal endpoint credential. Keep it only in the host-only file
     selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
     process environment.
