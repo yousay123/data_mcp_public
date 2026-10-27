@@ -14,6 +14,7 @@ from ksher_agent_data_mcp.datasources.dlc import (
     DlcQueryExecutor,
 )
 from ksher_agent_data_mcp.credentials.base import (
+    CredentialBackendUnavailable,
     CredentialConfigurationMissing,
     CredentialMappingUnavailable,
 )
@@ -25,9 +26,17 @@ from ksher_agent_data_mcp.models.contracts import ResultClass, Status, UserConte
 
 
 class FakeDlcClient:
-    def __init__(self, *, row_filter: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        row_filter: bool = False,
+        engine_type: str = "presto",
+        task_state: int = 2,
+    ) -> None:
         self.calls = []
         self.row_filter = row_filter
+        self.engine_type = engine_type
+        self.task_state = task_state
 
     def call(self, action, payload, timeout=90):
         self.calls.append((action, payload, timeout))
@@ -66,6 +75,16 @@ class FakeDlcClient:
                     key: {"PolicySet": rows, "TotalCount": len(rows)},
                 }
             }
+        if action == "DescribeDataEngines":
+            return {
+                "DataEngines": [
+                    {
+                        "DataEngineName": "shared-presto",
+                        "EngineType": self.engine_type,
+                    }
+                ],
+                "TotalCount": 1,
+            }
         if action == "DescribeTable":
             return {
                 "Table": {
@@ -74,9 +93,15 @@ class FakeDlcClient:
                     "Partitions": [{"Name": "dt", "Type": "string"}],
                 }
             }
-        if action == "CreateTask":
-            assert base64.b64decode(payload["Task"]["SQLTask"]["SQL"]).decode().startswith("SELECT")
-            return {"TaskId": "task-1"}
+        if action == "CreateTasks":
+            assert base64.b64decode(payload["Tasks"]["SQL"]).decode().startswith("SELECT")
+            return {"BatchId": "batch-1", "TaskIdSet": ["task-1"]}
+        if action == "DescribeTasks":
+            return {
+                "TaskList": [
+                    {"Id": "task-1", "State": self.task_state, "DataAmount": 12}
+                ]
+            }
         if action == "DescribeTaskResult":
             return {
                 "TaskInfo": {
@@ -211,6 +236,7 @@ def test_dlc_resolves_caller_permissions_validates_and_executes(tmp_path):
     assert principal is not None
     assert principal.cam_uin == "700000000001"
     assert principal.engine_allowed is True
+    assert principal.data_engine_type == "presto"
 
     catalog = DlcMetadataCatalog(settings, client)
     guard = SqlGuard(settings, catalog, datasource="dlc", dialect="presto")
@@ -231,6 +257,53 @@ def test_dlc_resolves_caller_permissions_validates_and_executes(tmp_path):
     assert result.status == Status.SUCCESS
     assert result.rows == [{"order_id": "42"}]
     assert result.read_bytes == 12
+    actions = [action for action, _, _ in client.calls]
+    assert actions.index("CreateTasks") < actions.index("DescribeTasks")
+    assert actions.index("DescribeTasks") < actions.index("DescribeTaskResult")
+    create_payload = next(payload for action, payload, _ in client.calls if action == "CreateTasks")
+    assert create_payload["Tasks"]["TaskType"] == "SQLTask"
+    assert create_payload["Tasks"]["FailureTolerance"] == "Terminate"
+
+
+def test_dlc_uses_spark_sql_task_for_spark_engine(tmp_path):
+    settings = dlc_settings(tmp_path)
+    client = FakeDlcClient(engine_type="spark")
+    principal = DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+
+    result = DlcQueryExecutor(settings, client).run(
+        principal,
+        "SELECT order_id FROM analytics.orders",
+        timeout_seconds=10,
+    )
+
+    assert result.status == Status.SUCCESS
+    create_payload = next(payload for action, payload, _ in client.calls if action == "CreateTasks")
+    assert create_payload["Tasks"]["TaskType"] == "SparkSQLTask"
+
+
+def test_dlc_fails_closed_for_unknown_engine_type(tmp_path):
+    settings = dlc_settings(tmp_path)
+
+    with pytest.raises(CredentialBackendUnavailable, match="unsupported_engine_type"):
+        DlcPrincipalResolver(settings, FakeDlcClient(engine_type="hive")).resolve(
+            UserContext(union_id="on_user")
+        )
+
+
+def test_dlc_failed_task_does_not_fetch_result(tmp_path):
+    settings = dlc_settings(tmp_path)
+    client = FakeDlcClient(task_state=-1)
+    principal = DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+
+    result = DlcQueryExecutor(settings, client).run(
+        principal,
+        "SELECT order_id FROM analytics.orders",
+        timeout_seconds=10,
+    )
+
+    assert result.status == Status.ERROR
+    assert result.error_code == "query_failed"
+    assert not any(action == "DescribeTaskResult" for action, _, _ in client.calls)
 
 
 def test_dlc_denies_unlisted_table_before_describe(tmp_path):
@@ -272,7 +345,7 @@ def test_dlc_fails_closed_for_row_filter(tmp_path):
     assert result.status == Status.ERROR
     assert result.result_class == ResultClass.POLICY_ERROR
     assert result.error_code == "fine_grained_policy_not_supported"
-    assert not any(action == "CreateTask" for action, _, _ in client.calls)
+    assert not any(action == "CreateTasks" for action, _, _ in client.calls)
 
 
 def test_skill_tc_call_mode_fails_closed_for_invalid_skill_response(tmp_path, monkeypatch):
