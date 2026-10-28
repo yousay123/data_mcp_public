@@ -55,10 +55,11 @@ def scan_worktree() -> list[str]:
     return findings
 
 
-def scan_history() -> list[str]:
+def scan_history(base: str | None = None) -> list[str]:
     findings: list[str] = []
+    revision = f"{base}..HEAD" if base else "HEAD"
     objects = subprocess.run(
-        ["git", "rev-list", "--objects", "--all"],
+        ["git", "rev-list", "--objects", revision],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -90,10 +91,14 @@ def scan_history() -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--history", action="store_true", help="also scan every reachable Git blob")
+    parser.add_argument(
+        "--history-base",
+        help="only scan Git objects introduced after this revision (for example a PR base SHA)",
+    )
     args = parser.parse_args()
     findings = scan_worktree()
     if args.history:
-        findings.extend(scan_history())
+        findings.extend(scan_history(args.history_base))
     if findings:
         print("Public-source safety scan failed:")
         for finding in sorted(set(findings)):
