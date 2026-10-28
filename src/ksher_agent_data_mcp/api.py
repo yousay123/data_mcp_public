@@ -72,6 +72,7 @@ class MetadataSnapshotRefreshRequest(BaseModel):
     request_lark_app_id: str | None = None
     caller_source: str | None = None
     caller_sender_type: str | None = None
+    caller_session_id: str | None = None
     caller_task_id: str | None = None
     caller_turn_id: str | None = None
     caller_captured_at: str | None = None
@@ -80,6 +81,7 @@ class MetadataSnapshotRefreshRequest(BaseModel):
         return {
             "caller_source": self.caller_source,
             "sender_type": self.caller_sender_type,
+            "session_id": self.caller_session_id,
             "task_id": self.caller_task_id,
             "turn_id": self.caller_turn_id,
             "captured_at": self.caller_captured_at,

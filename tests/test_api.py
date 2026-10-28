@@ -327,6 +327,7 @@ def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) ->
             "request_user_open_id": "ou_owner",
             "request_lark_app_id": "cli_test",
             "caller_source": "schedule_creator",
+            "caller_session_id": "session_test",
             "caller_task_id": "task_test",
         },
     )
@@ -339,6 +340,7 @@ def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) ->
         "audit_context": {
             "caller_source": "schedule_creator",
             "sender_type": None,
+            "session_id": "session_test",
             "task_id": "task_test",
             "turn_id": None,
             "captured_at": None,
