@@ -153,6 +153,26 @@ const readmeSource = readFileSync(join(repoRoot, 'README.md'), 'utf-8');
 if (!readmeSource.includes('_meta.botmuxTrustedCaller')) {
   fail('README must document _meta.botmuxTrustedCaller as the trusted identity source');
 }
+const skillSource = readFileSync(join(repoRoot, 'skills', 'data-mcp', 'SKILL.md'), 'utf-8');
+const skillDescription = skillSource.match(/^description:\s*(.+)$/m)?.[1] ?? '';
+for (const requiredDescriptionRule of [
+  'explicit DLC request with a fully qualified table',
+  'never call search_metadata_snapshot',
+  'validate_sql_for_user with datasource=dlc',
+]) {
+  if (!skillDescription.includes(requiredDescriptionRule)) {
+    fail(`Data MCP skill description is missing DLC routing rule: ${requiredDescriptionRule}`);
+  }
+}
+for (const requiredRule of [
+  'Never rely on the tool schema\'s default data source',
+  'For `dlc` with a fully qualified table, do not call',
+  'validation performs live DLC principal, table metadata, partition, engine,',
+]) {
+  if (!skillSource.includes(requiredRule)) {
+    fail(`Data MCP skill is missing datasource routing rule: ${requiredRule}`);
+  }
+}
 if (!pkg.keywords?.includes('botmux-plugin')) fail('package.json must include keywords: ["botmux-plugin"]');
 if (!/^[a-z][a-z0-9._-]{0,63}$/.test(pkg.botmux?.id ?? '')) fail('package.json#botmux.id is invalid');
 if (!Array.isArray(pkg.files) || pkg.files.length !== 1 || pkg.files[0] !== 'dist/') {
@@ -167,6 +187,11 @@ assertNoSymlinks(runtimeRoot);
 const mcp = readJson(join(runtimeRoot, 'mcp', 'index.json'));
 const mcpServerSource = readFileSync(join(runtimeRoot, 'mcp', 'server.js'), 'utf-8');
 const mcpServerSourceFile = readFileSync(join(repoRoot, 'src', 'mcp', 'server.js'), 'utf-8');
+for (const source of [mcpServerSourceFile, mcpServerSource]) {
+  if (!source.includes('Never call this tool for an explicit DLC request with a fully qualified table')) {
+    fail('search_metadata_snapshot tool description must forbid explicit fully-qualified DLC routing');
+  }
+}
 const trustedCallerStart = mcpServerSourceFile.indexOf('function trustedCallerFrom(request) {');
 const trustedCallerEnd = mcpServerSourceFile.indexOf('\n}\n\nfunction normalizeTrustedCaller', trustedCallerStart);
 if (trustedCallerStart < 0 || trustedCallerEnd < 0) {
@@ -1008,6 +1033,7 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
+        DATA_MCP_ENABLED_DATASOURCES: 'tchouse-c,dlc',
         DATA_MCP_EXPORT_QUERY_ENDPOINT: 'data:application/json,%7B%22ok%22%3Atrue%7D',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
@@ -1070,8 +1096,11 @@ try {
       ['run_query_for_user', visibleRunSchema],
       ['export_query_to_excel_file', visibleExportSchema],
     ]) {
-      if (JSON.stringify(schema?.properties?.datasource?.enum) !== JSON.stringify(['tchouse-c'])) {
-        fail(`${name} datasource schema must allow only tchouse-c`);
+      if (
+        JSON.stringify(schema?.properties?.datasource?.enum)
+        !== JSON.stringify(['tchouse-c', 'dlc'])
+      ) {
+        fail(`${name} datasource schema must expose the configured datasource registry`);
       }
     }
     if (

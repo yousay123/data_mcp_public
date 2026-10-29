@@ -5,11 +5,11 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 PRIVATE_ENV_FILE_ENV = "KSHER_AGENT_DATA_MCP_ENV_FILE"
 SENSITIVE_PROCESS_ENV_KEYS = (
     "DATA_MCP_INTERNAL_AUTH_TOKEN",
     "TCHOUSE_D_PASSWORD",
+    "TC_SIGNER_TOKEN",
 )
 
 
@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     credential_provider: str = Field(default="memory", alias="CREDENTIAL_PROVIDER")
     credential_memory_file: Path | None = Field(default=None, alias="CREDENTIAL_MEMORY_FILE")
     query_executor: str = Field(default="dry_run", alias="QUERY_EXECUTOR")
+    enabled_datasources: str = Field(
+        default="tchouse-c", alias="DATA_MCP_ENABLED_DATASOURCES"
+    )
     export_max_rows: int = Field(default=100_000, alias="DATA_MCP_EXPORT_MAX_ROWS", ge=1)
     export_max_bytes: int = Field(
         default=1024 * 1024 * 1024, alias="DATA_MCP_EXPORT_MAX_BYTES", ge=1
@@ -149,6 +152,37 @@ class Settings(BaseSettings):
     tchouse_d_credential_sql: str | None = Field(
         default=None,
         alias="TCHOUSE_D_CREDENTIAL_SQL",
+    )
+    dlc_region: str = Field(default="ap-hongkong", alias="DATA_MCP_DLC_REGION")
+    dlc_project_id: str | None = Field(default=None, alias="DATA_MCP_DLC_PROJECT_ID")
+    dlc_catalog: str = Field(default="DataLakeCatalog", alias="DATA_MCP_DLC_CATALOG")
+    dlc_default_database: str | None = Field(
+        default=None, alias="DATA_MCP_DLC_DEFAULT_DATABASE"
+    )
+    dlc_data_engine_name: str | None = Field(
+        default=None, alias="DATA_MCP_DLC_DATA_ENGINE_NAME"
+    )
+    dlc_principal_mapping_file: Path | None = Field(
+        default=None, alias="DATA_MCP_DLC_PRINCIPAL_MAPPING_FILE"
+    )
+    dlc_auth_mode: str = Field(default="signer", alias="DATA_MCP_DLC_AUTH_MODE")
+    dlc_tc_call_path: Path | None = Field(
+        default=None, alias="DATA_MCP_DLC_TC_CALL_PATH"
+    )
+    dlc_tc_call_env_mode: str = Field(
+        default="inherit", alias="DATA_MCP_DLC_TC_CALL_ENV_MODE"
+    )
+    dlc_tc_call_shell: Path = Field(
+        default=Path("/bin/zsh"), alias="DATA_MCP_DLC_TC_CALL_SHELL"
+    )
+    dlc_signer_url: str = Field(
+        default="http://127.0.0.1:18790", alias="DATA_MCP_DLC_SIGNER_URL"
+    )
+    dlc_signer_token_file: Path | None = Field(
+        default=None, alias="DATA_MCP_DLC_SIGNER_TOKEN_FILE"
+    )
+    dlc_poll_interval_seconds: float = Field(
+        default=0.5, alias="DATA_MCP_DLC_POLL_INTERVAL_SECONDS", gt=0, le=10
     )
 
 
