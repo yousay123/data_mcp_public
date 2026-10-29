@@ -194,7 +194,13 @@ class Settings(BaseSettings):
         default=45,
         alias="DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS",
         gt=1,
-        le=50,
+        le=180,
+    )
+    dlc_query_timeout_seconds: float = Field(
+        default=60,
+        alias="DATA_MCP_DLC_QUERY_TIMEOUT_SECONDS",
+        gt=1,
+        le=180,
     )
     dlc_api_call_timeout_seconds: float = Field(
         default=6,

@@ -26,8 +26,12 @@ def canonical_result_context(
 
     expression = sqlglot.parse_one(normalized_sql, read=SQL_DIALECT)
     select = expression if isinstance(expression, exp.Select) else expression.find(exp.Select)
-    projections = [] if select is None else [_projection_name(item) for item in select.expressions]
+    projection_items = [] if select is None else list(select.expressions)
+    projections = [_projection_name(item) for item in projection_items]
     projections = [value for value in projections if value]
+    metric_expressions = [
+        item.sql(dialect=SQL_DIALECT, pretty=False) for item in projection_items
+    ]
     where = None if select is None else select.args.get("where")
     filters = [] if where is None else [
         item.sql(dialect=SQL_DIALECT, pretty=False) for item in _flatten_and(where.this)
@@ -43,6 +47,7 @@ def canonical_result_context(
         "datasource": datasource,
         "tables": sorted(set(tables)),
         "metric_columns": projections or sorted(set(referenced_columns)),
+        "metric_expressions": metric_expressions,
         "filter_predicates": filters,
         "time_range_predicates": time_filters,
         "grouping_columns": grouping,

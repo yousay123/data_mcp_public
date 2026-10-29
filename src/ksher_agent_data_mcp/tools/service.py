@@ -23,6 +23,7 @@ from ksher_agent_data_mcp.export import (
     new_export_id,
     sanitize_excel_filename,
 )
+from ksher_agent_data_mcp.metadata.catalog import MetadataAccessDenied, MetadataLookupError
 from ksher_agent_data_mcp.metadata.snapshot import (
     SnapshotError,
     refresh_metadata_snapshot,
@@ -76,6 +77,122 @@ class DataMcpService:
         self.repair_chains = RepairChainStore(container.settings.query_repair_max_failures)
         self._inspection_calls: OrderedDict[tuple[str, str], int] = OrderedDict()
         self._inspection_calls_lock = Lock()
+
+    def search_dlc_tables_for_user(
+        self,
+        request_user_union_id: str,
+        request_user_open_id: str | None,
+        query: str,
+        request_lark_app_id: str | None = None,
+        audit_context: AuditContext | None = None,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        user_or_error = self._build_user_context(
+            request_user_union_id, request_user_open_id, request_lark_app_id
+        )
+        if isinstance(user_or_error, dict):
+            return user_or_error
+        user = user_or_error
+        if not self._is_trusted_human_or_schedule(audit_context):
+            error = self._caller_policy_error("DLC 表发现只允许受信任的真实用户或定时任务触发")
+            self._audit_rejected_caller(
+                "dlc_table_search",
+                request_user_union_id,
+                request_user_open_id,
+                request_lark_app_id,
+                audit_context,
+                error,
+            )
+            return error
+        normalized_query = query.strip()
+        if not normalized_query or len(normalized_query) > 500 or limit < 1 or limit > 20:
+            return {
+                "status": Status.VALIDATION_ERROR,
+                "result_class": "policy_error",
+                "error_code": "dlc_table_search_input_invalid",
+                "message": "DLC 表检索 query 不能为空且不超过 500 字符，limit 必须为 1 到 20",
+            }
+        credential = self._resolve_validation_credential(user, "dlc", audit_context)
+        if isinstance(credential, dict):
+            return credential
+        adapter = self._data_source_adapter("dlc")
+        if adapter is None:
+            return self._credential_resolution_error(
+                "dlc",
+                code="unsupported_datasource",
+                message="当前 MCP 未启用 DLC 数据源",
+                suggested_action="请维护方启用 DLC 数据源后重试",
+            )
+        try:
+            tables = adapter.sql_guard.catalog.suggest_tables(
+                normalized_query, limit=limit, credential=credential
+            )
+            response: dict[str, Any] = {
+                "status": Status.SUCCESS if tables else Status.NOT_FOUND,
+                "result_class": "success" if tables else "inconclusive",
+                "datasource": "dlc",
+                "region": getattr(credential, "region", None),
+                "catalog": getattr(credential, "catalog", None),
+                "candidates": [
+                    {
+                        "full_name": table.full_name,
+                        "description": table.description,
+                        "partition_fields": table.partition_fields,
+                        "columns": [
+                            {
+                                "name": column.name,
+                                "type": column.type,
+                                "description": column.description,
+                            }
+                            for column in table.columns[:30]
+                        ],
+                        "authoritative": True,
+                    }
+                    for table in tables
+                ],
+                "requires_confirmation": len(tables) != 1,
+            }
+            if not tables:
+                response["error_code"] = "dlc_table_no_match"
+                response["message"] = "当前用户可访问的 DLC 表中未找到可核验候选"
+            elif len(tables) > 1:
+                response["message"] = "找到多个已核验候选，请先让用户确认表名再生成 SQL"
+            else:
+                response["message"] = "找到唯一已核验候选，可按返回的完整表名和分区字段生成 SQL"
+        except MetadataAccessDenied:
+            response = {
+                "status": Status.VALIDATION_ERROR,
+                "result_class": "policy_error",
+                "error_code": "dlc_table_search_permission_denied",
+                "message": "当前用户无权读取候选表元数据",
+                "candidates": [],
+            }
+        except MetadataLookupError:
+            response = {
+                "status": Status.ERROR,
+                "result_class": "inconclusive",
+                "error_code": "dlc_table_search_unavailable",
+                "message": "DLC 表元数据检索暂不可用",
+                "candidates": [],
+            }
+        audit_logger.emit(
+            AuditEvent(
+                event_type="dlc_table_search",
+                union_id=user.union_id,
+                feishu_user_id=user.feishu_user_id,
+                lark_app_id=user.lark_app_id,
+                email=user.email,
+                status=response["status"],
+                detail={
+                    "datasource": "dlc",
+                    "query_hash": hashlib.sha256(normalized_query.encode()).hexdigest()[:16],
+                    "candidate_count": len(response.get("candidates", [])),
+                    "error_code": response.get("error_code"),
+                    **self._audit_detail(audit_context),
+                },
+            )
+        )
+        return response
 
     def inspect_ck_subjects_by_table(
         self,
@@ -1229,7 +1346,7 @@ class DataMcpService:
             executor_timeout = max(
                 0.1,
                 min(
-                    executor_timeout,
+                    self.container.settings.dlc_query_timeout_seconds,
                     self.container.settings.dlc_operation_timeout_seconds - elapsed,
                 ),
             )
@@ -1290,6 +1407,9 @@ class DataMcpService:
                 status=result.status,
                 detail={
                     "query_id": result.query_id,
+                    "provider_task_id": (
+                        result.query_id if validation.datasource == "dlc" else None
+                    ),
                     "credential": credential.masked(),
                     "tables": validation.tables,
                     "datasource": validation.datasource,

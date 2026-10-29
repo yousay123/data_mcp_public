@@ -1,6 +1,7 @@
 import base64
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from ksher_agent_data_mcp.db.sql_guard import SqlGuard
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.metadata.catalog import MetadataAccessDenied
 from ksher_agent_data_mcp.models.contracts import ResultClass, Status, UserContext
+from ksher_agent_data_mcp.tools.service import DataMcpService
 
 
 class FakeDlcClient:
@@ -42,14 +44,17 @@ class FakeDlcClient:
         self.calls.append((action, payload, timeout))
         if action == "DescribeUserInfo":
             info_type = payload["Type"]
-            policy = {
-                "Catalog": "DataLakeCatalog",
-                "Database": "analytics",
-                "Table": "orders",
-                "Operation": "SELECT",
-                "PolicyType": "TABLE",
-                "Source": "USER",
-            }
+            policies = [
+                {
+                    "Catalog": "DataLakeCatalog",
+                    "Database": "analytics",
+                    "Table": table,
+                    "Operation": "SELECT",
+                    "PolicyType": "TABLE",
+                    "Source": "USER",
+                }
+                for table in ("orders", "merchant_shop")
+            ]
             engine = {
                 "DataEngine": "shared-presto",
                 "Operation": "USE",
@@ -61,7 +66,7 @@ class FakeDlcClient:
                 "RowFilter": "RowFilterInfo",
             }[info_type]
             rows = (
-                [policy]
+                policies
                 if info_type == "DataAuth"
                 else [engine]
                 if info_type == "EngineAuth"
@@ -86,12 +91,32 @@ class FakeDlcClient:
                 "TotalCount": 1,
             }
         if action == "DescribeTable":
+            table = payload["TableName"]
             return {
                 "Table": {
-                    "TableBaseInfo": {"TableComment": "orders"},
-                    "Columns": [{"Name": "order_id", "Type": "bigint"}],
+                    "TableBaseInfo": {"TableComment": table},
+                    "Columns": [
+                        {
+                            "Name": "order_id" if table == "orders" else f"{table}_id",
+                            "Type": "bigint",
+                        }
+                    ],
                     "Partitions": [{"Name": "dt", "Type": "string"}],
                 }
+            }
+        if action == "DescribeDMSTables":
+            return {
+                "TableList": [
+                    {
+                        "Table": {"DbName": "analytics", "Name": "merchant_shop"},
+                        "Asset": {"Description": "商户店铺维度表"},
+                    },
+                    {
+                        "Table": {"DbName": "private", "Name": "merchant_shop_secret"},
+                        "Asset": {"Description": "不可访问表"},
+                    },
+                ],
+                "TotalCount": 2,
             }
         if action == "CreateTasks":
             assert base64.b64decode(payload["Tasks"]["SQL"]).decode().startswith("SELECT")
@@ -133,6 +158,18 @@ class TransientPermissionClient(FakeDlcClient):
         # Avoid recording the successful attempt twice.
         self.calls.pop()
         return super().call(action, payload, timeout)
+
+
+class FailedTaskClient(FakeDlcClient):
+    def __init__(self, error: str) -> None:
+        super().__init__(task_state=-1)
+        self.error = error
+
+    def call(self, action, payload, timeout=90):
+        response = super().call(action, payload, timeout)
+        if action == "DescribeTasks":
+            response["TaskList"][0]["Error"] = self.error
+        return response
 
 
 def dlc_settings(tmp_path):
@@ -362,7 +399,43 @@ def test_dlc_failed_task_does_not_fetch_result(tmp_path):
 
     assert result.status == Status.ERROR
     assert result.error_code == "query_failed"
+    assert result.failure_stage == "dlc_task_execution"
+    assert result.failure_action == "DescribeTasks"
+    assert result.diagnostic_source == "wedata-tencent-workflow"
     assert not any(action == "DescribeTaskResult" for action, _, _ in client.calls)
+
+
+@pytest.mark.parametrize(
+    ("error", "case", "stage"),
+    [
+        ("MANAGED_TABLE_DATASOURCE_UNSUPPORTED(code=2011)", "SQL-001", "dlc_sql_execution"),
+        ("AUTH_ACCESS_ERROR(code=2045)", "PERM-002", "dlc_authorization"),
+        (
+            "User:100000000001 does not have permission to use this computing engine",
+            "PERM-001",
+            "dlc_engine_authorization",
+        ),
+    ],
+)
+def test_dlc_failed_task_uses_safe_wedata_diagnostics(tmp_path, error, case, stage):
+    settings = dlc_settings(tmp_path)
+    client = FailedTaskClient(error)
+    principal = DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+
+    result = DlcQueryExecutor(settings, client).run(
+        principal,
+        "SELECT order_id FROM analytics.orders",
+        timeout_seconds=10,
+    )
+
+    assert result.status == Status.ERROR
+    assert result.diagnostic_source == "wedata-tencent-workflow"
+    assert result.diagnostic_case == case
+    assert result.failure_stage == stage
+    assert result.failure_action == "DescribeTasks"
+    assert result.diagnostic_summary
+    assert result.suggested_action
+    assert error not in result.model_dump_json()
 
 
 def test_dlc_denies_unlisted_table_before_describe(tmp_path):
@@ -374,6 +447,93 @@ def test_dlc_denies_unlisted_table_before_describe(tmp_path):
     with pytest.raises(MetadataAccessDenied):
         catalog.describe_table("analytics.payments", principal)
     assert not any(action == "DescribeTable" for action, _, _ in client.calls)
+
+
+def test_dlc_discovers_and_verifies_authorized_table_from_business_phrase(tmp_path):
+    settings = dlc_settings(tmp_path)
+    client = FakeDlcClient()
+    principal = DlcPrincipalResolver(settings, client).resolve(UserContext(union_id="on_user"))
+    catalog = DlcMetadataCatalog(settings, client)
+
+    candidates = catalog.suggest_tables("昨天店铺表数据量", limit=5, credential=principal)
+
+    assert [table.full_name for table in candidates] == ["analytics.merchant_shop"]
+    assert candidates[0].partition_fields == ["dt"]
+    assert candidates[0].columns[0].name == "merchant_shop_id"
+    assert any(action == "DescribeDMSTables" for action, _, _ in client.calls)
+    described = [
+        payload["TableName"]
+        for action, payload, _ in client.calls
+        if action == "DescribeTable"
+    ]
+    assert described == ["merchant_shop"]
+
+
+def test_service_dlc_table_search_is_caller_bound_and_auditable(tmp_path):
+    settings = dlc_settings(tmp_path)
+    client = FakeDlcClient()
+    adapter = DataSourceAdapter(
+        datasource="dlc",
+        adapter="tencent_dlc",
+        credentials=DlcPrincipalResolver(settings, client),
+        sql_guard=SqlGuard(
+            settings,
+            DlcMetadataCatalog(settings, client),
+            datasource="dlc",
+            dialect="presto",
+        ),
+        executor=DlcQueryExecutor(settings, client),
+    )
+    base = build_container(settings.model_copy(update={"enabled_datasources": "tchouse-c"}))
+    service = DataMcpService(replace(base, data_sources=DataSourceRegistry([adapter])))
+
+    result = service.search_dlc_tables_for_user(
+        "on_user",
+        "ou_user",
+        "昨天店铺表数据量",
+        "cli_test",
+        audit_context={"sender_type": "user", "turn_id": "turn_test"},
+    )
+
+    assert result["status"] == Status.SUCCESS
+    assert result["requires_confirmation"] is False
+    assert [row["full_name"] for row in result["candidates"]] == [
+        "analytics.merchant_shop"
+    ]
+    assert result["candidates"][0]["authoritative"] is True
+
+
+def test_service_dlc_table_search_rejects_bot_before_metadata_lookup(tmp_path):
+    settings = dlc_settings(tmp_path)
+    client = FakeDlcClient()
+    adapter = DataSourceAdapter(
+        datasource="dlc",
+        adapter="tencent_dlc",
+        credentials=DlcPrincipalResolver(settings, client),
+        sql_guard=SqlGuard(
+            settings,
+            DlcMetadataCatalog(settings, client),
+            datasource="dlc",
+            dialect="presto",
+        ),
+        executor=DlcQueryExecutor(settings, client),
+    )
+    base = build_container(settings.model_copy(update={"enabled_datasources": "tchouse-c"}))
+    service = DataMcpService(replace(base, data_sources=DataSourceRegistry([adapter])))
+
+    result = service.search_dlc_tables_for_user(
+        "on_user",
+        "ou_bot",
+        "店铺表",
+        "cli_test",
+        audit_context={"sender_type": "bot", "turn_id": "turn_test"},
+    )
+
+    assert result["status"] == Status.VALIDATION_ERROR
+    assert {issue["code"] for issue in result["issues"]} == {
+        "trusted_human_or_schedule_required"
+    }
+    assert client.calls == []
 
 
 def test_dlc_rejects_cross_catalog_sql(tmp_path):

@@ -25,6 +25,7 @@ input.on('line', async line => {
     process.stdout.write(`${JSON.stringify({
       ok: false,
       error: error instanceof Error ? error.message : 'result_agent_worker_failed',
+      audit: error instanceof Error ? error.resultAgentAudit : undefined,
       agentPid: process.pid,
     })}\n`);
   } finally {

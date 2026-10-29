@@ -127,14 +127,19 @@ def test_dlc_permission_resolution_has_bounded_default_timeouts() -> None:
 
     assert settings.dlc_permission_timeout_seconds == 20
     assert settings.dlc_operation_timeout_seconds == 45
+    assert settings.dlc_query_timeout_seconds == 60
     assert settings.dlc_api_call_timeout_seconds == 6
     assert settings.dlc_api_max_attempts == 2
     assert settings.dlc_permission_timeout_seconds < settings.query_timeout_seconds
+    assert Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=90).dlc_operation_timeout_seconds == 90
+    assert Settings(DATA_MCP_DLC_QUERY_TIMEOUT_SECONDS=180).dlc_query_timeout_seconds == 180
 
     with pytest.raises(ValueError):
         Settings(DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS=46)
     with pytest.raises(ValueError):
-        Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=51)
+        Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=181)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_QUERY_TIMEOUT_SECONDS=181)
     with pytest.raises(ValueError):
         Settings(DATA_MCP_DLC_API_MAX_ATTEMPTS=4)
 

@@ -28,6 +28,7 @@ def test_context_is_derived_from_validated_sql_and_bound_to_result_schema() -> N
     )
     assert context["provenance"] == "data_mcp_validated_query_plan"
     assert context["metric_columns"] == ["stat_date", "total"]
+    assert context["metric_expressions"] == ["stat_date", "sum(amount) AS total"]
     assert context["grouping_columns"] == ["stat_date"]
     assert context["filter_predicates"] == [
         "stat_date >= '2026-03-01'",

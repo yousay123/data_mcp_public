@@ -25,7 +25,7 @@ const modelServer = createServer((req, res) => {
   req.on('end', () => {
     const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     requests.push({ payload, authorization: req.headers.authorization });
-    res.writeHead(200, { 'content-type': 'application/json' });
+    res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' });
     if (payload.tool_choice === 'none') {
       res.end(JSON.stringify({ choices: [{ message: { content: '已按同一查询结果生成全部产物。' } }] }));
       return;
@@ -80,7 +80,21 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
-    res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: toolCalls } }] }));
+    if (responseMode === 'row-count') {
+      const call = {
+        id: 'count', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }] }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    res.end(JSON.stringify({
+      id: 'resp_result_agent_fixture', model: 'internal-test-model-resolved',
+      choices: [{ message: { content: null, tool_calls: toolCalls } }],
+    }));
   });
 });
 await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve));
@@ -114,8 +128,24 @@ const delivered = await runInternalResultAgent({
   runtimeConfig,
   pluginHome,
 });
+if (!delivered.markdown.includes('## 查询口径')
+  || !delivered.markdown.includes('synthetic.events')
+  || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
+  throw new Error('analysis did not combine result and query scope');
+}
 if (delivered.files.length !== 4 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
   throw new Error('result Agent did not create every requested artifact');
+}
+if (delivered.audit?.status !== 'succeeded'
+  || delivered.audit.modelId !== 'internal-test-model'
+  || delivered.audit.responseModel !== 'internal-test-model-resolved'
+  || delivered.audit.requestId !== 'req_result_agent_fixture'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1'
+  || delivered.audit.inputRowCount !== 2
+  || delivered.audit.httpStatus !== 200
+  || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
+    .every(value => /^[a-f0-9]{64}$/.test(value))) {
+  throw new Error('result Agent did not return a complete privacy-safe audit trace');
 }
 if (requests.length !== 1 || requests.some(entry => entry.authorization !== 'Bearer internal-test-key')) {
   throw new Error('result Agent model loop or authentication is incorrect');
@@ -131,6 +161,39 @@ const expectedTools = ['create_analysis', 'create_excel', 'create_pdf', 'create_
 for (const name of expectedTools) {
   if (!firstRequest.tools.some(tool => tool.function?.name === name)) throw new Error(`missing Agent tool ${name}`);
 }
+
+responseMode = 'row-count';
+const rowCountResult = {
+  status: 'success', datasource: 'dlc', row_count: 1,
+  columns: [{ name: 'row_count', type: 'BIGINT' }],
+  rows: [{ row_count: 1261699 }],
+  truncated: false, quality_warnings: [],
+  result_context: canonicalContext([{ name: 'row_count', type: 'BIGINT' }], {
+    datasource: 'dlc',
+    tables: ['ksher_dim.dim_kgp_va_account'],
+    metric_columns: ['row_count'],
+    metric_expressions: ['COUNT(*) AS row_count'],
+    filter_predicates: ["ds = '20261027'"],
+    time_range_predicates: ["ds = '20261027'"],
+  }),
+};
+const rowCountDelivery = await runInternalResultAgent({
+  result: rowCountResult,
+  question: '查询昨天数据量', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+for (const expected of [
+  '**数据量：1,261,699 行**',
+  '## 查询口径',
+  'DLC',
+  'ksher_dim.dim_kgp_va_account',
+  'COUNT(*) AS row_count',
+  "ds = '20261027'",
+]) {
+  if (!rowCountDelivery.markdown.includes(expected)) {
+    throw new Error(`beautified count delivery missing ${expected}`);
+  }
+}
+responseMode = 'tools';
 for (const call of firstRequest.tools) {
   if (JSON.stringify(call).includes('sql')) throw new Error('result Agent tool schema leaked SQL');
 }
@@ -230,10 +293,10 @@ const precision = await runInternalResultAgent({
   pluginHome,
 });
 const exactClaims = [
-  'amount（sum）：9007199254740989.51',
-  'amount（average）：3002399751580329.836667',
-  'amount（minimum）：-3.50',
-  'amount（maximum）：9007199254740993.00',
+  '- **amount（合计）**：9,007,199,254,740,989.51',
+  '- **amount（平均值）**：3,002,399,751,580,329.836667',
+  '- **amount（最小值）**：-3.50',
+  '- **amount（最大值）**：9,007,199,254,740,993.00',
 ];
 for (const claim of exactClaims) {
   if (!precision.markdown.includes(claim)) throw new Error(`missing exact analysis claim: ${claim}`);
@@ -259,7 +322,7 @@ const decimalResult = {
 const decimalSum = await runInternalResultAgent({
   result: decimalResult, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!decimalSum.markdown.includes('amount（sum）：0.30')) {
+if (!decimalSum.markdown.includes('amount（合计）**：0.30')) {
   throw new Error(`decimal addition lost scale or precision: ${decimalSum.markdown}`);
 }
 const negativeSum = await runInternalResultAgent({
@@ -274,7 +337,7 @@ const negativeSum = await runInternalResultAgent({
   },
   question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!negativeSum.markdown.includes('amount（sum）：-5.00')) {
+if (!negativeSum.markdown.includes('amount（合计）**：-5.00')) {
   throw new Error(`negative decimal aggregation is incorrect: ${negativeSum.markdown}`);
 }
 for (const invalid of ['not-a-number', 9007199254740992]) {
@@ -311,6 +374,10 @@ const isolated = await runIsolatedResultAgent({
 });
 if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
+}
+if (isolated.audit?.modelId !== 'internal-test-model'
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1') {
+  throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
 

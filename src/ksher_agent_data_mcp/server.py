@@ -157,6 +157,24 @@ def search_metadata_snapshot(
 
 
 @mcp.tool()
+def search_dlc_tables_for_user(
+    query: Annotated[str, Field(min_length=1, max_length=500)],
+    limit: Annotated[int, Field(ge=1, le=20)] = 5,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Find authoritative DLC table candidates under the trusted caller identity."""
+    identity = _required_hidden_identity(ctx)
+    return service.search_dlc_tables_for_user(
+        request_user_union_id=identity["request_user_union_id"],
+        request_user_open_id=identity.get("request_user_open_id"),
+        request_lark_app_id=identity.get("request_lark_app_id"),
+        query=query,
+        limit=limit,
+        audit_context=_audit_context(identity),
+    )
+
+
+@mcp.tool()
 def inspect_ck_subjects_by_table(
     target_tables: list[str], ctx: Context | None = None
 ) -> dict[str, Any]:

@@ -20,6 +20,17 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v1';
+
+function sha256(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function attachAudit(error, audit) {
+  const normalized = error instanceof Error ? error : new Error('result_agent_failed');
+  normalized.resultAgentAudit = { ...audit, status: 'failed' };
+  return normalized;
+}
 
 function modelConfig(runtimeConfig) {
   const endpointValue = runtimeConfig.value('DATA_MCP_RESULT_MODEL_ENDPOINT');
@@ -37,6 +48,7 @@ function modelConfig(runtimeConfig) {
 }
 
 async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
+  const startedAt = Date.now();
   const body = JSON.stringify(payload);
   if (Buffer.byteLength(body) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const pinned = await resolvePrivateModelAddress(config.endpoint.hostname, undefined, {
@@ -60,6 +72,7 @@ async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
       res.on('end', () => resolvePromise({
         ok: res.statusCode >= 200 && res.statusCode < 300,
         status: res.statusCode,
+        requestId: res.headers['x-request-id'] || res.headers['request-id'],
         text: Buffer.concat(chunks).toString('utf8'),
       }));
     });
@@ -67,12 +80,38 @@ async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
     req.on('error', rejectPromise);
     req.end(body);
   });
-  if (!response.ok) throw new Error(`result_agent_http_${response.status}`);
+  const responseTrace = {
+    requestId: typeof response.requestId === 'string' ? response.requestId : null,
+    latencyMs: Date.now() - startedAt,
+    httpStatus: response.status,
+  };
+  if (!response.ok) {
+    const error = new Error(`result_agent_http_${response.status}`);
+    error.modelTrace = responseTrace;
+    throw error;
+  }
   let parsed;
-  try { parsed = JSON.parse(response.text); } catch { throw new Error('result_agent_invalid_json'); }
+  try { parsed = JSON.parse(response.text); } catch {
+    const error = new Error('result_agent_invalid_json');
+    error.modelTrace = responseTrace;
+    throw error;
+  }
   const message = parsed?.choices?.[0]?.message;
-  if (!message || typeof message !== 'object') throw new Error('result_agent_invalid_response');
-  return message;
+  if (!message || typeof message !== 'object') {
+    const error = new Error('result_agent_invalid_response');
+    error.modelTrace = responseTrace;
+    throw error;
+  }
+  return {
+    message,
+    trace: {
+      requestId: responseTrace.requestId || parsed?.id,
+      responseModel: typeof parsed?.model === 'string' ? parsed.model : null,
+      outputHash: sha256(stableJson(message)),
+      latencyMs: responseTrace.latencyMs,
+      httpStatus: responseTrace.httpStatus,
+    },
+  };
 }
 
 function columnNames(result) {
@@ -138,7 +177,7 @@ function validateCanonicalContext(value) {
   const unsigned = { ...value };
   delete unsigned.integrity;
   const expected = createHash('sha256').update(stableJson(unsigned)).digest('hex');
-  const stringArrays = ['tables', 'metric_columns', 'filter_predicates', 'time_range_predicates', 'grouping_columns'];
+  const stringArrays = ['tables', 'metric_columns', 'metric_expressions', 'filter_predicates', 'time_range_predicates', 'grouping_columns'];
   if (value.schema_version !== 1
     || value.provenance !== 'data_mcp_validated_query_plan'
     || typeof value.datasource !== 'string'
@@ -349,6 +388,46 @@ function formatDecimal(coefficient, scale, minimumScale = scale) {
   return `${negative ? '-' : ''}${integer}${fraction ? `.${fraction}` : ''}`;
 }
 
+function groupedNumber(value) {
+  const text = String(value);
+  const match = text.match(/^(-?)(\d+)(\.\d+)?$/);
+  if (!match) return text;
+  return `${match[1]}${match[2].replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${match[3] || ''}`;
+}
+
+function markdownTableCell(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('|', '\\|')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+function queryContextLines(envelope) {
+  const context = envelope.manifest.context;
+  const rows = [
+    ['数据源', String(context.datasource).toUpperCase()],
+    ['数据表', context.tables.join('、')],
+    ['统计口径', context.metric_expressions.join('、')],
+  ];
+  if (context.time_range_predicates.length) {
+    rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
+  }
+  const otherFilters = context.filter_predicates.filter(
+    predicate => !context.time_range_predicates.includes(predicate),
+  );
+  if (otherFilters.length) rows.push(['其他过滤', otherFilters.join(' AND ')]);
+  if (context.grouping_columns.length) rows.push(['分组字段', context.grouping_columns.join('、')]);
+  return [
+    '## 查询口径',
+    '',
+    '| 口径项 | 内容 |',
+    '| --- | --- |',
+    ...rows.map(([label, value]) => `| ${label} | ${markdownTableCell(value)} |`),
+  ];
+}
+
 function roundedDivide(numerator, denominator) {
   if (denominator <= 0n) throw new Error('result_agent_invalid_claim_value');
   const negative = numerator < 0n;
@@ -368,7 +447,7 @@ function computedClaims(args, envelope) {
     if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(operation)) {
       throw new Error('result_agent_invalid_claim_operation');
     }
-    if (operation === 'count') return `记录数（count）：${envelope.rows.length}`;
+    if (operation === 'count') return `**返回记录数：${groupedNumber(envelope.rows.length)} 行**`;
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
     if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
     const values = envelope.rows.map(row => parseDecimal(row[column])).filter(value => value !== null);
@@ -386,15 +465,20 @@ function computedClaims(args, envelope) {
       outputScale = Math.min(100, Math.max(scale, 6));
       coefficient = roundedDivide(coefficient * powerOfTen(outputScale - scale), BigInt(exact.length));
     }
-    const value = formatDecimal(coefficient, outputScale, scale);
-    return `${column}（${operation}）：${value}`;
+    const value = groupedNumber(formatDecimal(coefficient, outputScale, scale));
+    if (column.toLowerCase() === 'row_count') return `**数据量：${value} 行**`;
+    const operationLabel = {
+      sum: '合计', average: '平均值', minimum: '最小值', maximum: '最大值',
+    }[operation];
+    return `- **${column}（${operationLabel}）**：${value}`;
   });
 }
 
 function narrativeLines(args, envelope) {
-  const lines = ['查询结果', ''];
+  const lines = ['查询结果', '', '## 数据结论', ''];
   const claims = computedClaims(args, envelope);
-  if (claims.length) lines.push('数据结论', ...claims, '');
+  if (claims.length) lines.push(...claims, '');
+  lines.push(...queryContextLines(envelope), '');
   return lines;
 }
 
@@ -554,20 +638,42 @@ export async function runInternalResultAgent(options) {
     },
     { role: 'user', content: serialized },
   ];
-  const first = await postModel(config, {
-    model: config.model,
-    temperature: 0,
-    messages,
-    tools: toolDefinitions(),
-    tool_choice: 'required',
-  }, options.runtimeConfig, options.onTestExceptionUsed);
-  const calls = Array.isArray(first.tool_calls) ? first.tool_calls.map(parseToolCall) : [];
-  if (!calls.length) throw new Error('result_agent_tool_call_required');
-  if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
-    throw new Error('result_agent_unrequested_tool');
+  const tools = toolDefinitions();
+  const baseAudit = {
+    schemaVersion: 1,
+    status: 'started',
+    modelId: config.model,
+    endpointHost: config.endpoint.hostname,
+    promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
+    promptTemplateHash: sha256(messages[0].content),
+    inputHash: sha256(serialized),
+    inputRowCount: envelope.rows.length,
+  };
+  let modelResponse;
+  try {
+    modelResponse = await postModel(config, {
+      model: config.model,
+      temperature: 0,
+      messages,
+      tools,
+      tool_choice: 'required',
+    }, options.runtimeConfig, options.onTestExceptionUsed);
+  } catch (error) {
+    throw attachAudit(error, { ...baseAudit, ...(error?.modelTrace || {}) });
   }
-  for (const output of outputs) {
-    if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
+  const first = modelResponse.message;
+  let calls;
+  try {
+    calls = Array.isArray(first.tool_calls) ? first.tool_calls.map(parseToolCall) : [];
+    if (!calls.length) throw new Error('result_agent_tool_call_required');
+    if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
+      throw new Error('result_agent_unrequested_tool');
+    }
+    for (const output of outputs) {
+      if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
+    }
+  } catch (error) {
+    throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
   }
   const artifacts = [];
   try {
@@ -587,11 +693,16 @@ export async function runInternalResultAgent(options) {
       files: artifacts.map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),
       artifactTypes: artifacts.map(artifact => artifact.type),
       manifest: envelope.manifest,
+      audit: {
+        ...baseAudit,
+        ...modelResponse.trace,
+        status: 'succeeded',
+      },
     };
   } catch (error) {
     for (const artifact of artifacts) {
       try { unlinkSync(artifact.path); } catch { /* best effort */ }
     }
-    throw error;
+    throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
   }
 }

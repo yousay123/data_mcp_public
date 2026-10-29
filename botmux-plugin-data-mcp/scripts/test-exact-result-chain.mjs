@@ -126,10 +126,10 @@ const delivery = records.find(record => record.args[0] === 'send' && record.file
 if (!delivery) throw new Error('trusted delivery did not capture every exact artifact');
 const deliveredText = records.map(record => record.content || '').join('\n');
 const exactClaims = [
-  'amount（sum）：9007199254740989.51',
-  'amount（average）：3002399751580329.836667',
-  'amount（minimum）：-3.50',
-  'amount（maximum）：9007199254740993.00',
+  '- **amount（合计）**：9,007,199,254,740,989.51',
+  '- **amount（平均值）**：3,002,399,751,580,329.836667',
+  '- **amount（最小值）**：-3.50',
+  '- **amount（最大值）**：9,007,199,254,740,993.00',
 ];
 for (const claim of exactClaims) {
   if (!deliveredText.includes(claim)) {

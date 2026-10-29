@@ -166,6 +166,9 @@ for (const requiredDescriptionRule of [
 }
 for (const requiredRule of [
   'Never rely on the tool schema\'s default data source',
+  'When the current user request does not name a data source, default to',
+  'Treat each new query request as a fresh source choice',
+  '`search_dlc_tables_for_user` only when the current request explicitly names',
   'For `dlc` with a fully qualified table, do not call',
   'validation performs live DLC principal, table metadata, partition, engine,',
 ]) {
@@ -1131,6 +1134,15 @@ try {
         !== JSON.stringify(['tchouse-c', 'dlc'])
       ) {
         fail(`${name} datasource schema must expose the configured datasource registry`);
+      }
+      if (schema?.properties?.datasource?.default !== 'tchouse-c') {
+        fail(`${name} datasource schema must default to tchouse-c when it is enabled`);
+      }
+    }
+    const dlcDiscoveryDescription = tools.find(tool => tool.name === 'search_dlc_tables_for_user')?.description ?? '';
+    for (const requiredText of ['explicitly names DLC/WeData', 'default to TChouse-C/ClickHouse', 'never infer DLC from an earlier query or test']) {
+      if (!dlcDiscoveryDescription.includes(requiredText)) {
+        fail(`search_dlc_tables_for_user description is missing datasource routing guard: ${requiredText}`);
       }
     }
     if (

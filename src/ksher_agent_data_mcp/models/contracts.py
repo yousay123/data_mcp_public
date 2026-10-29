@@ -167,6 +167,12 @@ class QueryResult(BaseModel):
     error_code: str | None = None
     error_name: str | None = None
     retryable: bool = False
+    failure_stage: str | None = None
+    failure_action: str | None = None
+    diagnostic_source: str | None = None
+    diagnostic_case: str | None = None
+    diagnostic_summary: str | None = None
+    suggested_action: str | None = None
 
 
 def mask_jdbc_url(jdbc_url: str) -> str:

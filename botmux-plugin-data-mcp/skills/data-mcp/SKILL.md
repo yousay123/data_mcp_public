@@ -36,17 +36,23 @@ Choose the data source before metadata discovery or SQL generation:
 
 1. When the user explicitly names DLC, use `datasource=dlc`. When the user
    explicitly names ClickHouse, CK, or TChouse-C, use `datasource=tchouse-c`.
-2. Never rely on the tool schema's default data source when more than one data
-   source is enabled. Never silently retry or fall back to a different source.
-3. If the user does not identify a data source and the confirmed context does
-   not determine one uniquely, ask which source to use.
+2. When the current user request does not name a data source, default to
+   `datasource=tchouse-c`. Treat each new query request as a fresh source choice:
+   a DLC choice from an earlier query or test must not leak into it. Only a
+   clearly worded continuation of the same query may inherit its confirmed
+   source.
+3. Never rely on the tool schema's default data source when more than one data
+   source is enabled. Select the source explicitly under rules 1-2, and never
+   silently retry or fall back to a different source.
 
 When the user describes a metric, topic, or business object instead of a table:
 
 1. For `tchouse-c`, call `search_metadata_snapshot` first; never query the
-   online metadata dictionary as an automatic fallback. For `dlc`, ask for a
-   fully qualified table when one has not been supplied; the CK snapshot is not
-   a DLC discovery source.
+   online metadata dictionary as an automatic fallback. Call
+   `search_dlc_tables_for_user` only when the current request explicitly names
+   DLC/WeData or is a clear continuation of an already confirmed DLC query.
+   A business phrase, table nickname, or earlier DLC test is not evidence that
+   the current request wants DLC. The CK snapshot is not a DLC discovery source.
 2. Identify candidate tables, fields, partitions, and metric definitions.
 3. Ask for clarification when the business scope, date range, region, or metric
    definition is ambiguous.
@@ -55,7 +61,13 @@ When the user describes a metric, topic, or business object instead of a table:
 6. Execute only read-only queries after validation succeeds. Follow the tools
    actually registered for this Bot:
    - when `deliver_query_result_for_user` is present, use it; rows, analysis,
-     and files stay on the isolated delivery path;
+     and files stay on the isolated result-Agent path. For analysis-only
+     output, the tool returns only the internal result model's safe final
+     markdown to the calling model; reply with that markdown once as the normal
+     final response. Do not split query scope and result into separate messages
+     and do not create a separate result-access card. When the handoff contains
+     attachments, send them directly to the original group/topic/private chat
+     with the same final reply, exactly as requested by the user;
    - when it is absent, this Bot is explicitly configured for single-model
      operation: use `run_query_for_user`; the calling model must create any
      requested file with its own artifact skill/tool. In this mode query rows
@@ -122,6 +134,14 @@ When the user names a table directly:
 9. Treat `expires_at` as best-effort local retention metadata. Data MCP cleans
    expired export directories before later exports, but the plugin still deletes
    the staged local file after each delivery attempt.
+10. DLC failures use the controlled `wedata-tencent-workflow` troubleshooting
+    path. Validation returns bounded safe issue codes and suggested actions.
+    Execution failures are classified from the trusted DLC task state and safe
+    error evidence, then delivered as a deterministic failure card containing
+    the stage, safe error code, retryability, plan/query identifiers, matching
+    WeData case id when available, and the next diagnostic action. Never ask the
+    user to paste raw DLC responses or credentials, never expose the upstream
+    response body, and never retry an ambiguously completed plan.
 
 ## Safety Rules
 
@@ -143,8 +163,13 @@ The plugin MCP server exposes:
   single-model mode; in dual-model mode it is fail-closed.
 - `deliver_query_result_for_user`: executes one validated plan once, gives
   rows/schema/context to the internal result Agent, and delivers Agent-authored
-  analysis and requested Excel/PDF/chart/document artifacts to the signed
-  original Feishu message. The calling model receives only a delivery receipt.
+  analysis and requested Excel/PDF/chart/document artifacts.
+  `response_mode=model_handoff` returns `final_markdown` authored by the internal
+  result model plus zero or more attachment paths. The calling model must send
+  the markdown once as its normal final reply and attach every returned file
+  directly to the original group/topic/private chat with `botmux send --files`.
+  Keep result and query scope together. Never replace the response with a
+  protected result-access or download-entry card.
 - `continue_query_result_for_user`: use for an unambiguous follow-up about the
   current caller-bound result without querying again. Pass only the user's
   follow-up text and explicit `requested_outputs`. Never invent or pass a

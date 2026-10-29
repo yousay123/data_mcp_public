@@ -228,12 +228,15 @@ function configValue(name) {
 if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
   console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
 }
-if (process.env.DATA_MCP_TEST_PROFILE_APP_ID || process.env.DATA_MCP_TEST_PROFILE_ENV_FILE) {
+if (configValue('DATA_MCP_TEST_PROFILE_APP_ID') || configValue('DATA_MCP_TEST_PROFILE_ENV_FILE')) {
   console.error('[data-mcp] WARN signed-app test profile selection is configured');
 }
 
 function runtimeConfigForCaller(caller) {
-  const profile = resolveSignedAppTestProfile(caller);
+  const profile = resolveSignedAppTestProfile(caller, {
+    DATA_MCP_TEST_PROFILE_APP_ID: configValue('DATA_MCP_TEST_PROFILE_APP_ID'),
+    DATA_MCP_TEST_PROFILE_ENV_FILE: configValue('DATA_MCP_TEST_PROFILE_ENV_FILE'),
+  });
   return Object.freeze({
     testProfileSelected: profile !== undefined,
     value(name) {
@@ -258,6 +261,10 @@ function enabledDatasourceIds() {
     .map((value) => value.trim().toLowerCase())
     .filter((value) => /^[a-z0-9][a-z0-9-]*$/.test(value));
   return [...new Set(values.length ? values : ['tchouse-c'])];
+}
+
+function defaultDatasourceId(datasourceIds) {
+  return datasourceIds.includes('tchouse-c') ? 'tchouse-c' : datasourceIds[0];
 }
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
@@ -451,10 +458,32 @@ function collapsedValidationDetail(caller) {
 
 function sanitizeValidationResult(body) {
   if (!body || body.status !== 'success') {
+    const issues = Array.isArray(body?.issues)
+      ? body.issues.slice(0, 20).flatMap(issue => {
+        if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return [];
+        const code = typeof issue.code === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(issue.code)
+          ? issue.code : null;
+        if (!code) return [];
+        return [{
+          code,
+          severity: typeof issue.severity === 'string' && /^[a-z]{1,20}$/.test(issue.severity)
+            ? issue.severity : 'error',
+          ...(typeof issue.message === 'string' && issue.message.length <= 500
+            ? { message: issue.message } : {}),
+          ...(typeof issue.suggested_action === 'string' && issue.suggested_action.length <= 500
+            ? { suggested_action: issue.suggested_action } : {}),
+        }];
+      })
+      : [];
+    const directCode = typeof body?.error_code === 'string'
+      && /^[A-Za-z0-9_.-]{1,128}$/.test(body.error_code)
+      ? body.error_code : null;
     return {
       status: 'validation_error',
-      error_code: 'sql_validation_failed',
-      message: 'sql_validation_failed',
+      error_code: directCode || (issues.length === 1 ? issues[0].code : 'sql_validation_failed'),
+      message: issues.length === 1 && issues[0].message
+        ? issues[0].message : 'SQL 校验失败，请根据安全问题码修正后重新校验',
+      ...(issues.length ? { issues } : {}),
     };
   }
   const result = {
@@ -547,6 +576,7 @@ function servicePath(kind) {
   if (kind === 'run') return '/agent/run-query';
   if (kind === 'refreshSnapshot') return '/agent/refresh-metadata-snapshot';
   if (kind === 'searchSnapshot') return '/agent/search-metadata-snapshot';
+  if (kind === 'searchDlcTables') return '/agent/search-dlc-tables';
   if (kind === 'subjectsByTable') return '/agent/inspect-ck-subjects-by-table';
   if (kind === 'resourcesBySubject') return '/agent/inspect-ck-resources-by-subject';
   if (kind === 'defaultRoleBaseline') return '/agent/audit-ck-default-role-baseline';
@@ -664,6 +694,27 @@ async function runResultAgent(result, args, runtimeConfig, timeoutMs) {
   });
 }
 
+function resultAgentAuditDetail(trace, result) {
+  const detail = trace && typeof trace === 'object' && !Array.isArray(trace) ? trace : {};
+  return {
+    stage: 'result_agent',
+    action: 'model_request',
+    queryId: result?.query_id,
+    providerTaskId: result?.datasource === 'dlc' ? result.query_id : undefined,
+    modelId: detail.modelId,
+    responseModel: detail.responseModel,
+    endpointHost: detail.endpointHost,
+    requestId: detail.requestId,
+    promptTemplateVersion: detail.promptTemplateVersion,
+    promptTemplateHash: detail.promptTemplateHash,
+    inputHash: detail.inputHash,
+    outputHash: detail.outputHash,
+    inputRowCount: detail.inputRowCount,
+    latencyMs: detail.latencyMs,
+    httpStatus: detail.httpStatus,
+  };
+}
+
 function resultAgentAuditStatus(error) {
   const code = error instanceof Error ? error.message : '';
   const safeCodes = new Set([
@@ -681,6 +732,7 @@ function resultAgentAuditStatus(error) {
     'result_agent_worker_failed',
     'result_agent_process_isolation_failed',
     'result_agent_context_missing',
+    'result_model_network_not_private',
   ]);
   if (/^result_agent_http_[1-5][0-9]{2}$/.test(code)) return code;
   return safeCodes.has(code) ? code : 'result_agent_failed';
@@ -688,7 +740,8 @@ function resultAgentAuditStatus(error) {
 
 function resultAgentAuditAction(errorCode) {
   if (errorCode === 'result_agent_not_configured') return 'model_config';
-  if (errorCode === 'result_agent_endpoint_not_allowed') return 'endpoint_validation';
+  if (errorCode === 'result_agent_endpoint_not_allowed'
+    || errorCode === 'result_model_network_not_private') return 'endpoint_validation';
   if (errorCode === 'result_agent_timeout' || errorCode.startsWith('result_agent_http_')) return 'model_request';
   if (errorCode.includes('context') || errorCode.includes('schema') || errorCode.includes('rows')) {
     return 'result_validation';
@@ -720,6 +773,28 @@ function markdownCell(value) {
     .replace(/[\r\n]+/g, ' ');
 }
 
+function deterministicContextLines(result) {
+  const context = result?.result_context;
+  if (!context || typeof context !== 'object') return [];
+  const rows = [
+    ['数据源', String(context.datasource || result.datasource || '').toUpperCase()],
+    ['数据表', Array.isArray(context.tables) ? context.tables.join('、') : ''],
+    ['统计口径', Array.isArray(context.metric_expressions)
+      ? context.metric_expressions.join('、') : ''],
+  ].filter(([, value]) => value);
+  if (Array.isArray(context.time_range_predicates) && context.time_range_predicates.length) {
+    rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
+  }
+  if (!rows.length) return [];
+  return [
+    '## 查询口径',
+    '',
+    '| 口径项 | 内容 |',
+    '| --- | --- |',
+    ...rows.map(([label, value]) => `| ${label} | ${markdownCell(value)} |`),
+  ];
+}
+
 function deterministicAnalysisFallback(result, args) {
   const outputs = requestedOutputs(args);
   if (outputs.length !== 1 || outputs[0] !== 'analysis') return null;
@@ -735,14 +810,108 @@ function deterministicAnalysisFallback(result, args) {
     throw new Error('deterministic_fallback_invalid_row');
   });
   const markdown = [
-    '查询已完成。结果代理暂不可用，以下为受控查询返回的原始结果，未作额外口径推断：',
+    '# 查询结果',
+    '',
+    '> 结果代理暂不可用，以下为受控查询返回的原始结果，未作额外口径推断。',
+    '',
+    '## 数据明细',
     '',
     `| ${columns.map(markdownCell).join(' | ')} |`,
     `| ${columns.map(() => '---').join(' | ')} |`,
     ...renderedRows.map(row => `| ${row.join(' | ')} |`),
+    '',
+    ...deterministicContextLines(result),
   ].join('\n');
   if (Buffer.byteLength(markdown) > 16 * 1024) return null;
   return { markdown, files: [] };
+}
+
+function safeDiagnosticText(value, fallback, max = 500) {
+  return typeof value === 'string' && value.trim() && value.length <= max
+    ? value.trim() : fallback;
+}
+
+function safeDiagnosticCode(value, fallback) {
+  return typeof value === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(value)
+    ? value : fallback;
+}
+
+function deterministicDlcFailure(result, args) {
+  if (!result || result.status === 'success'
+    || (result.datasource !== 'dlc' && args.datasource !== 'dlc')) return null;
+  const errorCode = safeDiagnosticCode(result.error_code, 'dlc_query_failed');
+  const failureStage = safeDiagnosticCode(result.failure_stage, 'dlc_task_execution');
+  const failureAction = safeDiagnosticCode(result.failure_action, null);
+  const diagnosticCase = result.diagnostic_case == null
+    ? null : safeDiagnosticCode(result.diagnostic_case, null);
+  const queryId = safeDiagnosticCode(result.query_id, null);
+  const planId = safeDiagnosticCode(args.query_plan_id, null);
+  const diagnosis = safeDiagnosticText(
+    result.diagnostic_summary,
+    `DLC 查询失败（${errorCode}）`,
+  );
+  const suggestedAction = safeDiagnosticText(
+    result.suggested_action,
+    '请维护方根据安全错误码和查询标识检查 DLC 审计后再处理',
+  );
+  const details = [
+    ['失败阶段', failureStage],
+    ...(failureAction ? [['失败动作', failureAction]] : []),
+    ['安全错误码', errorCode],
+    ['可重试', result.retryable === true ? '是；确认上游状态后再重试' : '否；先完成排障'],
+    ...(diagnosticCase ? [['WeData 排障案例', diagnosticCase]] : []),
+    ...(planId ? [['查询计划', planId]] : []),
+    ...(queryId ? [['DLC Query ID', queryId]] : []),
+  ];
+  return {
+    markdown: [
+      '# DLC 查询失败',
+      '',
+      '## 排查结论',
+      '',
+      diagnosis,
+      '',
+      '## 故障信息',
+      '',
+      '| 项目 | 内容 |',
+      '| --- | --- |',
+      ...details.map(([label, value]) => `| ${markdownCell(label)} | ${markdownCell(value)} |`),
+      '',
+      '## 建议处理',
+      '',
+      suggestedAction,
+      '',
+      '> 排障基于 WeData Skill 的受控 DLC 调用链路和案例规则；未向模型或消息暴露凭证、原始响应体及账号敏感信息。',
+    ].join('\n'),
+    files: [],
+  };
+}
+
+function deterministicResultAgentFailure(result, args, errorCode) {
+  const queryId = safeDiagnosticCode(result?.query_id, null);
+  const planId = safeDiagnosticCode(args.query_plan_id, null);
+  const action = resultAgentAuditAction(errorCode);
+  const details = [
+    ['失败阶段', 'result_agent'],
+    ['失败动作', action],
+    ['安全错误码', errorCode],
+    ...(planId ? [['查询计划', planId]] : []),
+    ...(queryId ? [['Query ID', queryId]] : []),
+  ];
+  return {
+    markdown: [
+      '# 查询结果处理失败',
+      '',
+      '数据查询已经完成，但内网结果模型未能生成用户要求的最终输出，因此本次没有展示查询数据。',
+      '',
+      '| 项目 | 内容 |',
+      '| --- | --- |',
+      ...details.map(([label, value]) => `| ${markdownCell(label)} | ${markdownCell(value)} |`),
+      '',
+      '请模型网关/结果代理维护方按安全错误码和查询标识排查；确认模型服务恢复后，再由真人请求重新生成计划。',
+    ].join('\n'),
+    files: [],
+  };
 }
 
 function storableQueryResult(result) {
@@ -806,7 +975,18 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     }
   }
   const result = await callDataMcpService('run', caller, args, runtimeConfig);
-  if (result?.status !== 'success') return { error: isolatedDeliveryFailure() };
+  if (result?.status !== 'success') {
+    const failure = deterministicDlcFailure(result, args);
+    if (!failure) return { error: isolatedDeliveryFailure() };
+    return {
+      delivery: {
+        schemaVersion: 1,
+        deliveryId: `data-result-error-${randomUUID()}`,
+        markdown: failure.markdown,
+        responseKind: 'final',
+      },
+    };
+  }
   let authored;
   try {
     authored = await runResultAgent(
@@ -815,15 +995,6 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       runtimeConfig,
       DELIVERY_BUDGET_MS - (Date.now() - deliveryStartedAt),
     );
-  } catch (error) {
-    const errorCode = resultAgentAuditStatus(error);
-    let fallback;
-    try {
-      fallback = resultAgentMayUseDeterministicFallback(errorCode)
-        ? deterministicAnalysisFallback(result, args)
-        : null;
-    }
-    catch { fallback = null; }
     if (store && identity) {
       try {
         store.audit(
@@ -831,19 +1002,33 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
           caller.turnId || 'initial',
           args.question || '',
           null,
-          fallback ? 'deterministic_fallback_used' : errorCode,
+          'result_agent_succeeded',
+          Date.now(),
+          resultAgentAuditDetail(authored.audit, result),
+        );
+      } catch { /* best-effort non-sensitive audit */ }
+    }
+    delete authored.audit;
+  } catch (error) {
+    const errorCode = resultAgentAuditStatus(error);
+    if (store && identity) {
+      try {
+        store.audit(
+          identity,
+          caller.turnId || 'initial',
+          args.question || '',
+          null,
+          errorCode,
           Date.now(),
           {
-            stage: 'result_agent',
+            ...resultAgentAuditDetail(error?.resultAgentAudit, result),
             action: resultAgentAuditAction(errorCode),
             errorCode,
-            queryId: result.query_id,
           },
         );
       } catch { /* best-effort non-sensitive audit */ }
     }
-    if (!fallback) return { error: isolatedDeliveryFailure() };
-    authored = fallback;
+    authored = deterministicResultAgentFailure(result, args, errorCode);
   }
   if (store) {
     try { store.put(identity, storedPayload(args, result)); }
@@ -894,6 +1079,16 @@ async function continueQueryResult(caller, args, runtimeConfig) {
       ...args,
       question,
     }, runtimeConfig);
+    store.audit(
+      identity,
+      caller.turnId,
+      question,
+      expectedVersion,
+      'result_agent_succeeded',
+      Date.now(),
+      resultAgentAuditDetail(authored.audit, payload.result),
+    );
+    delete authored.audit;
     store.assertVersion(identity, expectedVersion);
     store.touch(identity, expectedVersion);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
@@ -906,8 +1101,13 @@ async function continueQueryResult(caller, args, runtimeConfig) {
         responseKind: 'final',
       },
     };
-  } catch {
-    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed');
+  } catch (error) {
+    const errorCode = resultAgentAuditStatus(error);
+    store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed', Date.now(), {
+      ...resultAgentAuditDetail(error?.resultAgentAudit, payload.result),
+      action: resultAgentAuditAction(errorCode),
+      errorCode,
+    });
     return { error: fixedFollowupResult('delivery_failed') };
   }
 }
@@ -1033,6 +1233,22 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
       payload.priority = args.priority.trim();
     }
     return callSnapshotService(kind, caller, payload, runtimeConfig);
+  }
+
+  if (kind === 'searchDlcTables') {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    const limit = args.limit === undefined ? 5 : args.limit;
+    if (!query || query.length > 500 || !Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      return {
+        status: 'validation_error',
+        result_class: 'policy_error',
+        error_code: 'dlc_table_search_input_invalid',
+        message: 'DLC 表检索 query 不能为空且不超过 500 字符，limit 必须为 1 到 20 的整数',
+      };
+    }
+    return callSnapshotService(kind, caller, {
+      ...trustedCallerPayload(caller), query, limit,
+    }, runtimeConfig);
   }
 
   if (kind === 'refreshSnapshot') {
@@ -1240,6 +1456,7 @@ function trustedCallerPayload(caller) {
     ...(caller.requestLarkAppId ? { request_lark_app_id: caller.requestLarkAppId } : {}),
     caller_source: caller.callerSource ?? null,
     caller_sender_type: caller.senderType ?? 'unknown_legacy',
+    caller_session_id: nonBlankProcessEnv('BOTMUX_SESSION_ID') ?? null,
     caller_task_id: caller.taskId ?? null,
     caller_turn_id: caller.turnId ?? null,
     caller_captured_at: caller.capturedAt ?? null,
@@ -1377,6 +1594,11 @@ async function handleToolCall(request) {
       error(request.id, -32602, `unknown_tool:${String(name)}`);
       return;
     }
+    const policyIssue = callerPolicyIssue(caller);
+    if (policyIssue) {
+      ok(request.id, jsonTool(policyIssue));
+      return;
+    }
     let prepared;
     try {
       prepared = await deliverQueryResult(caller, argsFrom(request), runtimeConfig);
@@ -1390,6 +1612,11 @@ async function handleToolCall(request) {
   if (name === 'continue_query_result_for_user') {
     if (dataMcpModelMode() !== 'dual') {
       error(request.id, -32602, `unknown_tool:${String(name)}`);
+      return;
+    }
+    const policyIssue = callerPolicyIssue(caller);
+    if (policyIssue) {
+      ok(request.id, jsonTool(policyIssue));
       return;
     }
     let prepared;
@@ -1409,6 +1636,11 @@ async function handleToolCall(request) {
 
   if (name === 'search_metadata_snapshot') {
     ok(request.id, jsonTool(await callDataMcpService('searchSnapshot', caller, argsFrom(request), runtimeConfig)));
+    return;
+  }
+
+  if (name === 'search_dlc_tables_for_user') {
+    ok(request.id, jsonTool(await callDataMcpService('searchDlcTables', caller, argsFrom(request), runtimeConfig)));
     return;
   }
 
@@ -1432,6 +1664,7 @@ async function handleToolCall(request) {
 
 function toolSchemas() {
   const datasourceIds = enabledDatasourceIds();
+  const defaultDatasource = defaultDatasourceId(datasourceIds);
   const tools = [
     {
       name: 'data_mcp_identity_probe',
@@ -1460,7 +1693,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
+          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
           execution_mode: { type: 'string', enum: ['single', 'compare'], default: 'single' },
           repair_chain_id: { type: 'string', description: 'Reuse only when correcting the same failed SQL attempt.' },
         },
@@ -1475,7 +1708,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
+          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
           query_plan_id: { type: 'string' },
         },
         required: ['sql', 'query_plan_id'],
@@ -1484,12 +1717,12 @@ function toolSchemas() {
     },
     {
       name: 'deliver_query_result_for_user',
-      description: 'Execute one approved query once, pass rows/schema/context to the internal result Agent, and deliver Agent-authored analysis and requested artifacts through the trusted Botmux host.',
+      description: 'Execute one approved query once, pass rows/schema/context to the internal result Agent, and deliver the Agent-authored response and requested artifacts directly to the original trusted Feishu conversation.',
       inputSchema: {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: datasourceIds[0] },
+          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
           query_plan_id: { type: 'string' },
           question: { type: 'string', minLength: 1, maxLength: 4000 },
           requested_outputs: {
@@ -1544,6 +1777,22 @@ function toolSchemas() {
           query: { type: 'string', minLength: 1 },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
           priority: { type: 'string' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'search_dlc_tables_for_user',
+      description: 'DLC-only live table discovery under the trusted caller identity. Call only when the current user request explicitly names DLC/WeData or is a clear continuation of an already confirmed DLC query. If the current request does not name a source, default to TChouse-C/ClickHouse and use search_metadata_snapshot instead; never infer DLC from an earlier query or test. For an explicit DLC request, call this before generating SQL when the user has not supplied a verified database.table, or after DLC validation reports a metadata lookup failure. Never invent or fuzzy-rewrite a table name: use only authoritative candidates returned here; when requires_confirmation=true, ask the user to choose before validating SQL.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string', minLength: 1, maxLength: 500,
+            description: 'Business phrase, metric, or suspected DLC table name from the user request.',
+          },
+          limit: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
         },
         required: ['query'],
         additionalProperties: false,

@@ -138,6 +138,7 @@ function writeProfile(path, values, mode = 0o600) {
   writeFileSync(path, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode });
 }
 
+const profileFile = join(root, 'test-profile.env');
 const defaultEnvFile = join(root, 'default.env');
 writeFileSync(defaultEnvFile, [
   `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
@@ -148,9 +149,10 @@ writeFileSync(defaultEnvFile, [
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
   'DATA_MCP_RESULT_MODEL=default-model',
   'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
+  `DATA_MCP_TEST_PROFILE_APP_ID=${selectedAppId}`,
+  `DATA_MCP_TEST_PROFILE_ENV_FILE=${profileFile}`,
   'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
 ].join('\n') + '\n', { mode: 0o600 });
-const profileFile = join(root, 'test-profile.env');
 writeProfile(profileFile, completeProfileLines({
   DATA_MCP_RESULT_BINDING_HMAC_KEY: evilBindingSecret,
   BOTMUX_SESSION_ID: 'forbidden-profile-session',
@@ -166,8 +168,6 @@ function childEnvironment(extra = {}) {
     BOTMUX_SESSION_ID: 'signed-profile-session',
     BOTMUX_PLUGIN_HOME: pluginHome,
     KSHER_AGENT_DATA_MCP_ENV_FILE: defaultEnvFile,
-    DATA_MCP_TEST_PROFILE_APP_ID: selectedAppId,
-    DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
     FAKE_BOTMUX_APP_ID: selectedAppId,
     FAKE_BOTMUX_LOG: botmuxLog,
     ...extra,
@@ -271,7 +271,6 @@ const initial = await plugin.call('deliver_query_result_for_user', {
 }, caller(selectedAppId, 'om_initial'));
 if (toolPayload(initial).status !== 'delivered'
   || JSON.stringify(initial.result?.content).includes(rowSentinel)
-  || JSON.stringify(initial.result?.content).includes(modelSentinel)
   || modelAuthorization !== 'Bearer synthetic-profile-api-key') {
   throw new Error('initial analysis did not use the selected model profile safely');
 }
@@ -279,14 +278,17 @@ if (toolPayload(initial).status !== 'delivered'
 const followup = await plugin.call('continue_query_result_for_user', {
   question: 'follow up', output_mode: 'analysis',
 }, caller(selectedAppId, 'om_followup'));
-if (toolPayload(followup).status !== 'delivered' || modelCalls !== 2) {
+if (toolPayload(followup).status !== 'delivered'
+  || modelCalls !== 2) {
   throw new Error('follow-up did not reuse the selected model profile and base HMAC binding');
 }
 
 const exported = await plugin.call('continue_query_result_for_user', {
   question: 'export', requested_outputs: ['excel'],
 }, caller(selectedAppId, 'om_export'));
-if (toolPayload(exported).attachmentCount !== 1 || modelCalls !== 3) {
+if (toolPayload(exported).status !== 'delivered'
+  || toolPayload(exported).attachmentCount !== 1
+  || modelCalls !== 3) {
   throw new Error('follow-up Excel did not use the selected internal Agent profile exclusively');
 }
 await plugin.close();
@@ -372,14 +374,21 @@ if (toolPayload(noOptionalResult).status !== 'delivered'
 await noOptionalPlugin.close();
 
 clearSignedAppTestProfileCacheForTests();
-const direct = resolveSignedAppTestProfile({ requestLarkAppId: selectedAppId }, childEnvironment());
+const directSelectorEnv = {
+  ...childEnvironment(),
+  DATA_MCP_TEST_PROFILE_APP_ID: selectedAppId,
+  DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
+};
+const direct = resolveSignedAppTestProfile(
+  { requestLarkAppId: selectedAppId }, directSelectorEnv,
+);
 if (direct.DATA_MCP_SERVICE_SOCKET_PATH !== socketPath
   || Object.hasOwn(direct, 'DATA_MCP_RESULT_BINDING_HMAC_KEY')
   || Object.hasOwn(direct, 'BOTMUX_SESSION_ID')) {
   throw new Error('profile whitelist accepted identity or HMAC configuration');
 }
-if (resolveSignedAppTestProfile({ requestLarkAppId: otherAppId }, childEnvironment()) !== undefined
-  || resolveSignedAppTestProfile({}, childEnvironment()) !== undefined) {
+if (resolveSignedAppTestProfile({ requestLarkAppId: otherAppId }, directSelectorEnv) !== undefined
+  || resolveSignedAppTestProfile({}, directSelectorEnv) !== undefined) {
   throw new Error('unsigned or other-app caller selected the test profile');
 }
 

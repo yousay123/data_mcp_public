@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,18 @@ from ksher_agent_data_mcp.models.contracts import (
 DLC_API_VERSION = "2021-01-25"
 _SUCCESS_STATE = 2
 _FAILURE_STATES = {-1, -3}
+_DLC_DIAGNOSTIC_SOURCE = "wedata-tencent-workflow"
+
+_DLC_TABLE_SEARCH_ALIASES = {
+    "店铺": "shop",
+    "门店": "shop",
+    "商户": "merchant",
+    "订单": "order",
+    "交易": "transaction",
+    "提现": "withdraw",
+    "账户": "account",
+    "用户": "user",
+}
 
 
 class DlcApiError(RuntimeError):
@@ -468,23 +481,84 @@ class DlcMetadataCatalog(MetadataCatalog):
         credential: DlcPrincipalRef | None = None,
     ) -> list[TableMeta]:
         principal = _require_dlc_principal(credential)
-        needle = full_name.lower().replace("`", "")
-        candidates: list[TableMeta] = []
+        if principal.has_row_filters or principal.has_data_masks:
+            raise MetadataAccessDenied("DLC 行级或脱敏策略尚未接入安全执行，拒绝使用服务身份代查")
+        tokens = _dlc_table_search_tokens(full_name)
+        if not tokens:
+            return []
+
+        candidates: dict[str, tuple[int, TableMeta]] = {}
+
+        def add_candidate(database: str, table: str, description: str | None = None) -> None:
+            database = database.strip().lower()
+            table = table.strip().lower()
+            if not database or not table or not _table_allowed(principal, database, table):
+                return
+            haystack = f"{database}.{table} {description or ''}".lower()
+            score = sum(1 for token in tokens if token in haystack)
+            if score <= 0:
+                return
+            key = f"{database}.{table}"
+            current = candidates.get(key)
+            meta = TableMeta(
+                datasource="dlc",
+                database=database,
+                table=table,
+                description=description or None,
+            )
+            if current is None or score > current[0]:
+                candidates[key] = (score, meta)
+
         for policy in principal.policies:
             if policy.policy_type.upper() not in {"TABLE", "VIEW"}:
                 continue
             if policy.operation.upper() not in {"ALL", "SELECT"}:
                 continue
-            full = f"{policy.database}.{policy.table}".lower()
-            if (
-                policy.table
-                and policy.table != "*"
-                and any(token in full for token in needle.replace(".", "_").split("_") if token)
-            ):
-                candidates.append(
-                    TableMeta(datasource="dlc", database=policy.database, table=policy.table)
+            if policy.table and policy.table != "*":
+                add_candidate(policy.database, policy.table)
+
+        try:
+            for token in tokens[:4]:
+                response = self.client.call(
+                    "DescribeDMSTables",
+                    {
+                        "Keyword": token,
+                        "Limit": min(max(limit * 5, 20), 100),
+                        "Offset": 0,
+                        "DatasourceConnectionName": principal.catalog,
+                    },
                 )
-        return candidates[:limit]
+                for item in response.get("TableList") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_table = item.get("Table") or {}
+                    raw_asset = item.get("Asset") or {}
+                    if not isinstance(raw_table, dict):
+                        continue
+                    add_candidate(
+                        str(raw_table.get("DbName") or ""),
+                        str(raw_table.get("Name") or ""),
+                        str(raw_asset.get("Description") or "") or None,
+                    )
+        except DlcApiError as exc:
+            if "Permission" in exc.code or "Unauthorized" in exc.code:
+                raise MetadataAccessDenied(str(exc)) from exc
+            raise MetadataLookupError(str(exc)) from exc
+
+        verified: list[TableMeta] = []
+        ranked = sorted(
+            candidates.values(),
+            key=lambda row: (-row[0], row[1].database, row[1].table),
+        )
+        for _, candidate in ranked:
+            meta = self.describe_table(candidate.full_name, principal)
+            if meta is not None:
+                if not meta.description and candidate.description:
+                    meta = meta.model_copy(update={"description": candidate.description})
+                verified.append(meta)
+            if len(verified) >= limit:
+                break
+        return verified
 
 
 class DlcQueryExecutor(QueryExecutor):
@@ -562,6 +636,7 @@ class DlcQueryExecutor(QueryExecutor):
                 exc.code,
                 ResultClass.POLICY_ERROR if policy else ResultClass.INCONCLUSIVE,
                 retryable=exc.retryable,
+                failure_action=exc.action,
             )
         finally:
             self._slots.release()
@@ -575,7 +650,10 @@ class DlcQueryExecutor(QueryExecutor):
         timeout_seconds: int,
         max_rows: int | None,
     ) -> QueryResult:
-        deadline = time.monotonic() + min(timeout_seconds, self.settings.query_timeout_seconds)
+        deadline = time.monotonic() + min(
+            timeout_seconds,
+            self.settings.dlc_query_timeout_seconds,
+        )
         limit = max_rows or self.settings.max_rows
         task_info = self._wait_for_completion(task_id, sql, started, deadline)
         if isinstance(task_info, QueryResult):
@@ -611,14 +689,29 @@ class DlcQueryExecutor(QueryExecutor):
                     result_class = (
                         ResultClass.INCONCLUSIVE if state == -3 else ResultClass.CK_QUERY_ERROR
                     )
-                    return _dlc_error(task_id, sql, started, code, result_class)
+                    return _dlc_error(
+                        task_id,
+                        sql,
+                        started,
+                        code,
+                        result_class,
+                        task_error=_task_failure_text(task_info),
+                        failure_action="DescribeTasks",
+                    )
                 if state == _SUCCESS_STATE:
                     return task_info
             time.sleep(
                 min(self.settings.dlc_poll_interval_seconds, max(deadline - time.monotonic(), 0))
             )
         self._cancel_task(task_id)
-        return _dlc_error(task_id, sql, started, "query_timeout", ResultClass.INCONCLUSIVE)
+        return _dlc_error(
+            task_id,
+            sql,
+            started,
+            "query_timeout",
+            ResultClass.INCONCLUSIVE,
+            failure_action="DescribeTasks",
+        )
 
     def _read_result(
         self,
@@ -667,7 +760,14 @@ class DlcQueryExecutor(QueryExecutor):
                 break
         else:
             self._cancel_task(task_id)
-            return _dlc_error(task_id, sql, started, "query_timeout", ResultClass.INCONCLUSIVE)
+            return _dlc_error(
+                task_id,
+                sql,
+                started,
+                "query_timeout",
+                ResultClass.INCONCLUSIVE,
+                failure_action="DescribeTaskResult",
+            )
 
         truncated = len(rows) > limit or bool(next_token)
         bounded_rows = rows[:limit]
@@ -790,6 +890,21 @@ def _split_dlc_table(full_name: str, default_database: str) -> tuple[str, str]:
     return default_database.lower(), parts[0]
 
 
+def _dlc_table_search_tokens(query: str) -> list[str]:
+    normalized = query.lower().replace("`", " ")
+    tokens = re.findall(r"[a-z][a-z0-9_]{1,127}", normalized)
+    for phrase, alias in _DLC_TABLE_SEARCH_ALIASES.items():
+        if phrase in normalized:
+            tokens.append(alias)
+    ignored = {"table", "select", "from", "where", "count", "昨天", "昨日", "数据", "数据量"}
+    unique: list[str] = []
+    for token in tokens:
+        if token in ignored or token in unique:
+            continue
+        unique.append(token)
+    return unique
+
+
 def _table_allowed(principal: DlcPrincipalRef, database: str, table: str) -> bool:
     if principal.user_type.upper() == "ADMIN":
         return True
@@ -819,7 +934,10 @@ def _dlc_error(
     result_class: ResultClass,
     *,
     retryable: bool = False,
+    task_error: str | None = None,
+    failure_action: str | None = None,
 ) -> QueryResult:
+    diagnosis = _diagnose_dlc_failure(code, task_error)
     return QueryResult(
         status=Status.ERROR,
         result_class=result_class,
@@ -830,7 +948,91 @@ def _dlc_error(
         error_code=code,
         retryable=retryable,
         quality_warnings=[_safe_dlc_error(code)],
+        failure_stage=diagnosis["failure_stage"],
+        failure_action=failure_action,
+        diagnostic_source=_DLC_DIAGNOSTIC_SOURCE,
+        diagnostic_case=diagnosis.get("diagnostic_case"),
+        diagnostic_summary=diagnosis["diagnostic_summary"],
+        suggested_action=diagnosis["suggested_action"],
     )
+
+
+def _task_failure_text(task_info: dict[str, Any]) -> str:
+    """Return bounded task failure evidence for classification only.
+
+    The raw text is never copied into QueryResult. It may contain SQL fragments,
+    internal identities, or request metadata, so only the deterministic
+    classifier below is allowed to inspect it.
+    """
+    values = [task_info.get("Error"), task_info.get("OutputMessage")]
+    return "\n".join(str(value)[:4000] for value in values if value)
+
+
+def _diagnose_dlc_failure(code: str, task_error: str | None) -> dict[str, str | None]:
+    """Classify DLC failures using the WeData troubleshooting case contract.
+
+    This mirrors only stable, reviewed case signatures. The caller receives a
+    safe diagnosis and case id, never the upstream DLC error body.
+    """
+    evidence = f"{code}\n{task_error or ''}".upper()
+    if "MANAGED_TABLE_DATASOURCE_UNSUPPORTED" in evidence or "CODE=2011" in evidence:
+        return {
+            "failure_stage": "dlc_sql_execution",
+            "diagnostic_case": "SQL-001",
+            "diagnostic_summary": "建表语义冲突：managed table 不能同时使用 USING 数据源格式声明",
+            "suggested_action": "检查 CREATE TABLE；目标为 managed table 时移除 USING，目标为 external table 时补齐 LOCATION",
+        }
+    if "AUTH_ACCESS_ERROR" in evidence or "CODE=2045" in evidence:
+        return {
+            "failure_stage": "dlc_authorization",
+            "diagnostic_case": "PERM-002",
+            "diagnostic_summary": "运行身份缺少目标库 CREATE 权限，后续 SQL 尚未执行",
+            "suggested_action": "由有权限账号预建目标表并移除日常 DDL，或按审批流程补充目标库 CREATE 权限",
+        }
+    if (
+        "DOES NOT HAVE PERMISSION TO USE THIS COMPUTING ENGINE" in evidence
+        or code == "engine_permission_denied"
+    ):
+        return {
+            "failure_stage": "dlc_engine_authorization",
+            "diagnostic_case": "PERM-001",
+            "diagnostic_summary": "计算引擎权限或 WeData/DLC 内部用户映射异常",
+            "suggested_action": "对比可信身份映射与报错中的运行身份，并检查目标引擎用户组授权；不要原样重复提交",
+        }
+    if "PERMISSION" in evidence or "UNAUTHORIZED" in evidence:
+        return {
+            "failure_stage": "dlc_authorization",
+            "diagnostic_case": None,
+            "diagnostic_summary": "DLC 权限校验失败",
+            "suggested_action": "核对当前用户的 CAM/DLC 映射、表 SELECT 权限和计算引擎权限",
+        }
+    if code == "query_timeout":
+        return {
+            "failure_stage": "dlc_task_execution",
+            "diagnostic_case": None,
+            "diagnostic_summary": "DLC 任务在受控等待时限内未完成，已请求取消",
+            "suggested_action": "按 query_id 检查任务状态、引擎队列和扫描量；确认终态后再决定是否重试",
+        }
+    if code == "query_cancelled":
+        return {
+            "failure_stage": "dlc_task_execution",
+            "diagnostic_case": None,
+            "diagnostic_summary": "DLC 任务已取消，执行结果不可用",
+            "suggested_action": "按 query_id 核对取消来源、引擎状态和任务审计；确认未运行后再重新生成计划",
+        }
+    if code in {"signer_unreachable", "tc_call_timeout", "credential_resolution_timeout"}:
+        return {
+            "failure_stage": "dlc_control_plane",
+            "diagnostic_case": None,
+            "diagnostic_summary": "WeData Skill 受控腾讯云调用链路暂不可用或超时",
+            "suggested_action": "检查 tc-signer/tc_call.py、网络和凭证映射服务，恢复后从真人请求重新生成计划",
+        }
+    return {
+        "failure_stage": "dlc_task_execution",
+        "diagnostic_case": None,
+        "diagnostic_summary": f"DLC 查询在执行阶段失败（{code}）",
+        "suggested_action": "按 query_id 检查 CreateTasks、DescribeTasks 和 DescribeTaskResult 审计后再处理",
+    }
 
 
 def _safe_dlc_error(code: str) -> str:

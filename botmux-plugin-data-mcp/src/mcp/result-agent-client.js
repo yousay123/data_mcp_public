@@ -61,7 +61,11 @@ export function runIsolatedResultAgent(options) {
       let response;
       try { response = JSON.parse(stdout.trim()); } catch { reject(new Error('result_agent_ipc_invalid_response')); return; }
       if (code !== 0 || !response?.ok) {
-        reject(new Error(typeof response?.error === 'string' ? response.error : 'result_agent_worker_failed'));
+        const error = new Error(typeof response?.error === 'string' ? response.error : 'result_agent_worker_failed');
+        if (response?.audit && typeof response.audit === 'object' && !Array.isArray(response.audit)) {
+          error.resultAgentAudit = response.audit;
+        }
+        reject(error);
         return;
       }
       if (!Number.isSafeInteger(response.agentPid) || response.agentPid === process.pid || stderrBytes > 0) {

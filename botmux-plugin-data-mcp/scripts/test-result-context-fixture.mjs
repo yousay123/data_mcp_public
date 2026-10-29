@@ -15,6 +15,7 @@ export function canonicalContext(columns, overrides = {}) {
     datasource: 'tchouse-c',
     tables: ['synthetic.events'],
     metric_columns: columns.map(column => typeof column === 'string' ? column : column.name),
+    metric_expressions: columns.map(column => typeof column === 'string' ? column : column.name),
     filter_predicates: [],
     time_range_predicates: [],
     grouping_columns: [],

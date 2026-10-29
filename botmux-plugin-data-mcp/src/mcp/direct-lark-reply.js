@@ -201,7 +201,7 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
     try {
       textResult = await runBotmux([
         'send', '--content-file', bodyPath,
-        '--no-mention', '--response-kind', attachmentCount > 0 ? 'progress' : 'auxiliary',
+        '--no-mention', '--response-kind', 'final',
         '--quote', identity.turnId,
       ]);
     } catch {
