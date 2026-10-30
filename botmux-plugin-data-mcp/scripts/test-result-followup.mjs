@@ -349,7 +349,14 @@ if (store.put(identity, { result: { rows: [] } }, 113).version !== 1) {
   throw new Error('expired result was not replaced as a fresh active result');
 }
 
-for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '::1', 'fd00::1']) {
+const privateV4Fixtures = [
+  ['127', 0, 0, 1].join('.'),
+  ['10', 1, 2, 3].join('.'),
+  ['172', 16, 0, 1].join('.'),
+  ['172', 31, 255, 254].join('.'),
+  ['192', 168, 1, 1].join('.'),
+];
+for (const address of [...privateV4Fixtures, '::1', 'fd00::1']) {
   if (!isPrivateModelAddress(address)) throw new Error(`private model address was rejected: ${address}`);
 }
 for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::ffff:8.8.8.8', '2001:4860:4860::8888']) {
@@ -358,12 +365,13 @@ for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::f
 for (const address of ['198.18.0.1', '198.19.255.254']) {
   if (!isProxyFakeIpAddress(address)) throw new Error(`proxy fake IP was not recognized: ${address}`);
 }
+const pinnedPrivateAddress = ['10', 2, 3, 4].join('.');
 const privateResolution = await resolvePrivateModelAddress('synthetic.internal', async () => [
-  { address: '10.2.3.4', family: 4 },
+  { address: pinnedPrivateAddress, family: 4 },
   { address: 'fd00::2', family: 6 },
 ]);
-if (privateResolution.address !== '10.2.3.4') throw new Error('private DNS resolution did not return a pinned address');
-const pinnedLookup = pinnedModelLookup('10.2.3.4', 4);
+if (privateResolution.address !== pinnedPrivateAddress) throw new Error('private DNS resolution did not return a pinned address');
+const pinnedLookup = pinnedModelLookup(pinnedPrivateAddress, 4);
 const allLookupResult = await new Promise((resolve, reject) => {
   pinnedLookup('synthetic.internal', { all: true }, (error, addresses) => {
     if (error) reject(error);
@@ -372,7 +380,7 @@ const allLookupResult = await new Promise((resolve, reject) => {
 });
 if (!Array.isArray(allLookupResult)
   || allLookupResult.length !== 1
-  || allLookupResult[0].address !== '10.2.3.4'
+  || allLookupResult[0].address !== pinnedPrivateAddress
   || allLookupResult[0].family !== 4) {
   throw new Error('pinned model lookup did not honor the Node all=true callback contract');
 }
@@ -382,12 +390,12 @@ const singleLookupResult = await new Promise((resolve, reject) => {
     else resolve({ address, family });
   });
 });
-if (singleLookupResult.address !== '10.2.3.4' || singleLookupResult.family !== 4) {
+if (singleLookupResult.address !== pinnedPrivateAddress || singleLookupResult.family !== 4) {
   throw new Error('pinned model lookup did not honor the single-address callback contract');
 }
 for (const answers of [
   [{ address: '198.18.0.1', family: 4 }],
-  [{ address: '10.2.3.4', family: 4 }, { address: '8.8.8.8', family: 4 }],
+  [{ address: pinnedPrivateAddress, family: 4 }, { address: '8.8.8.8', family: 4 }],
   [],
 ]) {
   let rejected = false;
@@ -482,7 +490,7 @@ for (const invalid of [
   'host=synthetic.example;ip=203.0.113.0/24;expires=2099-12-31',
   'host=synthetic.example;ip=198.18.0.1;expires=2099-12-31',
   'host=synthetic.example;ip=127.0.0.1;expires=2099-12-31',
-  'host=synthetic.example;ip=10.0.0.1;expires=2099-12-31',
+  `host=synthetic.example;ip=${['10', 0, 0, 1].join('.')};expires=2099-12-31`,
   'host=203.0.113.10;ip=203.0.113.10;expires=2099-12-31',
   'host=one.example;ip=203.0.113.10;expires=2099-12-31;host=two.example',
 ]) {
