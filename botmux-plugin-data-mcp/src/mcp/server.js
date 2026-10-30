@@ -223,15 +223,33 @@ function configValue(name) {
   return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
 }
 
+function hostOnlyConfigValue(name) {
+  const fromHostFile = hostEnv()[name];
+  return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
+}
+
 if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
   console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
 }
 if (process.env.DATA_MCP_TEST_PROFILE_APP_ID || process.env.DATA_MCP_TEST_PROFILE_ENV_FILE) {
+  console.error(
+    '[data-mcp] WARN process-level signed-app test profile selectors are ignored; '
+    + 'configure them in KSHER_AGENT_DATA_MCP_ENV_FILE',
+  );
+}
+if (hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_APP_ID')
+  || hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_ENV_FILE')) {
   console.error('[data-mcp] WARN signed-app test profile selection is configured');
 }
 
 function runtimeConfigForCaller(caller) {
-  const profile = resolveSignedAppTestProfile(caller);
+  const profile = resolveSignedAppTestProfile(caller, {
+    // The selector controls whether a signed caller is redirected to a test
+    // service. Keep it in the host-owned configuration plane: per-bot runtime
+    // env is session-local and can be copied to the wrong bot accidentally.
+    DATA_MCP_TEST_PROFILE_APP_ID: hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_APP_ID'),
+    DATA_MCP_TEST_PROFILE_ENV_FILE: hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_ENV_FILE'),
+  });
   return Object.freeze({
     testProfileSelected: profile !== undefined,
     value(name) {

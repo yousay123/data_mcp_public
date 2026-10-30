@@ -168,6 +168,10 @@ Environment contract:
     the absolute env-file path as that call's test profile. Missing, malformed,
     symlinked, non-regular, or permissions broader than `0600` fail closed for
     the selected app and never fall back to the default profile.
+  - Store both selector variables only in the host-owned file selected by
+    `KSHER_AGENT_DATA_MCP_ENV_FILE`. Process-level values, including BotMux
+    per-bot `pluginRuntime.env`, are ignored so copying a test selector into a
+    production bot cannot redirect that bot to the test service.
   - The test profile may override only the dedicated service socket and result
     model endpoint, exact-host allowlist, model, API key, and endpoint test
     exception. Socket, model endpoint, exact-host allowlist, and model are all

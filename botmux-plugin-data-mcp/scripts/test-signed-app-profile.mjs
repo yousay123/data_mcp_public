@@ -110,19 +110,24 @@ function writeProfile(path, values, mode = 0o600) {
   writeFileSync(path, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode });
 }
 
-const defaultEnvFile = join(root, 'default.env');
-writeFileSync(defaultEnvFile, [
-  `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
-  `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
-  `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
-  `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
-  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
-  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
-  'DATA_MCP_RESULT_MODEL=default-model',
-  'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
-  'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
-].join('\n') + '\n', { mode: 0o600 });
 const profileFile = join(root, 'test-profile.env');
+const defaultEnvFile = join(root, 'default.env');
+function writeHostEnv(path, selectorProfilePath) {
+  writeFileSync(path, [
+    `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
+    `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
+    `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
+    `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
+    `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
+    'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
+    'DATA_MCP_RESULT_MODEL=default-model',
+    'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
+    `DATA_MCP_TEST_PROFILE_APP_ID=${selectedAppId}`,
+    `DATA_MCP_TEST_PROFILE_ENV_FILE=${selectorProfilePath}`,
+    'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
+  ].join('\n') + '\n', { mode: 0o600 });
+}
+writeHostEnv(defaultEnvFile, profileFile);
 writeProfile(profileFile, completeProfileLines({
   DATA_MCP_RESULT_BINDING_HMAC_KEY: evilBindingSecret,
   BOTMUX_SESSION_ID: 'forbidden-profile-session',
@@ -262,9 +267,11 @@ for (const [label, mutate] of [
   mutate(values);
   writeProfile(invalidPath, values);
   const hitsBefore = defaultServiceHits;
+  const invalidHostEnv = join(root, `${label.replaceAll(' ', '-')}-host.env`);
+  writeHostEnv(invalidHostEnv, invalidPath);
   const invalidProfilePlugin = spawnPlugin({
     BOTMUX_SESSION_ID: `invalid-${label.replaceAll(' ', '-')}`,
-    DATA_MCP_TEST_PROFILE_ENV_FILE: invalidPath,
+    KSHER_AGENT_DATA_MCP_ENV_FILE: invalidHostEnv,
   });
   const response = await invalidProfilePlugin.call('validate_sql_for_user', {
     sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -281,9 +288,11 @@ const noOptionalValues = completeProfileLines();
 delete noOptionalValues.DATA_MCP_RESULT_MODEL_API_KEY;
 writeProfile(noOptionalProfile, noOptionalValues);
 modelAuthorization = 'not-called';
+const noOptionalHostEnv = join(root, 'no-optional-host.env');
+writeHostEnv(noOptionalHostEnv, noOptionalProfile);
 const noOptionalPlugin = spawnPlugin({
   BOTMUX_SESSION_ID: 'no-optional-session',
-  DATA_MCP_TEST_PROFILE_ENV_FILE: noOptionalProfile,
+  KSHER_AGENT_DATA_MCP_ENV_FILE: noOptionalHostEnv,
 });
 const noOptionalResult = await noOptionalPlugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -383,7 +392,23 @@ try {
 } catch (error) { malformedRejected = error?.message === 'test_profile_config_invalid'; }
 if (!malformedRejected) throw new Error('malformed profile did not fail closed');
 
-const invalidPlugin = spawnPlugin({ DATA_MCP_TEST_PROFILE_ENV_FILE: looseProfile });
+const processOverrideHitsBefore = defaultServiceHits;
+const processOverridePlugin = spawnPlugin({
+  DATA_MCP_TEST_PROFILE_APP_ID: otherAppId,
+  DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
+});
+const processOverrideResponse = await processOverridePlugin.call('validate_sql_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+}, caller(otherAppId, 'process-override-turn'));
+if (JSON.stringify(processOverrideResponse).includes('signed-profile-plan')
+  || defaultServiceHits !== processOverrideHitsBefore + 1) {
+  throw new Error('process-level selector redirected a signed caller to the test profile');
+}
+await processOverridePlugin.close();
+
+const invalidHostEnvFile = join(root, 'invalid-selector-host.env');
+writeHostEnv(invalidHostEnvFile, looseProfile);
+const invalidPlugin = spawnPlugin({ KSHER_AGENT_DATA_MCP_ENV_FILE: invalidHostEnvFile });
 const invalidResponse = await invalidPlugin.call('validate_sql_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
 }, caller(selectedAppId, 'invalid-profile-turn'));
