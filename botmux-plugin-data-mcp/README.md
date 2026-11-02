@@ -1,29 +1,10 @@
 # botmux-plugin-data-mcp
 
-Private Botmux plugin for Data MCP access.
+Botmux plugin for identity-bound Data MCP access.
 
-This package is intentionally private and is not registered in the public
-Botmux plugin market. It is meant to be installed only in controlled
-environments and enabled only for selected bots.
-
-## Current Mainline Mode
-
-This branch is the **single-model compatibility version**. After a successful
-validation, `run_query_for_user` returns query rows to the calling model, and
-the export tool returns its artifact metadata to that model. Consequently,
-business query results enter the external model's conversation context. This
-mode does not require Botmux trusted-result delivery capability or an internal
-result-analysis model.
-
-The isolated two-model implementation is maintained on
-`feat/dual-model-v1-integration-20261023` until its rollout prerequisites are
-met. That mode requires a Botmux host with trusted result delivery support and
-an approved, configured internal model endpoint. It must pass the documented
-end-to-end isolation and delivery audit before being merged into the mainline.
-
-The retired raw bypass tools (`frozen_query_raw` and `execute_frozen_query`)
-must not be restored in either mode. All access remains bound to Gateway-
-injected identity, read-only validation, query plans, and service-side limits.
+This source repository is public. Deployment-specific endpoints, credentials,
+database names, table names, business definitions, and prompts must stay in
+host-only configuration and must never be committed here.
 
 ## Capabilities
 
@@ -37,7 +18,6 @@ injected identity, read-only validation, query plans, and service-side limits.
   - fails closed when Gateway trusted-caller metadata is absent
   - exposes identity-bound tools that forward explicit SQL to the Data MCP
     service side for validation/execution
-  - does not expose raw frozen-query rendering to the model-facing MCP surface
   - exposes signed local snapshot refresh/search over the same private Unix socket
 - CLI:
   - `botmux data-mcp:status`
@@ -70,6 +50,13 @@ turn. A `schedule_creator` caller is accepted only when `turnId` has the form
 `taskId`. Conversely, a `schedule:` turn is rejected unless its trusted caller
 source is `schedule_creator`. This prevents a scheduled input adopted into an
 already-active turn from using that turn's preserved caller identity.
+
+Trusted artifact delivery is one-shot. The internal result Agent runs in a
+separate child process with an allowlisted environment, selects and invokes the
+Excel/PDF/chart/document tool, and stages atomic outbound files;
+the Botmux host consumes it into bounded memory and removes the staged source
+before any send. Plugin shutdown cleans files still owned by that process, and
+startup removes abandoned Data MCP artifacts older than 15 minutes.
 
 Query plans additionally bind to a host-injected execution context. The wrapper
 prefers a non-empty `BOTMUX_SESSION_ID` and otherwise uses a non-empty
@@ -144,6 +131,77 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
   - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
+- Raw `run_query_for_user` responses are always disabled in dual-model mode,
+  and no model-visible Data MCP export tool is registered. Business results
+  must use `deliver_query_result_for_user`;
+  this fail-closed boundary cannot be disabled by environment configuration.
+- `DATA_MCP_RESULT_MODEL_ENDPOINT`
+  - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
+- `DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS`
+  - Required comma-separated exact hostname allowlist for the internal result model endpoint.
+  - Every request also resolves and pins the endpoint to loopback, RFC1918, or
+    IPv6 ULA. Redirects and `198.18.0.0/15` proxy fake-IP addresses are rejected.
+    Deployments using split DNS must configure a direct route that resolves to
+    the real private address; never weaken the address check to accommodate a proxy.
+- `DATA_MCP_RESULT_MODEL_TEST_EXCEPTION`
+  - Test-only, default-disabled exception for exactly one public endpoint, formatted
+    as `host=exact.example;ip=203.0.113.10;expires=YYYY-MM-DD`. Wildcards, CIDR
+    ranges, multiple records, private/loopback addresses, and `198.18.0.0/15`
+    proxy fake-IP addresses are rejected. The hostname and its sole DNS answer
+    must exactly match. The expiry may be at most 60 calendar days from the
+    current UTC date, and the exception expires automatically after the stated
+    UTC date.
+  - Every use writes a `model_endpoint_exception_used` audit event containing
+    only a host fingerprint. This exception is only for synthetic data or
+    non-sensitive aggregate queries during integration testing. Remove it when
+    the model moves to the Tencent Cloud private network; never use it as a
+    production deployment substitute.
+- `DATA_MCP_RESULT_MODEL`
+  - Internal model name.
+- `DATA_MCP_RESULT_MODEL_API_KEY`
+
+结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
+55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
+使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
+首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
+`stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
+混成同一个不可定位错误。仅当请求输出为 `analysis`、结果不超过 20 行 × 20 列、
+每个单元格都是有界标量，且失败属于模型未配置、超时或 5xx 时，插件才会通过既有
+可信飞书回复通道确定性展示原始查询表格；不做口径推断。模型 endpoint/重定向、
+上下文完整性、进程隔离、附件产物等安全边界失败仍然 fail closed。
+  - Optional internal endpoint credential. Keep it only in the host-only file
+    selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
+    process environment.
+- `DATA_MCP_RESULT_BINDING_HMAC_KEY`
+  - Required, host-only secret of at least 32 characters for interactive result
+    bindings. Missing keys fail closed. Keep it in the same host-only env file.
+- `DATA_MCP_TEST_PROFILE_APP_ID` / `DATA_MCP_TEST_PROFILE_ENV_FILE`
+  - Optional test-only selector. When the host-signed per-call
+    `requestLarkAppId` exactly matches the configured app id, the plugin loads
+    the absolute env-file path as that call's test profile. Missing, malformed,
+    symlinked, non-regular, or permissions broader than `0600` fail closed for
+    the selected app and never fall back to the default profile.
+  - Store both selector variables only in the host-owned file selected by
+    `KSHER_AGENT_DATA_MCP_ENV_FILE`. Process-level values, including BotMux
+    per-bot `pluginRuntime.env`, are ignored so copying a test selector into a
+    production bot cannot redirect that bot to the test service.
+  - The test profile may override only the dedicated service socket and result
+    model endpoint, exact-host allowlist, model, API key, and endpoint test
+    exception. Socket, model endpoint, exact-host allowlist, and model are all
+    required; the socket cannot be `disabled`. A selected profile is a closed
+    configuration group: omitted optional keys remain absent and never inherit
+    their default-profile values. HMAC keys, caller/session identity, service
+    authentication, and all other settings are ignored even if present in the
+    file. The cache is isolated by signed app id, absolute file path, and mtime.
+  - Configure this only for a dedicated integration-test bot. Remove both
+    selector variables and the public-endpoint exception after moving the model
+    to the Tencent Cloud private network. While enabled, use only synthetic data
+    or explicitly approved non-sensitive aggregates.
+- `DATA_MCP_RESULT_IDLE_TTL_MS` / `DATA_MCP_RESULT_ABSOLUTE_TTL_MS`
+  - Optional positive integer overrides. Defaults are 24 hours idle and 7 days absolute.
+- `DATA_MCP_RESULT_MAX_BYTES` / `DATA_MCP_RESULT_MAX_OWNER_BYTES` /
+  `DATA_MCP_RESULT_MAX_TOTAL_BYTES`
+  - Optional positive byte quotas for one result, one owner, and the store.
 
 The service runner passes only an allowlisted non-sensitive environment to the
 Python API. The API loads private configuration directly from the host-only file
@@ -153,9 +211,75 @@ environment.
 
 For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. SQL validation, permission checks,
-account mapping, execution, export limits, and audit remain on the Data MCP
-side. Raw frozen-query rendering is deliberately absent from the model-facing
-tool list.
+account mapping, query execution limits, and audit remain on the Data MCP side.
+Final artifact generation belongs to the internal result Agent, not Data MCP.
+No model-visible tool may return raw query rows.
+
+The result context is not a model argument. Data MCP derives projection,
+time/filter/grouping, table, unit-status, and timezone-status fields from the
+validated normalized SQL, binds them to the query plan, adds the returned schema,
+and attaches a SHA-256 integrity digest. The isolated Agent rejects missing,
+malformed, or modified context.
+
+Interactive results are bound to the host-authenticated union id and app id,
+plus `BOTMUX_SESSION_ID`, which Botmux freezes in the plugin process environment
+and the model cannot supply as a tool argument. The result handle is never
+model-visible. When Botmux adds a signed session id to per-turn metadata, the
+plugin should migrate from the process environment to that value.
+
+`continue_query_result_for_user` accepts only the user's follow-up text and
+requested output types. It reuses the caller-bound stored rows/schema/context
+without rerunning the query. The internal result Agent must call the matching
+analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
+stored result. Artifact tools accept no model-authored titles, paragraphs,
+labels, annotations, sheet names, or filenames. The model selects only columns,
+aggregations, chart type, and layout; controlled templates render every word,
+and arbitrary-precision decimal arithmetic computes every numerical claim.
+The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
+so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per
+trusted turn id, only one follow-up call is accepted. Agent text and files are replied
+directly to the signed `turnId` message by the session-bound bot identity.
+Topic messages stay in the original topic; ordinary group and P2P messages
+remain flat replies in the same conversation. Before sending, the plugin uses
+Botmux's live session observation to verify that the bound session app matches
+the signed app id, then delegates routing to `botmux send`. Direct delivery has
+no cross-invocation deduplication: repeating the same delivery tool call can
+send duplicate text and attachments, so callers must not retry after an
+ambiguous receipt.
+It fails closed rather than falling back to another bot profile. Normal MCP content contains only delivery
+counts/status or a fixed error code; it never contains result text, filenames,
+paths, or file bytes.
+
+Direct replies remain in ordinary Lark chat history. A calling model with access
+to Botmux history/quoted-message tools can read that content in a later turn,
+even though the delivery tool response itself is redacted. Use direct delivery
+only with synthetic test data until the host provides result-message filtering
+or the protected result-page flow is restored.
+
+Known host limitation: a busy shared topic can expose the most recently
+captured human identity to a tool call. Binding mismatches fail closed, so this
+can interrupt a response but cannot return rows to the calling model. Deploy
+the internal model without tools or general outbound network access, and do not
+write its prompts or responses to ordinary logs.
+
+### Model-visible tool boundary
+
+| Tool | Success visible to the calling model | Failure visible to the calling model |
+| --- | --- | --- |
+| `data_mcp_identity_probe` | Trusted-identity diagnostics only; no query data | Fixed identity error |
+| `data_mcp_query_plan` | Planning guidance only; does not execute SQL | Fixed planning error |
+| `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
+| `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
+| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; the internal result Agent receives rows/schema/context, calls requested artifact tools, and the result is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
+| `continue_query_result_for_user` | Fixed direct-delivery receipt; active-result handles are not arguments | Fixed deterministic state or direct-delivery error only |
+| `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |
+| `search_metadata_snapshot` | Allowlisted dictionary fields only; example and sample values are removed | Fixed snapshot status code |
+| `audit_ck_default_role_baseline` | Access-control audit metadata; schedule-only | Policy/service status without query rows |
+| `inspect_ck_subjects_by_table` | Bounded access-holder metadata for explicit tables | Policy/service status without query rows |
+| `inspect_ck_resources_by_subject` | Bounded access metadata for explicit subjects | Policy/service status without query rows |
+
+There is no model-visible raw-result tool or handler route. Database service
+errors must not be relayed verbatim when they can echo literals from a query.
 
 Metadata discovery calls `search_metadata_snapshot`; refresh accepts only a
 host-injected `schedule_creator` identity with task/app/owner binding and never

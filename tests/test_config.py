@@ -62,7 +62,10 @@ def test_get_settings_reads_explicit_private_env_without_copying_secrets_to_envi
 
 @pytest.mark.parametrize(
     "sensitive_key",
-    ["DATA_MCP_INTERNAL_AUTH_TOKEN", "TCHOUSE_D_PASSWORD"],
+    [
+        "DATA_MCP_INTERNAL_AUTH_TOKEN",
+        "TCHOUSE_D_PASSWORD",
+    ],
 )
 def test_get_settings_rejects_secrets_in_process_environment(
     tmp_path, monkeypatch, sensitive_key: str
@@ -110,6 +113,23 @@ def test_query_read_and_memory_limits_are_not_service_configuration() -> None:
     assert "QUERY_MAX_MEMORY_BYTES" not in aliases
 
 
+def test_query_retry_defaults_are_bounded_to_three_retries() -> None:
+    settings = Settings()
+
+    assert settings.query_retry_max_retries == 3
+    assert settings.query_retry_base_delay_seconds == 0.25
+
+    disabled = Settings(
+        QUERY_RETRY_MAX_RETRIES=0,
+        QUERY_RETRY_BASE_DELAY_SECONDS=0,
+    )
+    assert disabled.query_retry_max_retries == 0
+    assert disabled.query_retry_base_delay_seconds == 0
+
+    with pytest.raises(ValueError):
+        Settings(QUERY_RETRY_MAX_RETRIES=4)
+
+
 def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
     assert Settings().query_plan_compare_ttl_seconds == 900
     shortened = Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=600)
@@ -117,6 +137,39 @@ def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
 
     with pytest.raises(ValueError):
         Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=901)
+
+
+def test_single_query_plan_ttl_defaults_to_ten_minutes_and_is_bounded() -> None:
+    assert Settings().query_plan_ttl_seconds == 600
+    shortened = Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=300)
+    assert shortened.query_plan_ttl_seconds == 300
+
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=59)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=901)
+
+
+def test_dlc_permission_resolution_has_bounded_default_timeouts() -> None:
+    settings = Settings()
+
+    assert settings.dlc_permission_timeout_seconds == 20
+    assert settings.dlc_operation_timeout_seconds == 45
+    assert settings.dlc_query_timeout_seconds == 60
+    assert settings.dlc_api_call_timeout_seconds == 6
+    assert settings.dlc_api_max_attempts == 2
+    assert settings.dlc_permission_timeout_seconds < settings.query_timeout_seconds
+    assert Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=90).dlc_operation_timeout_seconds == 90
+    assert Settings(DATA_MCP_DLC_QUERY_TIMEOUT_SECONDS=180).dlc_query_timeout_seconds == 180
+
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS=46)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS=181)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_QUERY_TIMEOUT_SECONDS=181)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_DLC_API_MAX_ATTEMPTS=4)
 
 
 def test_tchouse_d_provider_requires_explicit_warehouse_endpoints(monkeypatch) -> None:

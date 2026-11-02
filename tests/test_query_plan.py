@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from ksher_agent_data_mcp.config import Settings
+from ksher_agent_data_mcp.credentials.base import CredentialBackendUnavailable
 from ksher_agent_data_mcp.dependencies import build_container
 from ksher_agent_data_mcp.models.contracts import (
     CredentialRef,
@@ -87,6 +88,9 @@ def run_with_plan(
 
 def assert_plan_error(result: dict, expected_code: str) -> None:
     assert result["status"] == Status.VALIDATION_ERROR
+    assert result["error_code"] == expected_code
+    assert result["failure_stage"] == "query_plan_validation"
+    assert result["retryable"] is False
     assert [issue["code"] for issue in result["issues"]] == [expected_code]
     assert SQL not in str(result)
 
@@ -427,6 +431,69 @@ def test_compare_plan_allows_exactly_two_runs_and_audits_each_run(monkeypatch) -
     )
 
 
+def test_query_plan_execution_audits_single_policy_issue_as_safe_error_code(
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = build_service()
+    plan_id = issue_baseline_plan(service)
+    credential_error = service._credential_resolution_error(
+        DATASOURCE,
+        code="credential_backend_unavailable",
+        message="backend unavailable",
+        suggested_action="retry later",
+    )
+    monkeypatch.setattr(
+        service,
+        "_execute_sql_for_user",
+        lambda *args, **kwargs: credential_error,
+    )
+
+    result = run_with_plan(service, plan_id)
+
+    assert result["status"] == Status.NOT_FOUND
+    execution = [event for event in events if event.event_type == "query_plan_execution"][-1]
+    assert execution.detail["issue_codes"] == ["credential_backend_unavailable"]
+    assert execution.detail["error_code"] == "credential_backend_unavailable"
+
+
+def test_credential_backend_failure_emits_action_level_audit_without_public_detail(
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    service = build_service()
+    monkeypatch.setattr(
+        service.container.credentials,
+        "resolve",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            CredentialBackendUnavailable(
+                "tc_call_timeout",
+                operation="DescribeUserInfo",
+                retryable=True,
+                elapsed_ms=6200,
+            )
+        ),
+    )
+
+    user = service._build_user_context(UNION_ID, OPEN_ID, APP_ID)
+    assert not isinstance(user, dict)
+    result = service._resolve_credential(
+        user,
+        DATASOURCE,
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+
+    assert result["issues"][0]["code"] == "credential_backend_unavailable"
+    assert "tc_call_timeout" not in str(result)
+    audit = [event for event in events if event.event_type == "credential_resolution_failed"][-1]
+    assert audit.detail["backend_error_code"] == "tc_call_timeout"
+    assert audit.detail["backend_action"] == "DescribeUserInfo"
+    assert audit.detail["retryable"] is True
+    assert audit.detail["elapsed_ms"] == 6200
+
+
 def test_compare_plan_uses_independent_bounded_ttl() -> None:
     store = QueryPlanStore(ttl_seconds=300, compare_ttl_seconds=900)
     single = store.issue(
@@ -489,6 +556,31 @@ def test_compare_plan_store_rejects_ttl_above_server_cap() -> None:
         assert "server-side maximum" in str(exc)
     else:
         raise AssertionError("compare TTL above 15 minutes must be rejected")
+
+
+def test_single_plan_store_rejects_ttl_above_server_cap() -> None:
+    try:
+        QueryPlanStore(ttl_seconds=901)
+    except ValueError as exc:
+        assert "server-side maximum" in str(exc)
+    else:
+        raise AssertionError("single TTL above 15 minutes must be rejected")
+
+
+def test_service_uses_configured_single_plan_ttl() -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+                DATA_MCP_QUERY_PLAN_TTL_SECONDS=420,
+            )
+        )
+    )
+
+    assert service.query_plans.ttl_seconds == 420
 
 
 def test_compare_plan_atomic_counter_allows_only_two_concurrent_consumers() -> None:
@@ -588,6 +680,114 @@ def _service_with_sql_error(error_name: str) -> DataMcpService:
         )
     )
     return DataMcpService(replace(base, executor=_SqlErrorExecutor(error_name)))
+
+
+class _RetrySequenceExecutor:
+    def __init__(self, error_code: str, failures_before_success: int) -> None:
+        self.error_code = error_code
+        self.failures_before_success = failures_before_success
+        self.calls = 0
+
+    def run(self, credential, sql, timeout_seconds):
+        self.calls += 1
+        if self.calls <= self.failures_before_success:
+            return QueryResult(
+                status=Status.ERROR,
+                result_class=ResultClass.INCONCLUSIVE,
+                query_id=f"q_retry_{self.calls}",
+                datasource="tchouse-c",
+                sql=sql,
+                error_code=self.error_code,
+                retryable=True,
+                failure_stage="query_execution",
+            )
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_retry_success",
+            datasource="tchouse-c",
+            sql=sql,
+            rows=[{"value": 1}],
+            row_count=1,
+        )
+
+
+def _service_with_retry_executor(executor: _RetrySequenceExecutor) -> DataMcpService:
+    base = build_container(
+        Settings(
+            CREDENTIAL_PROVIDER="memory",
+            CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+            METADATA_PROVIDER="memory",
+            QUERY_EXECUTOR="dry_run",
+            QUERY_RETRY_MAX_RETRIES=3,
+            QUERY_RETRY_BASE_DELAY_SECONDS=0,
+        )
+    )
+    return DataMcpService(replace(base, executor=executor))
+
+
+def test_query_plan_retries_safe_predispatch_failure_three_times(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    executor = _RetrySequenceExecutor("query_concurrency_limit", 3)
+    service = _service_with_retry_executor(executor)
+    plan_id = issue_baseline_plan(service)
+
+    result = run_with_plan(service, plan_id)
+
+    assert result["status"] == Status.SUCCESS
+    assert result["query_plan_run_index"] == 1
+    assert result["query_attempt_index"] == 4
+    assert result["query_max_attempts"] == 4
+    assert result["query_retries_used"] == 3
+    assert executor.calls == 4
+    retry_events = [event for event in events if event.event_type == "query_retry_scheduled"]
+    assert [event.detail["attempt_index"] for event in retry_events] == [1, 2, 3]
+    assert {event.detail["retry_code"] for event in retry_events} == {
+        "query_concurrency_limit"
+    }
+
+    reused = run_with_plan(service, plan_id)
+    assert_plan_error(reused, "query_plan_already_consumed")
+
+
+def test_query_plan_retries_retryable_credential_backend_failure(monkeypatch) -> None:
+    service = build_service()
+    service.container.settings.query_retry_base_delay_seconds = 0
+    original_resolve = service.container.credentials.resolve
+    resolve_calls = 0
+
+    def flaky_resolve(*args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls <= 3:
+            raise CredentialBackendUnavailable(
+                "temporary_identity_backend_failure",
+                operation="resolve_user",
+                retryable=True,
+            )
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(service.container.credentials, "resolve", flaky_resolve)
+
+    result = run_with_plan(service, issue_baseline_plan(service))
+
+    assert result["status"] == Status.SUCCESS
+    assert result["query_attempt_index"] == 4
+    assert result["query_retries_used"] == 3
+    assert resolve_calls == 4
+
+
+def test_query_plan_does_not_retry_ambiguous_execution_timeout() -> None:
+    executor = _RetrySequenceExecutor("query_timeout", 1)
+    service = _service_with_retry_executor(executor)
+
+    result = run_with_plan(service, issue_baseline_plan(service))
+
+    assert result["status"] == Status.ERROR
+    assert result["error_code"] == "query_timeout"
+    assert result["query_attempt_index"] == 1
+    assert result["query_retries_used"] == 0
+    assert executor.calls == 1
 
 
 def test_repair_chain_counts_only_explicit_failed_repair_chain() -> None:
@@ -695,7 +895,7 @@ def test_validate_audits_credential_resolution_failure(monkeypatch) -> None:
     monkeypatch.setattr(
         service,
         "_resolve_validation_credential",
-        lambda user, datasource: credential_error,
+        lambda user, datasource, audit_context=None: credential_error,
     )
 
     result = service.validate_sql_for_user(
@@ -728,7 +928,7 @@ def test_validate_audits_account_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(
         service,
         "_resolve_validation_credential",
-        lambda user, datasource: credential,
+        lambda user, datasource, audit_context=None: credential,
     )
 
     result = service.validate_sql_for_user(

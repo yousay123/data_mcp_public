@@ -69,7 +69,7 @@ def _audit_context(identity: dict[str, str | None]) -> dict[str, str | None]:
 @mcp.tool()
 def validate_sql_for_user(
     sql: str,
-    datasource: Literal["tchouse-c"] = "tchouse-c",
+    datasource: str = "tchouse-c",
     repair_chain_id: str | None = None,
     execution_mode: Literal["single", "compare"] = "single",
     ctx: Context | None = None,
@@ -92,7 +92,7 @@ def validate_sql_for_user(
 def run_query_for_user(
     sql: str,
     query_plan_id: str,
-    datasource: Literal["tchouse-c"] = "tchouse-c",
+    datasource: str = "tchouse-c",
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Execute read-only SQL using the turn-snapshot identity injected by the agent host."""
@@ -112,7 +112,7 @@ def run_query_for_user(
 def export_query_to_excel_file(
     sql: str,
     query_plan_id: str,
-    datasource: Literal["tchouse-c"] = "tchouse-c",
+    datasource: str = "tchouse-c",
     filename: str | None = None,
     max_export_rows: Annotated[int, Field(ge=1)] | None = None,
     expected_source_version: Annotated[str, Field(min_length=1, max_length=256)] | None = None,
@@ -154,6 +154,24 @@ def search_metadata_snapshot(
 ) -> dict[str, Any]:
     """Search the signed local metadata snapshot for candidate recall only."""
     return service.search_metadata_snapshot(query=query, limit=limit, priority=priority)
+
+
+@mcp.tool()
+def search_dlc_tables_for_user(
+    query: Annotated[str, Field(min_length=1, max_length=500)],
+    limit: Annotated[int, Field(ge=1, le=20)] = 5,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Find authoritative DLC table candidates under the trusted caller identity."""
+    identity = _required_hidden_identity(ctx)
+    return service.search_dlc_tables_for_user(
+        request_user_union_id=identity["request_user_union_id"],
+        request_user_open_id=identity.get("request_user_open_id"),
+        request_lark_app_id=identity.get("request_lark_app_id"),
+        query=query,
+        limit=limit,
+        audit_context=_audit_context(identity),
+    )
 
 
 @mcp.tool()
@@ -217,6 +235,7 @@ def get_runtime_diagnostics() -> dict[str, Any]:
         "metadata_provider": settings.metadata_provider,
         "credential_provider": settings.credential_provider,
         "query_executor": settings.query_executor,
+        "enabled_datasources": list(service._enabled_datasource_ids()),
         "mcp_identity_contract": identity_contract(),
         "stdio": {
             "server": "python-mcp-sdk",
