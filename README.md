@@ -58,6 +58,17 @@ host-only 路径（默认 `~/.config/ksher-agent-data-mcp/env`），不要把凭
 应增加独立的身份解析、元数据、SQL 方言和执行适配器，不能复用另一个数据源的
 权限判断。
 
+公开查询工具未传 `datasource` 时固定路由到 `tchouse-c`，不按注册表顺序选择，
+也不会在 TChouse-C 失败后自动切换到 DLC。只有当前请求明确指定 `dlc` 时才进入
+DLC 链路；若部署未启用 TChouse-C，省略数据源会直接返回
+`unsupported_datasource`，避免静默串线。
+
+单次查询计划仍只允许外部消费一次。该次执行内部对能够证明“查询尚未发出”的
+失败（目前为凭证后端暂不可用、查询并发槽位已满）最多重试 3 次，默认退避为
+0.25、0.5、1 秒。超时、网络中断及数据源返回错误可能发生在查询已经提交之后，
+因此不会自动重放。可通过 `QUERY_RETRY_MAX_RETRIES`（上限 3）和
+`QUERY_RETRY_BASE_DELAY_SECONDS` 调整或关闭安全重试。
+
 DLC 入口只接受 BotMux 注入的可信身份，并从 host-only 文件按 `union_id` 取 CAM UIN。
 映射文件可由人工维护的飞书多维表格导出，
 但运行时只读取本机私有快照，不向模型暴露 CAM UIN。每条记录必须显式标记

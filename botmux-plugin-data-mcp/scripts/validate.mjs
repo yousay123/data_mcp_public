@@ -1056,7 +1056,7 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
-        DATA_MCP_ENABLED_DATASOURCES: 'tchouse-c,dlc',
+        DATA_MCP_ENABLED_DATASOURCES: 'dlc,tchouse-c',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
     });
@@ -1131,13 +1131,67 @@ try {
     ]) {
       if (
         JSON.stringify(schema?.properties?.datasource?.enum)
-        !== JSON.stringify(['tchouse-c', 'dlc'])
+        !== JSON.stringify(['dlc', 'tchouse-c'])
       ) {
         fail(`${name} datasource schema must expose the configured datasource registry`);
       }
       if (schema?.properties?.datasource?.default !== 'tchouse-c') {
         fail(`${name} datasource schema must default to tchouse-c when it is enabled`);
       }
+    }
+    const dlcOnlyProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
+      cwd: cleanRoot,
+      input: [
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        },
+        {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: {
+            name: 'validate_sql_for_user',
+            arguments: { sql: 'SELECT 1' },
+            _meta: {
+              botmuxTrustedCaller: {
+                requestUserOpenId: 'ou_test',
+                requestUserUnionId: 'on_test',
+                requestLarkAppId: 'cli_test',
+              },
+            },
+          },
+        },
+      ].map(message => JSON.stringify(message)).join('\n') + '\n',
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: {
+        ...process.env,
+        BOTMUX_SESSION_ID: 'session_dlc_only_probe',
+        BOTMUX_TRUSTED_TURN_FILE: '',
+        SESSION_DATA_DIR: '',
+        DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
+        DATA_MCP_ENABLED_DATASOURCES: 'dlc',
+      },
+    });
+    if (dlcOnlyProbe.status !== 0) {
+      fail(`DLC-only default datasource probe failed: ${dlcOnlyProbe.stderr}`);
+    }
+    const dlcOnlyResponses = (dlcOnlyProbe.stdout ?? '')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const dlcOnlyById = new Map(dlcOnlyResponses.map(response => [response.id, response]));
+    const dlcOnlyValidateSchema = dlcOnlyById.get(1)?.result?.tools
+      ?.find(tool => tool.name === 'validate_sql_for_user')?.inputSchema;
+    if (Object.hasOwn(dlcOnlyValidateSchema?.properties?.datasource ?? {}, 'default')) {
+      fail('DLC-only schema must not advertise DLC as the implicit datasource');
+    }
+    const omittedDatasourceText = dlcOnlyById.get(2)?.result?.content?.[0]?.text ?? '';
+    if (!omittedDatasourceText.includes('unsupported_datasource')) {
+      fail('omitted datasource must fail closed instead of falling through to DLC');
     }
     const dlcDiscoveryDescription = tools.find(tool => tool.name === 'search_dlc_tables_for_user')?.description ?? '';
     for (const requiredText of ['explicitly names DLC/WeData', 'default to TChouse-C/ClickHouse', 'never infer DLC from an earlier query or test']) {

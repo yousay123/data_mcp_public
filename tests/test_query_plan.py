@@ -682,6 +682,114 @@ def _service_with_sql_error(error_name: str) -> DataMcpService:
     return DataMcpService(replace(base, executor=_SqlErrorExecutor(error_name)))
 
 
+class _RetrySequenceExecutor:
+    def __init__(self, error_code: str, failures_before_success: int) -> None:
+        self.error_code = error_code
+        self.failures_before_success = failures_before_success
+        self.calls = 0
+
+    def run(self, credential, sql, timeout_seconds):
+        self.calls += 1
+        if self.calls <= self.failures_before_success:
+            return QueryResult(
+                status=Status.ERROR,
+                result_class=ResultClass.INCONCLUSIVE,
+                query_id=f"q_retry_{self.calls}",
+                datasource="tchouse-c",
+                sql=sql,
+                error_code=self.error_code,
+                retryable=True,
+                failure_stage="query_execution",
+            )
+        return QueryResult(
+            status=Status.SUCCESS,
+            query_id="q_retry_success",
+            datasource="tchouse-c",
+            sql=sql,
+            rows=[{"value": 1}],
+            row_count=1,
+        )
+
+
+def _service_with_retry_executor(executor: _RetrySequenceExecutor) -> DataMcpService:
+    base = build_container(
+        Settings(
+            CREDENTIAL_PROVIDER="memory",
+            CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+            METADATA_PROVIDER="memory",
+            QUERY_EXECUTOR="dry_run",
+            QUERY_RETRY_MAX_RETRIES=3,
+            QUERY_RETRY_BASE_DELAY_SECONDS=0,
+        )
+    )
+    return DataMcpService(replace(base, executor=executor))
+
+
+def test_query_plan_retries_safe_predispatch_failure_three_times(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(service_module.audit_logger, "emit", events.append)
+    executor = _RetrySequenceExecutor("query_concurrency_limit", 3)
+    service = _service_with_retry_executor(executor)
+    plan_id = issue_baseline_plan(service)
+
+    result = run_with_plan(service, plan_id)
+
+    assert result["status"] == Status.SUCCESS
+    assert result["query_plan_run_index"] == 1
+    assert result["query_attempt_index"] == 4
+    assert result["query_max_attempts"] == 4
+    assert result["query_retries_used"] == 3
+    assert executor.calls == 4
+    retry_events = [event for event in events if event.event_type == "query_retry_scheduled"]
+    assert [event.detail["attempt_index"] for event in retry_events] == [1, 2, 3]
+    assert {event.detail["retry_code"] for event in retry_events} == {
+        "query_concurrency_limit"
+    }
+
+    reused = run_with_plan(service, plan_id)
+    assert_plan_error(reused, "query_plan_already_consumed")
+
+
+def test_query_plan_retries_retryable_credential_backend_failure(monkeypatch) -> None:
+    service = build_service()
+    service.container.settings.query_retry_base_delay_seconds = 0
+    original_resolve = service.container.credentials.resolve
+    resolve_calls = 0
+
+    def flaky_resolve(*args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls <= 3:
+            raise CredentialBackendUnavailable(
+                "temporary_identity_backend_failure",
+                operation="resolve_user",
+                retryable=True,
+            )
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(service.container.credentials, "resolve", flaky_resolve)
+
+    result = run_with_plan(service, issue_baseline_plan(service))
+
+    assert result["status"] == Status.SUCCESS
+    assert result["query_attempt_index"] == 4
+    assert result["query_retries_used"] == 3
+    assert resolve_calls == 4
+
+
+def test_query_plan_does_not_retry_ambiguous_execution_timeout() -> None:
+    executor = _RetrySequenceExecutor("query_timeout", 1)
+    service = _service_with_retry_executor(executor)
+
+    result = run_with_plan(service, issue_baseline_plan(service))
+
+    assert result["status"] == Status.ERROR
+    assert result["error_code"] == "query_timeout"
+    assert result["query_attempt_index"] == 1
+    assert result["query_retries_used"] == 0
+    assert executor.calls == 1
+
+
 def test_repair_chain_counts_only_explicit_failed_repair_chain() -> None:
     service = _service_with_sql_error("UNKNOWN_IDENTIFIER")
     chain_id = None

@@ -113,6 +113,23 @@ def test_query_read_and_memory_limits_are_not_service_configuration() -> None:
     assert "QUERY_MAX_MEMORY_BYTES" not in aliases
 
 
+def test_query_retry_defaults_are_bounded_to_three_retries() -> None:
+    settings = Settings()
+
+    assert settings.query_retry_max_retries == 3
+    assert settings.query_retry_base_delay_seconds == 0.25
+
+    disabled = Settings(
+        QUERY_RETRY_MAX_RETRIES=0,
+        QUERY_RETRY_BASE_DELAY_SECONDS=0,
+    )
+    assert disabled.query_retry_max_retries == 0
+    assert disabled.query_retry_base_delay_seconds == 0
+
+    with pytest.raises(ValueError):
+        Settings(QUERY_RETRY_MAX_RETRIES=4)
+
+
 def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
     assert Settings().query_plan_compare_ttl_seconds == 900
     shortened = Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=600)

@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     default_limit: int = Field(default=200, alias="DEFAULT_LIMIT", ge=1)
     query_timeout_seconds: int = Field(default=60, alias="QUERY_TIMEOUT_SECONDS", ge=1)
     query_max_concurrency: int = Field(default=4, alias="QUERY_MAX_CONCURRENCY", ge=1)
+    query_retry_max_retries: int = Field(
+        default=3, alias="QUERY_RETRY_MAX_RETRIES", ge=0, le=3
+    )
+    query_retry_base_delay_seconds: float = Field(
+        default=0.25,
+        alias="QUERY_RETRY_BASE_DELAY_SECONDS",
+        ge=0,
+        le=5,
+    )
     query_repair_max_failures: int = Field(
         default=3, alias="QUERY_REPAIR_MAX_FAILURES", ge=1, le=10
     )

@@ -1,4 +1,5 @@
 import hashlib
+import time
 from collections import OrderedDict
 from datetime import UTC, datetime
 from threading import Lock
@@ -56,6 +57,13 @@ from ksher_agent_data_mcp.source_version import (
 )
 
 AuditContext = dict[str, str | None]
+
+_SAFE_QUERY_RETRY_CODES = frozenset(
+    {
+        "credential_backend_unavailable",
+        "query_concurrency_limit",
+    }
+)
 
 
 class DataMcpService:
@@ -679,7 +687,7 @@ class DataMcpService:
             )
             return plan_error
         assert plan_run is not None
-        response = self._execute_sql_for_user(
+        response = self._execute_sql_with_safe_retries(
             user,
             sql,
             datasource,
@@ -801,7 +809,7 @@ class DataMcpService:
         # Fetch one sentinel row beyond the export ceiling. This distinguishes an
         # exact-limit complete result from a larger result without materializing
         # the full oversized query.
-        result = self._execute_sql_for_user(
+        result = self._execute_sql_with_safe_retries(
             user,
             sql,
             datasource,
@@ -1215,6 +1223,9 @@ class DataMcpService:
                     "result_class": response.get("result_class"),
                     "issue_codes": issue_codes,
                     "error_code": safe_error_code,
+                    "query_attempt_index": response.get("query_attempt_index"),
+                    "query_max_attempts": response.get("query_max_attempts"),
+                    "query_retries_used": response.get("query_retries_used"),
                     **self._audit_detail(audit_context),
                 },
             )
@@ -1441,6 +1452,62 @@ class DataMcpService:
         self._attach_sql_account_binding(response, credential)
         return response
 
+    def _execute_sql_with_safe_retries(
+        self,
+        user: UserContext,
+        sql: str,
+        datasource: str,
+        request_user_tchouse_account: str | None,
+        audit_context: AuditContext | None,
+        repair_chain_id: str | None = None,
+        result_max_rows: int | None = None,
+    ) -> dict[str, Any]:
+        max_attempts = self.container.settings.query_retry_max_retries + 1
+        response: dict[str, Any] = {}
+        for attempt_index in range(1, max_attempts + 1):
+            execute_kwargs: dict[str, Any] = {
+                "user": user,
+                "sql": sql,
+                "datasource": datasource,
+                "request_user_tchouse_account": request_user_tchouse_account,
+                "audit_context": audit_context,
+                "repair_chain_id": repair_chain_id,
+            }
+            if result_max_rows is not None:
+                execute_kwargs["result_max_rows"] = result_max_rows
+            response = self._execute_sql_for_user(**execute_kwargs)
+            response["query_attempt_index"] = attempt_index
+            response["query_max_attempts"] = max_attempts
+            response["query_retries_used"] = attempt_index - 1
+            retry_code = _safe_query_retry_code(response)
+            if retry_code is None or attempt_index >= max_attempts:
+                return response
+
+            delay_seconds = self.container.settings.query_retry_base_delay_seconds * (
+                2 ** (attempt_index - 1)
+            )
+            audit_logger.emit(
+                AuditEvent(
+                    event_type="query_retry_scheduled",
+                    union_id=user.union_id,
+                    feishu_user_id=user.feishu_user_id,
+                    lark_app_id=user.lark_app_id,
+                    email=user.email,
+                    status=Status.ERROR,
+                    detail={
+                        "datasource": datasource,
+                        "attempt_index": attempt_index,
+                        "max_attempts": max_attempts,
+                        "retry_code": retry_code,
+                        "delay_seconds": delay_seconds,
+                        **self._audit_detail(audit_context),
+                    },
+                )
+            )
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+        return response
+
     def _attach_sql_account_binding(
         self,
         response: dict[str, Any],
@@ -1564,12 +1631,15 @@ class DataMcpService:
                     },
                 )
             )
-            return self._credential_resolution_error(
+            response = self._credential_resolution_error(
                 datasource,
                 code="credential_backend_unavailable",
                 message=f"{datasource} 权限解析后端暂时不可用，未执行查询",
                 suggested_action="请稍后重试；若持续失败，请维护方检查权限解析链路",
             )
+            response["retryable"] = exc.retryable
+            response["failure_stage"] = "credential_resolution"
+            return response
         except UnsupportedCredentialDatasource:
             return self._credential_resolution_error(
                 datasource,
@@ -2031,6 +2101,25 @@ def _query_plan_audit_ref(query_plan_id: str | None) -> str | None:
     if not isinstance(query_plan_id, str) or not query_plan_id.strip():
         return None
     return hashlib.sha256(query_plan_id.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_query_retry_code(response: dict[str, Any]) -> str | None:
+    if response.get("status") == Status.SUCCESS.value:
+        return None
+    if response.get("retryable") is not True:
+        return None
+
+    error_code = response.get("error_code")
+    if isinstance(error_code, str) and error_code in _SAFE_QUERY_RETRY_CODES:
+        return error_code
+
+    issue_codes = {
+        issue.get("code")
+        for issue in response.get("issues", [])
+        if isinstance(issue, dict) and isinstance(issue.get("code"), str)
+    }
+    matched = issue_codes & _SAFE_QUERY_RETRY_CODES
+    return next(iter(matched)) if len(matched) == 1 else None
 
 
 def _account_audit_ref(account: str) -> str | None:

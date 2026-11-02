@@ -165,6 +165,8 @@ def health() -> dict[str, Any]:
             "timeout_seconds": settings.query_timeout_seconds,
             "clickhouse_read_and_memory_limits": "cluster_profile",
             "max_concurrency": settings.query_max_concurrency,
+            "safe_retry_max_retries": settings.query_retry_max_retries,
+            "safe_retry_base_delay_seconds": settings.query_retry_base_delay_seconds,
             "repair_max_failures": settings.query_repair_max_failures,
             "query_plan_single_ttl_seconds": service.query_plans.ttl_seconds,
             "query_plan_compare_ttl_seconds": service.query_plans.compare_ttl_seconds,

@@ -279,7 +279,14 @@ function enabledDatasourceIds() {
 }
 
 function defaultDatasourceId(datasourceIds) {
-  return datasourceIds.includes('tchouse-c') ? 'tchouse-c' : datasourceIds[0];
+  return datasourceIds.includes('tchouse-c') ? 'tchouse-c' : undefined;
+}
+
+function queryDatasourceSchema(datasourceIds) {
+  const schema = { type: 'string', enum: datasourceIds };
+  const defaultDatasource = defaultDatasourceId(datasourceIds);
+  if (defaultDatasource) schema.default = defaultDatasource;
+  return schema;
 }
 function nonBlankProcessEnv(name) {
   // Security boundary: query-plan context must come from the host-owned child
@@ -1363,7 +1370,7 @@ async function callDataMcpService(kind, caller, args, runtimeConfig) {
   const enabledDatasources = enabledDatasourceIds();
   const datasource = typeof args.datasource === 'string' && args.datasource.trim()
     ? args.datasource.trim()
-    : enabledDatasources[0];
+    : 'tchouse-c';
   if (!enabledDatasources.includes(datasource)) {
     return {
       status: 'validation_error',
@@ -1679,7 +1686,7 @@ async function handleToolCall(request) {
 
 function toolSchemas() {
   const datasourceIds = enabledDatasourceIds();
-  const defaultDatasource = defaultDatasourceId(datasourceIds);
+  const datasourceSchema = queryDatasourceSchema(datasourceIds);
   const tools = [
     {
       name: 'data_mcp_identity_probe',
@@ -1708,7 +1715,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
+          datasource: datasourceSchema,
           execution_mode: { type: 'string', enum: ['single', 'compare'], default: 'single' },
           repair_chain_id: { type: 'string', description: 'Reuse only when correcting the same failed SQL attempt.' },
         },
@@ -1723,7 +1730,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
+          datasource: datasourceSchema,
           query_plan_id: { type: 'string' },
         },
         required: ['sql', 'query_plan_id'],
@@ -1737,7 +1744,7 @@ function toolSchemas() {
         type: 'object',
         properties: {
           sql: { type: 'string' },
-          datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
+          datasource: datasourceSchema,
           query_plan_id: { type: 'string' },
           question: { type: 'string', minLength: 1, maxLength: 4000 },
           requested_outputs: {
