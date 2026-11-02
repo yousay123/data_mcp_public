@@ -56,7 +56,7 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
     assert "max_rows_to_read" not in payload["query_resource_limits"]
     assert "max_bytes_to_read" not in payload["query_resource_limits"]
     assert "max_memory_bytes" not in payload["query_resource_limits"]
-    assert payload["query_resource_limits"]["query_plan_single_ttl_seconds"] == 300
+    assert payload["query_resource_limits"]["query_plan_single_ttl_seconds"] == 600
     assert payload["query_resource_limits"]["query_plan_compare_ttl_seconds"] <= 900
     assert payload["export_receipt"] == {
         "schema_version": 1,
@@ -305,6 +305,56 @@ def test_snapshot_search_endpoint_uses_internal_service(monkeypatch) -> None:
     }
 
 
+def test_dlc_table_search_endpoint_forwards_trusted_identity(monkeypatch) -> None:
+    set_internal_auth(monkeypatch, "test-token")
+    captured = {}
+
+    def fake_search(union_id, open_id, query, app_id, audit_context, limit):
+        captured.update(
+            union_id=union_id,
+            open_id=open_id,
+            query=query,
+            app_id=app_id,
+            audit_context=audit_context,
+            limit=limit,
+        )
+        return {"status": "success", "candidates": []}
+
+    monkeypatch.setattr(api_module.service, "search_dlc_tables_for_user", fake_search)
+    response = TestClient(app).post(
+        "/agent/search-dlc-tables",
+        headers={"X-Internal-Auth": "test-token"},
+        json={
+            "request_user_union_id": "on_user",
+            "request_user_open_id": "ou_user",
+            "request_lark_app_id": "cli_test",
+            "caller_sender_type": "user",
+            "caller_session_id": "session_test",
+            "caller_turn_id": "turn_test",
+            "query": "昨天店铺表数据量",
+            "limit": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success", "candidates": []}
+    assert captured == {
+        "union_id": "on_user",
+        "open_id": "ou_user",
+        "query": "昨天店铺表数据量",
+        "app_id": "cli_test",
+        "audit_context": {
+            "caller_source": None,
+            "sender_type": "user",
+            "session_id": "session_test",
+            "task_id": None,
+            "turn_id": "turn_test",
+            "captured_at": None,
+        },
+        "limit": 3,
+    }
+
+
 def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) -> None:
     set_internal_auth(monkeypatch, "test-token")
     captured = {}
@@ -339,6 +389,7 @@ def test_snapshot_refresh_endpoint_forwards_only_trusted_context(monkeypatch) ->
         "audit_context": {
             "caller_source": "schedule_creator",
             "sender_type": None,
+            "session_id": None,
             "task_id": "task_test",
             "turn_id": None,
             "captured_at": None,

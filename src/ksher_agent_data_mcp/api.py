@@ -72,6 +72,7 @@ class MetadataSnapshotRefreshRequest(BaseModel):
     request_lark_app_id: str | None = None
     caller_source: str | None = None
     caller_sender_type: str | None = None
+    caller_session_id: str | None = None
     caller_task_id: str | None = None
     caller_turn_id: str | None = None
     caller_captured_at: str | None = None
@@ -80,6 +81,7 @@ class MetadataSnapshotRefreshRequest(BaseModel):
         return {
             "caller_source": self.caller_source,
             "sender_type": self.caller_sender_type,
+            "session_id": self.caller_session_id,
             "task_id": self.caller_task_id,
             "turn_id": self.caller_turn_id,
             "captured_at": self.caller_captured_at,
@@ -92,6 +94,11 @@ class MetadataSnapshotSearchRequest(BaseModel):
     query: str
     limit: int = 20
     priority: str | None = None
+
+
+class DlcTableSearchRequest(MetadataSnapshotRefreshRequest):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=5, ge=1, le=20)
 
 
 class SubjectsByTableRequest(MetadataSnapshotRefreshRequest):
@@ -278,6 +285,18 @@ def agent_search_metadata_snapshot(request: MetadataSnapshotSearchRequest) -> di
         query=request.query,
         limit=request.limit,
         priority=request.priority,
+    )
+
+
+@app.post("/agent/search-dlc-tables", dependencies=[Depends(require_internal_http_auth)])
+def agent_search_dlc_tables(request: DlcTableSearchRequest) -> dict[str, Any]:
+    return service.search_dlc_tables_for_user(
+        request.request_user_union_id,
+        request.request_user_open_id,
+        request.query,
+        request.request_lark_app_id,
+        audit_context=request.audit_context(),
+        limit=request.limit,
     )
 
 

@@ -33,7 +33,7 @@ let records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
 for (const id of ['om_topic', 'om_group', 'om_p2p']) {
   const send = records.find(row => row.args[0] === 'send' && row.args.includes(id));
   if (!send) throw new Error(`signed turnId was not used for ${id}`);
-  if (!send.args.includes('--quote') || !send.args.includes('--response-kind') || !send.args.includes('auxiliary')) {
+  if (!send.args.includes('--quote') || !send.args.includes('--response-kind') || !send.args.includes('final')) {
     throw new Error(`direct reply controls missing for ${id}`);
   }
   if (send.args.some(arg => /chat_id|open_id|receive_id/.test(arg))) {
@@ -64,7 +64,7 @@ for (const send of [fileSend, noticeSend]) {
   }
 }
 if (fileSend.args[fileSend.args.indexOf('--response-kind') + 1] !== 'auxiliary'
-  || noticeSend.args[noticeSend.args.indexOf('--response-kind') + 1] !== 'progress') {
+  || noticeSend.args[noticeSend.args.indexOf('--response-kind') + 1] !== 'final') {
   throw new Error('file/text response lanes were not separated');
 }
 

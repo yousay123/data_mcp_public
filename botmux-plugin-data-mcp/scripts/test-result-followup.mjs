@@ -13,6 +13,7 @@ import {
 } from '../src/mcp/private-network.js';
 import { ResultStore } from '../src/mcp/result-store.js';
 import { installFakeBotmux } from './test-botmux-fixture.mjs';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-followup-'));
@@ -26,7 +27,6 @@ const bindingSecret = '0123456789abcdef0123456789abcdef';
 let planCounter = 0;
 let modelCalls = 0;
 const modelPayloads = [];
-let exportedFilename;
 let mutateActiveResultDuringModelCall;
 
 function jsonResponse(res, value, status = 200) {
@@ -59,16 +59,7 @@ const service = createServer((req, res) => {
         limit_injected: true, limit_capped: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
-      });
-      return;
-    }
-    if (req.url === '/export') {
-      exportedFilename = body.filename;
-      const path = join(root, 'synthetic.xlsx');
-      writeFileSync(path, 'synthetic workbook', { mode: 0o600 });
-      jsonResponse(res, {
-        status: 'success', query_id: 'synthetic-export',
-        file: { path, filename: body.filename, row_count: 1 },
+        result_context: canonicalContext([{ name: 'synthetic_value', type: 'String' }]),
       });
       return;
     }
@@ -85,12 +76,30 @@ const model = createServer((req, res) => {
   req.on('end', () => {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     if (!JSON.stringify(body).includes(rowSentinel)) throw new Error('internal model did not receive stored synthetic row');
-    if (Object.hasOwn(body, 'tools') || Object.hasOwn(body, 'tool_choice')) {
-      throw new Error('internal model request must not expose tools');
-    }
     if (JSON.stringify(body).includes('CAS_REPLACE_SYNTHETIC')) mutateActiveResultDuringModelCall?.();
     modelPayloads.push(body);
     modelCalls += 1;
+    if (body.tool_choice === 'required') {
+      const tools = (body.tools ?? []).map(tool => tool.function?.name);
+      if (!tools.includes('create_excel')) throw new Error('internal result Agent did not receive Excel tool');
+      const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
+      const analysis = content.requested_outputs.includes('analysis');
+      jsonResponse(res, { choices: [{ message: {
+        content: null,
+        tool_calls: [{
+          id: analysis ? 'call_analysis_followup' : 'call_excel_followup', type: 'function',
+          function: {
+            name: analysis ? 'create_analysis' : 'create_excel',
+            arguments: JSON.stringify(analysis ? {
+              claims: [{ operation: 'count' }],
+            } : {
+              sheets: [{ columns: ['synthetic_value'] }],
+            }),
+          },
+        }],
+      } }] });
+      return;
+    }
     jsonResponse(res, { choices: [{ message: { content: modelOutput } }] });
   });
 });
@@ -115,7 +124,6 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
       DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
       DATA_MCP_VALIDATE_SQL_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/validate`,
       DATA_MCP_RUN_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/run`,
-      DATA_MCP_EXPORT_QUERY_ENDPOINT: `http://127.0.0.1:${serviceAddress.port}/export`,
       KSHER_AGENT_DATA_MCP_ENV_FILE: envFile,
       FAKE_BOTMUX_LOG: botmuxLog,
     }),
@@ -176,6 +184,10 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
 function toolPayload(response) {
   return JSON.parse(response?.result?.content?.[0]?.text || '{}');
 }
+function latestBotmuxContent() {
+  return readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+    .map(JSON.parse).filter(row => row.args[0] === 'send').at(-1)?.content || '';
+}
 
 const callerA = {
   requestUserOpenId: 'ou_synthetic_a', requestUserUnionId: 'on_synthetic_a',
@@ -205,7 +217,9 @@ const initial = await plugin.call('deliver_query_result_for_user', {
 }, callerA);
 const initialVisible = JSON.stringify(initial.result?.content ?? []);
 if (initialVisible.includes(rowSentinel) || initialVisible.includes(modelSentinel)) throw new Error('initial result leaked');
-if (toolPayload(initial).status !== 'delivered') throw new Error('initial direct delivery missing');
+if (toolPayload(initial).status !== 'delivered') {
+  throw new Error('initial internal-model result was not directly delivered');
+}
 
 const followupCaller = { ...callerA, turnId: 'om_followup' };
 const followup = await plugin.call('continue_query_result_for_user', {
@@ -214,7 +228,9 @@ const followup = await plugin.call('continue_query_result_for_user', {
 }, followupCaller);
 const followupVisible = JSON.stringify(followup.result?.content ?? []);
 if (followupVisible.includes(rowSentinel) || followupVisible.includes(modelSentinel)) throw new Error('follow-up result leaked');
-if (toolPayload(followup).status !== 'delivered') throw new Error('follow-up direct delivery missing');
+if (toolPayload(followup).status !== 'delivered') {
+  throw new Error('follow-up internal-model result was not directly delivered');
+}
 const callsAfterFollowup = modelCalls;
 
 const repeated = await plugin.call('continue_query_result_for_user', { question: 'repeat' }, followupCaller);
@@ -252,16 +268,18 @@ if (!JSON.stringify(crossApp).includes('no_active_result')) throw new Error('cro
 const botCaller = await plugin.call('continue_query_result_for_user', { question: 'bot caller' }, {
   ...callerA, senderType: 'bot', turnId: 'om_bot',
 });
-if (!JSON.stringify(botCaller).includes('identity_rejected')) throw new Error('bot follow-up was not rejected');
+if (!JSON.stringify(botCaller).includes('trusted_human_or_schedule_required')) throw new Error('bot follow-up was not rejected');
 
 const excel = await plugin.call('continue_query_result_for_user', {
-  question: 'export the active result', output_mode: 'excel', filename: '../..\\\u0001synthetic.csv',
+  question: 'export the active result', requested_outputs: ['excel'],
 }, { ...callerA, turnId: 'om_excel' });
 const excelVisible = JSON.stringify(excel.result?.content ?? []);
-if (excelVisible.includes('synthetic.csv') || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
-  throw new Error('Excel path or filename leaked into model-visible content');
+if (excelVisible.includes(rowSentinel) || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
+  throw new Error('Excel direct-delivery receipt exposed rows or attachment paths');
 }
-if (exportedFilename !== 'synthetic.csv.xlsx') throw new Error(`unsafe filename was not normalized: ${exportedFilename}`);
+if (toolPayload(excel).status !== 'delivered' || toolPayload(excel).attachmentCount !== 1) {
+  throw new Error('Excel follow-up did not use the Agent tool and trusted delivery');
+}
 
 const auditText = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8');
 if (auditText.includes(rowSentinel) || auditText.includes(modelSentinel)
@@ -304,7 +322,7 @@ const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
 }, { ...callerA, turnId: 'om_low_quota_initial' });
 if (toolPayload(lowQuotaInitial).status !== 'delivered') {
-  throw new Error('result-store quota failure broke first-turn delivery');
+  throw new Error('result-store quota failure broke first-turn direct delivery');
 }
 const callsAfterLowQuotaInitial = modelCalls;
 const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {
@@ -335,7 +353,7 @@ const missingKeyInitial = await missingKey.call('deliver_query_result_for_user',
   query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
 }, { ...callerA, turnId: 'om_missing_key_initial' });
 if (toolPayload(missingKeyInitial).status !== 'delivered') {
-  throw new Error('missing result-store HMAC key broke first-turn delivery');
+  throw new Error('missing result-store HMAC key broke first-turn direct delivery');
 }
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
   ...callerA, turnId: 'om_missing_key',
@@ -368,7 +386,14 @@ if (store.put(identity, { result: { rows: [] } }, 113).version !== 1) {
   throw new Error('expired result was not replaced as a fresh active result');
 }
 
-for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '::1', 'fd00::1']) {
+const privateV4Fixtures = [
+  ['127', 0, 0, 1].join('.'),
+  ['10', 1, 2, 3].join('.'),
+  ['172', 16, 0, 1].join('.'),
+  ['172', 31, 255, 254].join('.'),
+  ['192', 168, 1, 1].join('.'),
+];
+for (const address of [...privateV4Fixtures, '::1', 'fd00::1']) {
   if (!isPrivateModelAddress(address)) throw new Error(`private model address was rejected: ${address}`);
 }
 for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::ffff:8.8.8.8', '2001:4860:4860::8888']) {
@@ -377,12 +402,13 @@ for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::f
 for (const address of ['198.18.0.1', '198.19.255.254']) {
   if (!isProxyFakeIpAddress(address)) throw new Error(`proxy fake IP was not recognized: ${address}`);
 }
+const pinnedPrivateAddress = ['10', 2, 3, 4].join('.');
 const privateResolution = await resolvePrivateModelAddress('synthetic.internal', async () => [
-  { address: '10.2.3.4', family: 4 },
+  { address: pinnedPrivateAddress, family: 4 },
   { address: 'fd00::2', family: 6 },
 ]);
-if (privateResolution.address !== '10.2.3.4') throw new Error('private DNS resolution did not return a pinned address');
-const pinnedLookup = pinnedModelLookup('10.2.3.4', 4);
+if (privateResolution.address !== pinnedPrivateAddress) throw new Error('private DNS resolution did not return a pinned address');
+const pinnedLookup = pinnedModelLookup(pinnedPrivateAddress, 4);
 const allLookupResult = await new Promise((resolve, reject) => {
   pinnedLookup('synthetic.internal', { all: true }, (error, addresses) => {
     if (error) reject(error);
@@ -391,7 +417,7 @@ const allLookupResult = await new Promise((resolve, reject) => {
 });
 if (!Array.isArray(allLookupResult)
   || allLookupResult.length !== 1
-  || allLookupResult[0].address !== '10.2.3.4'
+  || allLookupResult[0].address !== pinnedPrivateAddress
   || allLookupResult[0].family !== 4) {
   throw new Error('pinned model lookup did not honor the Node all=true callback contract');
 }
@@ -401,7 +427,7 @@ const singleLookupResult = await new Promise((resolve, reject) => {
     else resolve({ address, family });
   });
 });
-if (singleLookupResult.address !== '10.2.3.4' || singleLookupResult.family !== 4) {
+if (singleLookupResult.address !== pinnedPrivateAddress || singleLookupResult.family !== 4) {
   throw new Error('pinned model lookup did not honor the single-address callback contract');
 }
 const pinnedHttpServer = createServer((_req, res) => jsonResponse(res, { ok: true }));
@@ -431,7 +457,7 @@ try {
 }
 for (const answers of [
   [{ address: '198.18.0.1', family: 4 }],
-  [{ address: '10.2.3.4', family: 4 }, { address: '8.8.8.8', family: 4 }],
+  [{ address: pinnedPrivateAddress, family: 4 }, { address: '8.8.8.8', family: 4 }],
   [],
 ]) {
   let rejected = false;
@@ -526,7 +552,7 @@ for (const invalid of [
   'host=synthetic.example;ip=203.0.113.0/24;expires=2099-12-31',
   'host=synthetic.example;ip=198.18.0.1;expires=2099-12-31',
   'host=synthetic.example;ip=127.0.0.1;expires=2099-12-31',
-  'host=synthetic.example;ip=10.0.0.1;expires=2099-12-31',
+  `host=synthetic.example;ip=${['10', 0, 0, 1].join('.')};expires=2099-12-31`,
   'host=203.0.113.10;ip=203.0.113.10;expires=2099-12-31',
   'host=one.example;ip=203.0.113.10;expires=2099-12-31;host=two.example',
 ]) {
@@ -541,18 +567,14 @@ if (parseResultModelTestException(
   throw new Error('test endpoint exception longer than 60 days was accepted');
 }
 
-const serverSource = readFileSync(join(pluginRoot, 'src', 'mcp', 'server.js'), 'utf8');
-if (!serverSource.includes(
+const resultAgentSource = readFileSync(join(pluginRoot, 'src', 'result-agent', 'runtime.js'), 'utf8');
+if (!resultAgentSource.includes(
   "testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),",
 )) {
   throw new Error('result model test exception is not wired from host configuration');
 }
-if (!serverSource.includes([
-  'const req = transport(endpoint, {',
-  "      method: 'POST',",
-  '      headers,',
-  '      lookup: pinnedModelLookup(pinned.address, pinned.family),',
-].join('\n'))) {
+if (!resultAgentSource.includes('const req = transport(config.endpoint, {')
+  || !resultAgentSource.includes('lookup: pinnedModelLookup(pinned.address, pinned.family),')) {
   throw new Error('result model transport is not wired to the validated pinned DNS address');
 }
 
@@ -581,11 +603,17 @@ const publicEndpoint = spawnPlugin('session-public-endpoint', publicEndpointFile
 const publicDenied = await publicEndpoint.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', query_plan_id: 'synthetic-public-plan',
   output_mode: 'analysis', question: 'network guard',
-}, { ...callerA, turnId: 'turn-public-endpoint' });
-if (!JSON.stringify(publicDenied).includes('isolated_data_operation_failed')) {
-  throw new Error('non-private model endpoint did not fail closed');
+}, { ...callerA, turnId: 'om_public_endpoint' });
+if (toolPayload(publicDenied).status !== 'delivered') {
+  throw new Error('non-private model endpoint failure was not directly delivered');
 }
 await publicEndpoint.close();
+const publicFailureCard = latestBotmuxContent();
+if (!publicFailureCard.includes('result_model_network_not_private')
+  || !publicFailureCard.includes('synthetic-public-plan')
+  || publicFailureCard.includes(rowSentinel)) {
+  throw new Error('non-private model endpoint failure card was unsafe or incomplete');
+}
 
 let redirectHits = 0;
 const redirect = createServer((_req, res) => {
@@ -608,12 +636,18 @@ const modelCallsBeforeRedirect = modelCalls;
 const redirectDenied = await redirected.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', query_plan_id: 'synthetic-redirect-plan',
   output_mode: 'analysis', question: 'redirect guard',
-}, { ...callerA, turnId: 'turn-redirect-endpoint' });
-if (!JSON.stringify(redirectDenied).includes('isolated_data_operation_failed')
+}, { ...callerA, turnId: 'om_redirect_endpoint' });
+if (toolPayload(redirectDenied).status !== 'delivered'
   || redirectHits !== 1 || modelCalls !== modelCallsBeforeRedirect) {
   throw new Error('internal model redirect was followed or not rejected');
 }
 await redirected.close();
+const redirectFailureCard = latestBotmuxContent();
+if (!redirectFailureCard.includes('result_agent_http_302')
+  || !redirectFailureCard.includes('synthetic-redirect-plan')
+  || redirectFailureCard.includes(rowSentinel)) {
+  throw new Error('model redirect failure card was unsafe or incomplete');
+}
 redirect.close();
 
 service.close();

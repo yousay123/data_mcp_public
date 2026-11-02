@@ -16,6 +16,7 @@ import {
   resolveSignedAppTestProfile,
 } from '../src/mcp/signed-app-profile.js';
 import { installFakeBotmux } from './test-botmux-fixture.mjs';
+import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const testTmpRoot = process.platform === 'win32' ? tmpdir() : '/tmp';
@@ -28,6 +29,8 @@ const selectedAppId = 'cli_signed_profile_test';
 const otherAppId = 'cli_other_bot';
 const bindingSecret = '0123456789abcdef0123456789abcdef';
 const evilBindingSecret = 'profile-must-not-override-this-secret';
+const profileAuthToken = 'synthetic-profile-auth-token';
+const defaultAuthToken = 'synthetic-default-auth-token';
 const rowSentinel = 'SIGNED_PROFILE_ROW_SENTINEL';
 const modelSentinel = 'SIGNED_PROFILE_MODEL_SENTINEL';
 let modelCalls = 0;
@@ -43,6 +46,10 @@ const service = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
+    if (req.headers['x-internal-auth'] !== profileAuthToken) {
+      jsonResponse(res, { status: 'error' }, 401);
+      return;
+    }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
     if (req.url === '/agent/validate-sql') {
       jsonResponse(res, {
@@ -57,15 +64,7 @@ const service = createServer((req, res) => {
         status: 'success', datasource: 'tchouse-c', row_count: 1, truncated: false,
         columns: [{ name: 'synthetic_value', type: 'String' }],
         rows: [{ synthetic_value: rowSentinel }],
-      });
-      return;
-    }
-    if (req.url === '/agent/export-query-excel-file') {
-      const path = join(root, 'signed-profile.xlsx');
-      writeFileSync(path, 'synthetic workbook', { mode: 0o600 });
-      jsonResponse(res, {
-        status: 'success', query_id: 'signed-profile-export',
-        file: { path, filename: body.filename, row_count: 1 },
+        result_context: canonicalContext([{ name: 'synthetic_value', type: 'String' }]),
       });
       return;
     }
@@ -78,10 +77,30 @@ const model = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
-    const body = Buffer.concat(chunks).toString('utf8');
-    if (!body.includes(rowSentinel)) throw new Error('selected profile model did not receive synthetic result');
+    const bodyText = Buffer.concat(chunks).toString('utf8');
+    if (!bodyText.includes(rowSentinel)) throw new Error('selected profile model did not receive synthetic result');
+    const body = JSON.parse(bodyText);
     modelAuthorization = req.headers.authorization;
     modelCalls += 1;
+    if (body.tool_choice === 'required') {
+      const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
+      const analysis = content.requested_outputs.includes('analysis');
+      jsonResponse(res, { choices: [{ message: {
+        content: null,
+        tool_calls: [{
+          id: analysis ? 'call_signed_analysis' : 'call_signed_excel', type: 'function',
+          function: {
+            name: analysis ? 'create_analysis' : 'create_excel',
+            arguments: JSON.stringify(analysis ? {
+              claims: [{ operation: 'count' }],
+            } : {
+              sheets: [{ columns: ['synthetic_value'] }],
+            }),
+          },
+        }],
+      } }] });
+      return;
+    }
     jsonResponse(res, { choices: [{ message: { content: modelSentinel } }] });
   });
 });
@@ -89,8 +108,12 @@ await new Promise(resolvePromise => model.listen(0, '127.0.0.1', resolvePromise)
 const modelAddress = model.address();
 if (!modelAddress || typeof modelAddress === 'string') throw new Error('model fixture did not bind');
 
-const defaultService = createServer((_req, res) => {
+const defaultService = createServer((req, res) => {
   defaultServiceHits += 1;
+  if (req.headers['x-internal-auth'] !== defaultAuthToken) {
+    jsonResponse(res, { status: 'error' }, 401);
+    return;
+  }
   jsonResponse(res, { status: 'error' }, 503);
 });
 await new Promise(resolvePromise => defaultService.listen(0, '127.0.0.1', resolvePromise));
@@ -102,6 +125,7 @@ if (!defaultServiceAddress || typeof defaultServiceAddress === 'string') {
 function completeProfileLines(overrides = {}) {
   return {
     DATA_MCP_SERVICE_SOCKET_PATH: socketPath,
+    DATA_MCP_INTERNAL_AUTH_TOKEN: profileAuthToken,
     DATA_MCP_RESULT_MODEL_ENDPOINT: `http://127.0.0.1:${modelAddress.port}/v1/chat/completions`,
     DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS: '127.0.0.1',
     DATA_MCP_RESULT_MODEL: 'signed-profile-model',
@@ -114,19 +138,24 @@ function writeProfile(path, values, mode = 0o600) {
   writeFileSync(path, Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n', { mode });
 }
 
-const defaultEnvFile = join(root, 'default.env');
-writeFileSync(defaultEnvFile, [
-  `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
-  `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
-  `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
-  `DATA_MCP_EXPORT_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-export`,
-  `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
-  'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
-  'DATA_MCP_RESULT_MODEL=default-model',
-  'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
-  'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
-].join('\n') + '\n', { mode: 0o600 });
 const profileFile = join(root, 'test-profile.env');
+const defaultEnvFile = join(root, 'default.env');
+function writeHostEnv(path, selectorProfilePath) {
+  writeFileSync(path, [
+    `DATA_MCP_RESULT_BINDING_HMAC_KEY=${bindingSecret}`,
+    `DATA_MCP_INTERNAL_AUTH_TOKEN=${defaultAuthToken}`,
+    `DATA_MCP_VALIDATE_SQL_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-validate`,
+    `DATA_MCP_RUN_QUERY_ENDPOINT=http://127.0.0.1:${defaultServiceAddress.port}/default-run`,
+    `DATA_MCP_RESULT_MODEL_ENDPOINT=http://127.0.0.1:${modelAddress.port}/default-model`,
+    'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS=127.0.0.1',
+    'DATA_MCP_RESULT_MODEL=default-model',
+    'DATA_MCP_RESULT_MODEL_API_KEY=default-api-key',
+    `DATA_MCP_TEST_PROFILE_APP_ID=${selectedAppId}`,
+    `DATA_MCP_TEST_PROFILE_ENV_FILE=${selectorProfilePath}`,
+    'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION=host=default.example;ip=203.0.113.1;expires=2026-10-20',
+  ].join('\n') + '\n', { mode: 0o600 });
+}
+writeHostEnv(defaultEnvFile, profileFile);
 writeProfile(profileFile, completeProfileLines({
   DATA_MCP_RESULT_BINDING_HMAC_KEY: evilBindingSecret,
   BOTMUX_SESSION_ID: 'forbidden-profile-session',
@@ -142,8 +171,6 @@ function childEnvironment(extra = {}) {
     BOTMUX_SESSION_ID: 'signed-profile-session',
     BOTMUX_PLUGIN_HOME: pluginHome,
     KSHER_AGENT_DATA_MCP_ENV_FILE: defaultEnvFile,
-    DATA_MCP_TEST_PROFILE_APP_ID: selectedAppId,
-    DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
     FAKE_BOTMUX_APP_ID: selectedAppId,
     FAKE_BOTMUX_LOG: botmuxLog,
     ...extra,
@@ -180,6 +207,12 @@ function spawnPlugin(extraEnv = {}) {
     }
   });
   return {
+    listTools() {
+      const id = nextId++;
+      const response = new Promise(resolvePromise => pending.set(id, resolvePromise));
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list', params: {} })}\n`);
+      return response;
+    },
     call(name, arguments_, caller) {
       const id = nextId++;
       const response = new Promise(resolvePromise => pending.set(id, resolvePromise));
@@ -241,7 +274,6 @@ const initial = await plugin.call('deliver_query_result_for_user', {
 }, caller(selectedAppId, 'om_initial'));
 if (toolPayload(initial).status !== 'delivered'
   || JSON.stringify(initial.result?.content).includes(rowSentinel)
-  || JSON.stringify(initial.result?.content).includes(modelSentinel)
   || modelAuthorization !== 'Bearer synthetic-profile-api-key') {
   throw new Error('initial analysis did not use the selected model profile safely');
 }
@@ -249,20 +281,58 @@ if (toolPayload(initial).status !== 'delivered'
 const followup = await plugin.call('continue_query_result_for_user', {
   question: 'follow up', output_mode: 'analysis',
 }, caller(selectedAppId, 'om_followup'));
-if (toolPayload(followup).status !== 'delivered' || modelCalls !== 2) {
+if (toolPayload(followup).status !== 'delivered'
+  || modelCalls !== 2) {
   throw new Error('follow-up did not reuse the selected model profile and base HMAC binding');
 }
 
 const exported = await plugin.call('continue_query_result_for_user', {
-  question: 'export', output_mode: 'excel', filename: '../unsafe.xlsx',
+  question: 'export', requested_outputs: ['excel'],
 }, caller(selectedAppId, 'om_export'));
-if (toolPayload(exported).attachmentCount !== 1) {
-  throw new Error('follow-up export did not use the selected service profile');
+if (toolPayload(exported).status !== 'delivered'
+  || toolPayload(exported).attachmentCount !== 1
+  || modelCalls !== 3) {
+  throw new Error('follow-up Excel did not use the selected internal Agent profile exclusively');
 }
 await plugin.close();
 
+const singlePlugin = spawnPlugin({
+  BOTMUX_SESSION_ID: 'single-model-session',
+  DATA_MCP_MODEL_MODE: 'single',
+});
+const singleTools = (await singlePlugin.listTools()).result?.tools?.map(tool => tool.name) ?? [];
+if (singleTools.includes('deliver_query_result_for_user')
+  || singleTools.includes('continue_query_result_for_user')
+  || !singleTools.includes('run_query_for_user')
+  || singleTools.includes('export_query_to_excel_file')) {
+  throw new Error('single-model tool registration is incorrect');
+}
+const singleValidation = await singlePlugin.call('validate_sql_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+}, caller(selectedAppId, 'om_single_validate'));
+if (!JSON.stringify(singleValidation).includes('signed-profile-plan')) {
+  throw new Error('single-model validation did not use the selected service profile');
+}
+const singleRun = await singlePlugin.call('run_query_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'signed-profile-plan',
+}, caller(selectedAppId, 'om_single_run'));
+if (!JSON.stringify(singleRun).includes(rowSentinel)
+  || JSON.stringify(singleRun).includes('isolated_delivery_required')) {
+  throw new Error('single-model run did not return the service result');
+}
+const hiddenDualTool = await singlePlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'must stay hidden',
+}, caller(selectedAppId, 'om_single_hidden'));
+if (!JSON.stringify(hiddenDualTool).includes('unknown_tool:deliver_query_result_for_user')) {
+  throw new Error('single-model mode accepted a dual-model-only tool');
+}
+await singlePlugin.close();
+
 for (const [label, mutate] of [
   ['missing socket', values => { delete values.DATA_MCP_SERVICE_SOCKET_PATH; }],
+  ['missing internal auth', values => { delete values.DATA_MCP_INTERNAL_AUTH_TOKEN; }],
   ['missing model endpoint', values => { delete values.DATA_MCP_RESULT_MODEL_ENDPOINT; }],
   ['missing allowed hosts', values => { delete values.DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS; }],
   ['missing model', values => { delete values.DATA_MCP_RESULT_MODEL; }],
@@ -273,9 +343,11 @@ for (const [label, mutate] of [
   mutate(values);
   writeProfile(invalidPath, values);
   const hitsBefore = defaultServiceHits;
+  const invalidHostEnv = join(root, `${label.replaceAll(' ', '-')}-host.env`);
+  writeHostEnv(invalidHostEnv, invalidPath);
   const invalidProfilePlugin = spawnPlugin({
     BOTMUX_SESSION_ID: `invalid-${label.replaceAll(' ', '-')}`,
-    DATA_MCP_TEST_PROFILE_ENV_FILE: invalidPath,
+    KSHER_AGENT_DATA_MCP_ENV_FILE: invalidHostEnv,
   });
   const response = await invalidProfilePlugin.call('validate_sql_for_user', {
     sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -292,9 +364,11 @@ const noOptionalValues = completeProfileLines();
 delete noOptionalValues.DATA_MCP_RESULT_MODEL_API_KEY;
 writeProfile(noOptionalProfile, noOptionalValues);
 modelAuthorization = 'not-called';
+const noOptionalHostEnv = join(root, 'no-optional-host.env');
+writeHostEnv(noOptionalHostEnv, noOptionalProfile);
 const noOptionalPlugin = spawnPlugin({
   BOTMUX_SESSION_ID: 'no-optional-session',
-  DATA_MCP_TEST_PROFILE_ENV_FILE: noOptionalProfile,
+  KSHER_AGENT_DATA_MCP_ENV_FILE: noOptionalHostEnv,
 });
 const noOptionalResult = await noOptionalPlugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -307,14 +381,21 @@ if (toolPayload(noOptionalResult).status !== 'delivered'
 await noOptionalPlugin.close();
 
 clearSignedAppTestProfileCacheForTests();
-const direct = resolveSignedAppTestProfile({ requestLarkAppId: selectedAppId }, childEnvironment());
+const directSelectorEnv = {
+  ...childEnvironment(),
+  DATA_MCP_TEST_PROFILE_APP_ID: selectedAppId,
+  DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
+};
+const direct = resolveSignedAppTestProfile(
+  { requestLarkAppId: selectedAppId }, directSelectorEnv,
+);
 if (direct.DATA_MCP_SERVICE_SOCKET_PATH !== socketPath
   || Object.hasOwn(direct, 'DATA_MCP_RESULT_BINDING_HMAC_KEY')
   || Object.hasOwn(direct, 'BOTMUX_SESSION_ID')) {
   throw new Error('profile whitelist accepted identity or HMAC configuration');
 }
-if (resolveSignedAppTestProfile({ requestLarkAppId: otherAppId }, childEnvironment()) !== undefined
-  || resolveSignedAppTestProfile({}, childEnvironment()) !== undefined) {
+if (resolveSignedAppTestProfile({ requestLarkAppId: otherAppId }, directSelectorEnv) !== undefined
+  || resolveSignedAppTestProfile({}, directSelectorEnv) !== undefined) {
   throw new Error('unsigned or other-app caller selected the test profile');
 }
 
@@ -394,7 +475,23 @@ try {
 } catch (error) { malformedRejected = error?.message === 'test_profile_config_invalid'; }
 if (!malformedRejected) throw new Error('malformed profile did not fail closed');
 
-const invalidPlugin = spawnPlugin({ DATA_MCP_TEST_PROFILE_ENV_FILE: looseProfile });
+const processOverrideHitsBefore = defaultServiceHits;
+const processOverridePlugin = spawnPlugin({
+  DATA_MCP_TEST_PROFILE_APP_ID: otherAppId,
+  DATA_MCP_TEST_PROFILE_ENV_FILE: profileFile,
+});
+const processOverrideResponse = await processOverridePlugin.call('validate_sql_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+}, caller(otherAppId, 'process-override-turn'));
+if (JSON.stringify(processOverrideResponse).includes('signed-profile-plan')
+  || defaultServiceHits !== processOverrideHitsBefore + 1) {
+  throw new Error('process-level selector redirected a signed caller to the test profile');
+}
+await processOverridePlugin.close();
+
+const invalidHostEnvFile = join(root, 'invalid-selector-host.env');
+writeHostEnv(invalidHostEnvFile, looseProfile);
+const invalidPlugin = spawnPlugin({ KSHER_AGENT_DATA_MCP_ENV_FILE: invalidHostEnvFile });
 const invalidResponse = await invalidPlugin.call('validate_sql_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
 }, caller(selectedAppId, 'invalid-profile-turn'));

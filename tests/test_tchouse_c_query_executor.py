@@ -72,10 +72,108 @@ def test_clickhouse_transport_ignores_service_side_read_and_memory_limits(
     )
 
     assert seen_params["readonly"] == ["2"]
+    assert seen_params["output_format_json_quote_decimals"] == ["1"]
+    assert seen_params["output_format_json_quote_64bit_integers"] == ["1"]
     assert seen_params["max_result_rows"] == ["1000"]
     assert "max_rows_to_read" not in seen_params
     assert "max_bytes_to_read" not in seen_params
     assert "max_memory_usage" not in seen_params
+
+
+def test_clickhouse_transport_preserves_decimal_and_large_integer_tokens(
+    monkeypatch,
+) -> None:
+    seen_params: dict[str, list[str]] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return (
+                b'{"meta":['
+                b'{"name":"amount","type":"Decimal(38,2)"},'
+                b'{"name":"event_id","type":"UInt64"}],'
+                b'"data":[{"amount":"9007199254740993.01",'
+                b'"event_id":"18446744073709551615"}],"rows":1}'
+            )
+
+    def fake_urlopen(request, timeout):
+        seen_params.update(parse_qs(urlparse(request.full_url).query))
+        return FakeResponse()
+
+    monkeypatch.setattr(query_executor, "urlopen", fake_urlopen)
+    payload = query_executor.execute_clickhouse_json(
+        target=parse_clickhouse_jdbc_url(_credential().jdbc_url),
+        sql="SELECT amount, event_id FROM exact_values",
+        query_id="q_exact",
+        timeout_seconds=30,
+    )
+
+    assert seen_params["output_format_json_quote_decimals"] == ["1"]
+    assert seen_params["output_format_json_quote_64bit_integers"] == ["1"]
+    assert payload["data"] == [
+        {
+            "amount": "9007199254740993.01",
+            "event_id": "18446744073709551615",
+        }
+    ]
+
+
+def test_clickhouse_transport_defensively_preserves_unquoted_decimal(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"data":[{"amount":9007199254740993.01}],"rows":1}'
+
+    monkeypatch.setattr(query_executor, "urlopen", lambda request, timeout: FakeResponse())
+    payload = query_executor.execute_clickhouse_json(
+        target=parse_clickhouse_jdbc_url(_credential().jdbc_url),
+        sql="SELECT amount FROM legacy_proxy",
+        query_id="q_defensive",
+        timeout_seconds=30,
+    )
+
+    assert payload["data"][0]["amount"] == "9007199254740993.01"
+
+
+def test_tchouse_executor_keeps_exact_values_in_query_result(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            return (
+                b'{"meta":['
+                b'{"name":"amount","type":"Decimal(38,2)"},'
+                b'{"name":"event_id","type":"UInt64"}],'
+                b'"data":[{"amount":"9007199254740993.01",'
+                b'"event_id":"18446744073709551615"}],"rows":1}'
+            )
+
+    monkeypatch.setattr(query_executor, "urlopen", lambda request, timeout: FakeResponse())
+    result = TChouseCQueryExecutor(Settings()).run(
+        _credential(), "SELECT amount, event_id FROM exact_values", 30
+    )
+
+    assert result.status == Status.SUCCESS
+    assert result.rows == [
+        {
+            "amount": "9007199254740993.01",
+            "event_id": "18446744073709551615",
+        }
+    ]
 
 
 def test_tchouse_c_executor_converts_json_response(monkeypatch) -> None:

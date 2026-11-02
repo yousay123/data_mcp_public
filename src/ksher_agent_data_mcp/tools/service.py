@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from ksher_agent_data_mcp.audit.logger import AuditEvent, audit_logger
 from ksher_agent_data_mcp.credentials.base import (
+    CredentialBackendUnavailable,
     CredentialConfigurationMissing,
     CredentialMappingUnavailable,
     UnsupportedCredentialDatasource,
@@ -22,6 +23,7 @@ from ksher_agent_data_mcp.export import (
     new_export_id,
     sanitize_excel_filename,
 )
+from ksher_agent_data_mcp.metadata.catalog import MetadataAccessDenied, MetadataLookupError
 from ksher_agent_data_mcp.metadata.snapshot import (
     SnapshotError,
     refresh_metadata_snapshot,
@@ -29,6 +31,8 @@ from ksher_agent_data_mcp.metadata.snapshot import (
 )
 from ksher_agent_data_mcp.models.contracts import (
     CredentialRef,
+    DlcPrincipalRef,
+    ResolvedPrincipal,
     Status,
     UserContext,
     ValidationIssue,
@@ -39,6 +43,10 @@ from ksher_agent_data_mcp.query_plan import (
     QueryPlanRun,
     QueryPlanStore,
     RepairChainStore,
+)
+from ksher_agent_data_mcp.result_context import (
+    attach_returned_columns,
+    canonical_result_context,
 )
 from ksher_agent_data_mcp.source_version import (
     SourceVersionObservation,
@@ -64,11 +72,128 @@ class DataMcpService:
         # This process is intentionally single-worker; a multi-worker deploy
         # must move plans to shared storage before enabling this contract.
         self.query_plans = QueryPlanStore(
+            ttl_seconds=container.settings.query_plan_ttl_seconds,
             compare_ttl_seconds=container.settings.query_plan_compare_ttl_seconds
         )
         self.repair_chains = RepairChainStore(container.settings.query_repair_max_failures)
         self._inspection_calls: OrderedDict[tuple[str, str], int] = OrderedDict()
         self._inspection_calls_lock = Lock()
+
+    def search_dlc_tables_for_user(
+        self,
+        request_user_union_id: str,
+        request_user_open_id: str | None,
+        query: str,
+        request_lark_app_id: str | None = None,
+        audit_context: AuditContext | None = None,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        user_or_error = self._build_user_context(
+            request_user_union_id, request_user_open_id, request_lark_app_id
+        )
+        if isinstance(user_or_error, dict):
+            return user_or_error
+        user = user_or_error
+        if not self._is_trusted_human_or_schedule(audit_context):
+            error = self._caller_policy_error("DLC 表发现只允许受信任的真实用户或定时任务触发")
+            self._audit_rejected_caller(
+                "dlc_table_search",
+                request_user_union_id,
+                request_user_open_id,
+                request_lark_app_id,
+                audit_context,
+                error,
+            )
+            return error
+        normalized_query = query.strip()
+        if not normalized_query or len(normalized_query) > 500 or limit < 1 or limit > 20:
+            return {
+                "status": Status.VALIDATION_ERROR,
+                "result_class": "policy_error",
+                "error_code": "dlc_table_search_input_invalid",
+                "message": "DLC 表检索 query 不能为空且不超过 500 字符，limit 必须为 1 到 20",
+            }
+        credential = self._resolve_validation_credential(user, "dlc", audit_context)
+        if isinstance(credential, dict):
+            return credential
+        adapter = self._data_source_adapter("dlc")
+        if adapter is None:
+            return self._credential_resolution_error(
+                "dlc",
+                code="unsupported_datasource",
+                message="当前 MCP 未启用 DLC 数据源",
+                suggested_action="请维护方启用 DLC 数据源后重试",
+            )
+        try:
+            tables = adapter.sql_guard.catalog.suggest_tables(
+                normalized_query, limit=limit, credential=credential
+            )
+            response: dict[str, Any] = {
+                "status": Status.SUCCESS if tables else Status.NOT_FOUND,
+                "result_class": "success" if tables else "inconclusive",
+                "datasource": "dlc",
+                "region": getattr(credential, "region", None),
+                "catalog": getattr(credential, "catalog", None),
+                "candidates": [
+                    {
+                        "full_name": table.full_name,
+                        "description": table.description,
+                        "partition_fields": table.partition_fields,
+                        "columns": [
+                            {
+                                "name": column.name,
+                                "type": column.type,
+                                "description": column.description,
+                            }
+                            for column in table.columns[:30]
+                        ],
+                        "authoritative": True,
+                    }
+                    for table in tables
+                ],
+                "requires_confirmation": len(tables) != 1,
+            }
+            if not tables:
+                response["error_code"] = "dlc_table_no_match"
+                response["message"] = "当前用户可访问的 DLC 表中未找到可核验候选"
+            elif len(tables) > 1:
+                response["message"] = "找到多个已核验候选，请先让用户确认表名再生成 SQL"
+            else:
+                response["message"] = "找到唯一已核验候选，可按返回的完整表名和分区字段生成 SQL"
+        except MetadataAccessDenied:
+            response = {
+                "status": Status.VALIDATION_ERROR,
+                "result_class": "policy_error",
+                "error_code": "dlc_table_search_permission_denied",
+                "message": "当前用户无权读取候选表元数据",
+                "candidates": [],
+            }
+        except MetadataLookupError:
+            response = {
+                "status": Status.ERROR,
+                "result_class": "inconclusive",
+                "error_code": "dlc_table_search_unavailable",
+                "message": "DLC 表元数据检索暂不可用",
+                "candidates": [],
+            }
+        audit_logger.emit(
+            AuditEvent(
+                event_type="dlc_table_search",
+                union_id=user.union_id,
+                feishu_user_id=user.feishu_user_id,
+                lark_app_id=user.lark_app_id,
+                email=user.email,
+                status=response["status"],
+                detail={
+                    "datasource": "dlc",
+                    "query_hash": hashlib.sha256(normalized_query.encode()).hexdigest()[:16],
+                    "candidate_count": len(response.get("candidates", [])),
+                    "error_code": response.get("error_code"),
+                    **self._audit_detail(audit_context),
+                },
+            )
+        )
+        return response
 
     def inspect_ck_subjects_by_table(
         self,
@@ -400,7 +525,7 @@ class DataMcpService:
                 audit_context,
             )
             return chain_error
-        credential = self._resolve_validation_credential(user, datasource)
+        credential = self._resolve_validation_credential(user, datasource, audit_context)
         if isinstance(credential, dict):
             self._audit_query_plan_rejection(
                 user,
@@ -423,13 +548,17 @@ class DataMcpService:
                         request_user_tchouse_account or ""
                     ),
                     "resolved_account_ref": _account_audit_ref(
-                        credential.tchouse_account if credential else ""
+                        credential.tchouse_account
+                        if isinstance(credential, CredentialRef)
+                        else ""
                     ),
                 },
             )
             return account_error
 
-        result = self.container.sql_guard.validate(
+        adapter = self._data_source_adapter(datasource)
+        assert adapter is not None
+        result = adapter.sql_guard.validate(
             user,
             sql,
             datasource,
@@ -475,6 +604,12 @@ class DataMcpService:
                 trust_domain=trust_domain,
                 task_id=task_id,
                 execution_mode=execution_mode,
+                result_context=canonical_result_context(
+                    result.normalized_sql,
+                    datasource=datasource,
+                    tables=result.tables,
+                    referenced_columns=result.columns,
+                ),
             )
             response["query_plan_execution_mode"] = execution_mode
             response["query_plan_max_runs"] = EXECUTION_MODE_MAX_RUNS[execution_mode]
@@ -553,6 +688,11 @@ class DataMcpService:
             plan_run.repair_chain_id,
         )
         response = self._attach_repair_chain(response, plan_run.repair_chain_id)
+        if response.get("status") == Status.SUCCESS.value:
+            response["result_context"] = attach_returned_columns(
+                plan_run.result_context,
+                response.get("columns", []),
+            )
         self._audit_query_plan_execution(
             user,
             query_plan_id,
@@ -1008,18 +1148,19 @@ class DataMcpService:
         return session_id, trust_domain, task_id
 
     def _validate_public_query_datasource(self, datasource: str) -> dict[str, Any] | None:
-        if datasource == "tchouse-c":
+        if self._data_source_adapter(datasource) is not None:
             return None
+        supported = ", ".join(self._enabled_datasource_ids())
         return {
             "status": Status.VALIDATION_ERROR,
             "result_class": "policy_error",
-            "message": "当前公开查询入口仅支持 tchouse-c 数据源",
+            "message": f"当前公开查询入口未启用数据源：{datasource}",
             "issues": [
                 ValidationIssue(
                     code="unsupported_datasource",
                     severity="error",
-                    message="validate/run/export 仅允许 tchouse-c，已在凭证解析前拒绝",
-                    suggested_action="请将 datasource 改为 tchouse-c",
+                    message=f"validate/run/export 仅允许已配置数据源：{supported}",
+                    suggested_action=f"请将 datasource 改为以下值之一：{supported}",
                 ).model_dump()
             ],
             "permission_scope": "datasource",
@@ -1044,6 +1185,17 @@ class DataMcpService:
         response: dict[str, Any],
         audit_context: AuditContext | None,
     ) -> None:
+        issue_codes = [
+            issue.get("code")
+            for issue in response.get("issues", [])
+            if isinstance(issue, dict) and isinstance(issue.get("code"), str)
+        ]
+        response_error_code = response.get("error_code")
+        safe_error_code = (
+            response_error_code
+            if isinstance(response_error_code, str) and response_error_code
+            else issue_codes[0] if len(issue_codes) == 1 else None
+        )
         audit_logger.emit(
             AuditEvent(
                 event_type="query_plan_execution",
@@ -1061,7 +1213,8 @@ class DataMcpService:
                     "datasource": datasource,
                     "tables": response.get("tables", []),
                     "result_class": response.get("result_class"),
-                    "error_code": response.get("error_code"),
+                    "issue_codes": issue_codes,
+                    "error_code": safe_error_code,
                     **self._audit_detail(audit_context),
                 },
             )
@@ -1117,6 +1270,9 @@ class DataMcpService:
         return {
             "status": Status.VALIDATION_ERROR,
             "result_class": "policy_error",
+            "error_code": code,
+            "failure_stage": "query_plan_validation",
+            "retryable": False,
             "message": message,
             "issues": [
                 ValidationIssue(
@@ -1139,7 +1295,8 @@ class DataMcpService:
         repair_chain_id: str | None = None,
         result_max_rows: int | None = None,
     ) -> dict[str, Any]:
-        credential = self._resolve_credential(user, datasource)
+        operation_started = datetime.now(UTC)
+        credential = self._resolve_credential(user, datasource, audit_context=audit_context)
         if isinstance(credential, dict):
             return credential
         account_error = self._validate_expected_account(credential, request_user_tchouse_account)
@@ -1155,7 +1312,10 @@ class DataMcpService:
         if result_max_rows is not None:
             guard_kwargs["max_rows_ceiling"] = result_max_rows
             guard_kwargs["default_rows"] = result_max_rows
-        validation = self.container.sql_guard.validate(
+        adapter = self._data_source_adapter(datasource)
+        if adapter is None:
+            return self._validate_public_query_datasource(datasource) or {}
+        validation = adapter.sql_guard.validate(
             user,
             sql,
             datasource,
@@ -1184,14 +1344,24 @@ class DataMcpService:
             self._attach_sql_account_binding(response, credential)
             return response
 
+        executor_timeout = float(self.container.settings.query_timeout_seconds)
+        if datasource == "dlc":
+            elapsed = (datetime.now(UTC) - operation_started).total_seconds()
+            executor_timeout = max(
+                0.1,
+                min(
+                    self.container.settings.dlc_query_timeout_seconds,
+                    self.container.settings.dlc_operation_timeout_seconds - elapsed,
+                ),
+            )
         executor_kwargs: dict[str, Any] = {
             "credential": credential,
             "sql": validation.normalized_sql,
-            "timeout_seconds": self.container.settings.query_timeout_seconds,
+            "timeout_seconds": executor_timeout,
         }
         if result_max_rows is not None:
             executor_kwargs["max_rows"] = result_max_rows
-        result = self.container.executor.run(**executor_kwargs)
+        result = adapter.executor.run(**executor_kwargs)
         issue_codes = {issue.code for issue in validation.issues}
         result.limit_injected = "limit_injected" in issue_codes
         result.limit_capped = "limit_capped" in issue_codes
@@ -1218,10 +1388,9 @@ class DataMcpService:
                     result.truncated = True
                     result.quality_warnings.append("返回结果被服务行数上限截断")
                 elif result.row_count >= validation.effective_limit:
-                    # rows_before_limit_at_least is a lower bound and can equal
-                    # the returned row count when ClickHouse stops at LIMIT.
-                    # Fail closed without exact_rows_before_limit=1, which can
-                    # force a full scan and exceed read or timeout budgets.
+                    # rows_before_limit_at_least is only a lower bound. When it
+                    # cannot prove completeness, fail closed without forcing an
+                    # exact full scan that may exceed read or timeout budgets.
                     result.truncated = True
                     result.truncation_uncertain = True
                     result.quality_warnings.append(
@@ -1241,6 +1410,9 @@ class DataMcpService:
                 status=result.status,
                 detail={
                     "query_id": result.query_id,
+                    "provider_task_id": (
+                        result.query_id if validation.datasource == "dlc" else None
+                    ),
                     "credential": credential.masked(),
                     "tables": validation.tables,
                     "datasource": validation.datasource,
@@ -1272,7 +1444,7 @@ class DataMcpService:
     def _attach_sql_account_binding(
         self,
         response: dict[str, Any],
-        credential: CredentialRef | None,
+        credential: ResolvedPrincipal | None,
     ) -> None:
         if credential is None:
             return
@@ -1286,13 +1458,20 @@ class DataMcpService:
 
     def _validate_expected_account(
         self,
-        credential: CredentialRef | None,
+        credential: ResolvedPrincipal | None,
         expected_account: str | None,
     ) -> dict[str, Any] | None:
         if credential is None or not expected_account or not expected_account.strip():
             return None
 
         expected = expected_account.strip().lower()
+        if not isinstance(credential, CredentialRef):
+            return self._credential_resolution_error(
+                credential.datasource,
+                code="unexpected_tchouse_account",
+                message="非 TChouse 数据源不接受 request_user_tchouse_account",
+                suggested_action="请移除 TChouse 账号参数，由 BotMux 可信身份解析数据源主体",
+            )
         actual = credential.tchouse_account.strip().lower()
         if expected == actual:
             return None
@@ -1315,12 +1494,19 @@ class DataMcpService:
         }
 
     def _resolve_validation_credential(
-        self, user: UserContext, datasource: str
-    ) -> CredentialRef | None | dict[str, Any]:
-        if self.container.settings.metadata_provider != "tchouse_c":
+        self,
+        user: UserContext,
+        datasource: str,
+        audit_context: AuditContext | None = None,
+    ) -> ResolvedPrincipal | None | dict[str, Any]:
+        if datasource == "tchouse-c" and self.container.settings.metadata_provider != "tchouse_c":
             return None
-
-        return self._resolve_credential(user, datasource, for_catalog_probe=True)
+        return self._resolve_credential(
+            user,
+            datasource,
+            for_catalog_probe=True,
+            audit_context=audit_context,
+        )
 
     def _resolve_credential(
         self,
@@ -1328,9 +1514,18 @@ class DataMcpService:
         datasource: str,
         *,
         for_catalog_probe: bool = False,
-    ) -> CredentialRef | dict[str, Any]:
+        audit_context: AuditContext | None = None,
+    ) -> ResolvedPrincipal | dict[str, Any]:
+        adapter = self._data_source_adapter(datasource)
+        if adapter is None:
+            return self._credential_resolution_error(
+                datasource,
+                code="unsupported_datasource",
+                message=f"当前 MCP 未启用数据源：{datasource}",
+                suggested_action="请使用部署配置中已启用的数据源",
+            )
         try:
-            credential = self.container.credentials.resolve(user, datasource)
+            credential = adapter.credentials.resolve(user, datasource)
         except CredentialMappingUnavailable:
             return self._credential_resolution_error(
                 datasource,
@@ -1348,6 +1543,32 @@ class DataMcpService:
                 code="credential_config_missing",
                 message=f"Data MCP 缺少 {datasource} 凭证配置，无法解析数据库账号",
                 suggested_action="请联系 Data MCP 维护方检查服务端凭证配置",
+            )
+        except CredentialBackendUnavailable as exc:
+            audit_logger.emit(
+                AuditEvent(
+                    event_type="credential_resolution_failed",
+                    union_id=user.union_id,
+                    feishu_user_id=user.feishu_user_id,
+                    lark_app_id=user.lark_app_id,
+                    email=user.email,
+                    status=Status.ERROR,
+                    detail={
+                        "datasource": datasource,
+                        "error_code": "credential_backend_unavailable",
+                        "backend_error_code": exc.backend_code,
+                        "backend_action": exc.operation,
+                        "retryable": exc.retryable,
+                        "elapsed_ms": exc.elapsed_ms,
+                        **self._audit_detail(audit_context),
+                    },
+                )
+            )
+            return self._credential_resolution_error(
+                datasource,
+                code="credential_backend_unavailable",
+                message=f"{datasource} 权限解析后端暂时不可用，未执行查询",
+                suggested_action="请稍后重试；若持续失败，请维护方检查权限解析链路",
             )
         except UnsupportedCredentialDatasource:
             return self._credential_resolution_error(
@@ -1370,6 +1591,28 @@ class DataMcpService:
             suggested_action=f"确认飞书 union_id 和 {datasource} 账号映射是否存在",
             required_permission=f"{datasource} account mapping",
         )
+
+    def _enabled_datasource_ids(self) -> tuple[str, ...]:
+        registry = self.container.data_sources
+        return registry.ids if registry is not None else ("tchouse-c",)
+
+    def _data_source_adapter(self, datasource: str) -> Any:
+        registry = self.container.data_sources
+        if datasource == "tchouse-c":
+            if registry is not None and registry.get(datasource) is None:
+                return None
+            from ksher_agent_data_mcp.datasources.registry import DataSourceAdapter
+
+            return DataSourceAdapter(
+                datasource="tchouse-c",
+                adapter="legacy",
+                credentials=self.container.credentials,
+                sql_guard=self.container.sql_guard,
+                executor=self.container.executor,
+            )
+        if registry is not None:
+            return registry.get(datasource)
+        return None
 
     def _credential_resolution_error(
         self,
@@ -1812,7 +2055,9 @@ def _export_sql_account_binding(binding: Any) -> dict[str, Any] | None:
     return exported
 
 
-def _credential_resolution_source(credential: CredentialRef) -> str:
+def _credential_resolution_source(credential: ResolvedPrincipal) -> str:
+    if isinstance(credential, DlcPrincipalRef):
+        return "botmux_union_id_to_cam_mapping"
     if credential.datasource == "tchouse-d":
         return "configured_env_credential"
     return "mcp_union_id_mapping"

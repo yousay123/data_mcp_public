@@ -139,6 +139,40 @@ def test_run_query_for_user_uses_supplied_verified_identity() -> None:
     assert "on_example_user" not in str(result["sql_account_binding"])
 
 
+def test_validated_plan_returns_canonical_result_context() -> None:
+    service = DataMcpService(
+        build_container(
+            Settings(
+                CREDENTIAL_PROVIDER="memory",
+                CREDENTIAL_MEMORY_FILE="examples/credentials.example.json",
+                METADATA_PROVIDER="memory",
+                QUERY_EXECUTOR="dry_run",
+            )
+        )
+    )
+    validation = service.validate_sql_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=SMOKE_TEST_SQL,
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+    result = service.run_query_for_user(
+        request_user_union_id="on_example_user",
+        request_user_open_id="ou_example_user",
+        request_lark_app_id=APP_ID,
+        sql=SMOKE_TEST_SQL,
+        query_plan_id=validation["query_plan_id"],
+        audit_context=HUMAN_AUDIT_CONTEXT,
+    )
+    context = result["result_context"]
+    assert context["provenance"] == "data_mcp_validated_query_plan"
+    assert context["filter_predicates"] == ["ds = '2026-08-31'"]
+    assert context["time_range_predicates"] == ["ds = '2026-08-31'"]
+    assert context["integrity"]["algorithm"] == "sha256"
+    assert context["returned_columns"]
+
+
 @pytest.mark.parametrize(
     ("sql", "expected_injected", "expected_capped", "expected_limit"),
     [

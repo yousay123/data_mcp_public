@@ -165,18 +165,19 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
   const files = Array.isArray(delivery?.files)
     ? delivery.files.map(file => assertOutboundFile(file?.path, pluginHome))
     : [];
-  if (files.length > 1) throw fixedError('direct_reply_attachment_failed');
+  if (files.length > 6) throw fixedError('direct_reply_attachment_failed');
   const baseText = typeof delivery?.markdown === 'string' ? delivery.markdown.trim() : '';
   const temporary = mkdtempSync(join(tmpdir(), 'data-mcp-direct-reply-'));
   let attachmentCount = 0;
   try {
     const bodyPath = join(temporary, 'reply.md');
-    if (files.length === 1) {
+    if (files.length > 0) {
       writeFileSync(bodyPath, '', { mode: 0o600 });
       let fileResult;
       try {
         fileResult = await runBotmux([
-          'send', '--content-file', bodyPath, '--files', files[0],
+          'send', '--content-file', bodyPath,
+          ...files.flatMap(file => ['--files', file]),
           '--no-mention', '--response-kind', 'auxiliary',
           '--quote', identity.turnId,
         ]);
@@ -185,10 +186,10 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
       }
       const failed = Array.isArray(fileResult.failedAttachments) ? fileResult.failedAttachments.length : 0;
       const sent = Array.isArray(fileResult.attachmentMessageIds) ? fileResult.attachmentMessageIds.length : 0;
-      if (!successfulSend(fileResult) || failed > 0 || sent !== 1) {
+      if (!successfulSend(fileResult) || failed > 0 || sent !== files.length) {
         throw fixedError('direct_reply_attachment_failed');
       }
-      attachmentCount = 1;
+      attachmentCount = files.length;
     }
 
     const withAttachmentNotice = attachmentCount > 0
@@ -200,7 +201,7 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
     try {
       textResult = await runBotmux([
         'send', '--content-file', bodyPath,
-        '--no-mention', '--response-kind', attachmentCount > 0 ? 'progress' : 'auxiliary',
+        '--no-mention', '--response-kind', 'final',
         '--quote', identity.turnId,
       ]);
     } catch {

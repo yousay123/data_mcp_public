@@ -51,7 +51,9 @@ turn. A `schedule_creator` caller is accepted only when `turnId` has the form
 source is `schedule_creator`. This prevents a scheduled input adopted into an
 already-active turn from using that turn's preserved caller identity.
 
-Trusted Excel delivery is one-shot. The plugin stages an atomic outbound file;
+Trusted artifact delivery is one-shot. The internal result Agent runs in a
+separate child process with an allowlisted environment, selects and invokes the
+Excel/PDF/chart/document tool, and stages atomic outbound files;
 the Botmux host consumes it into bounded memory and removes the staged source
 before any send. Plugin shutdown cleans files still owned by that process, and
 startup removes abandoned Data MCP artifacts older than 15 minutes.
@@ -129,8 +131,9 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
   - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
-- Raw `run_query_for_user` / `export_query_to_excel_file` result responses are
-  always disabled. Business results must use `deliver_query_result_for_user`;
+- Raw `run_query_for_user` responses are always disabled in dual-model mode,
+  and no model-visible Data MCP export tool is registered. Business results
+  must use `deliver_query_result_for_user`;
   this fail-closed boundary cannot be disabled by environment configuration.
 - `DATA_MCP_RESULT_MODEL_ENDPOINT`
   - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
@@ -156,6 +159,16 @@ Environment contract:
 - `DATA_MCP_RESULT_MODEL`
   - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`
+
+结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
+55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
+使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
+首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
+`stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
+混成同一个不可定位错误。仅当请求输出为 `analysis`、结果不超过 20 行 × 20 列、
+每个单元格都是有界标量，且失败属于模型未配置、超时或 5xx 时，插件才会通过既有
+可信飞书回复通道确定性展示原始查询表格；不做口径推断。模型 endpoint/重定向、
+上下文完整性、进程隔离、附件产物等安全边界失败仍然 fail closed。
   - Optional internal endpoint credential. Keep it only in the host-only file
     selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
     process environment.
@@ -168,6 +181,10 @@ Environment contract:
     the absolute env-file path as that call's test profile. Missing, malformed,
     symlinked, non-regular, or permissions broader than `0600` fail closed for
     the selected app and never fall back to the default profile.
+  - Store both selector variables only in the host-owned file selected by
+    `KSHER_AGENT_DATA_MCP_ENV_FILE`. Process-level values, including BotMux
+    per-bot `pluginRuntime.env`, are ignored so copying a test selector into a
+    production bot cannot redirect that bot to the test service.
   - The test profile may override only the dedicated service socket and result
     model endpoint, exact-host allowlist, model, API key, and endpoint test
     exception. Socket, model endpoint, exact-host allowlist, and model are all
@@ -194,8 +211,15 @@ environment.
 
 For interactive tools, the plugin forwards explicit SQL and Botmux Gateway
 trusted identity to the Data MCP service. SQL validation, permission checks,
-account mapping, execution, export limits, and audit remain on the Data MCP
-side. No model-visible tool may return raw query rows.
+account mapping, query execution limits, and audit remain on the Data MCP side.
+Final artifact generation belongs to the internal result Agent, not Data MCP.
+No model-visible tool may return raw query rows.
+
+The result context is not a model argument. Data MCP derives projection,
+time/filter/grouping, table, unit-status, and timezone-status fields from the
+validated normalized SQL, binds them to the query plan, adds the returned schema,
+and attaches a SHA-256 integrity digest. The isolated Agent rejects missing,
+malformed, or modified context.
 
 Interactive results are bound to the host-authenticated union id and app id,
 plus `BOTMUX_SESSION_ID`, which Botmux freezes in the plugin process environment
@@ -203,12 +227,17 @@ and the model cannot supply as a tool argument. The result handle is never
 model-visible. When Botmux adds a signed session id to per-turn metadata, the
 plugin should migrate from the process environment to that value.
 
-`continue_query_result_for_user` accepts only the user's follow-up text and an
-output mode. Analysis uses the stored result. Excel follow-ups deliberately
-revalidate permissions and rerun the original SQL; therefore the spreadsheet
-may differ from the earlier analysis snapshot. Its reply states that it is a
-fresh query and includes the generation time. Per trusted turn id, only
-one follow-up call is accepted. Internal-model text and Excel files are replied
+`continue_query_result_for_user` accepts only the user's follow-up text and
+requested output types. It reuses the caller-bound stored rows/schema/context
+without rerunning the query. The internal result Agent must call the matching
+analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
+stored result. Artifact tools accept no model-authored titles, paragraphs,
+labels, annotations, sheet names, or filenames. The model selects only columns,
+aggregations, chart type, and layout; controlled templates render every word,
+and arbitrary-precision decimal arithmetic computes every numerical claim.
+The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
+so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per
+trusted turn id, only one follow-up call is accepted. Agent text and files are replied
 directly to the signed `turnId` message by the session-bound bot identity.
 Topic messages stay in the original topic; ordinary group and P2P messages
 remain flat replies in the same conversation. Before sending, the plugin uses
@@ -241,8 +270,7 @@ write its prompts or responses to ordinary logs.
 | `data_mcp_query_plan` | Planning guidance only; does not execute SQL | Fixed planning error |
 | `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
 | `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
-| `export_query_to_excel_file` | Always `isolated_delivery_required`; file metadata is closed | Fixed isolated-operation error |
-| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; result content is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
+| `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; the internal result Agent receives rows/schema/context, calls requested artifact tools, and the result is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
 | `continue_query_result_for_user` | Fixed direct-delivery receipt; active-result handles are not arguments | Fixed deterministic state or direct-delivery error only |
 | `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |
 | `search_metadata_snapshot` | Allowlisted dictionary fields only; example and sample values are removed | Fixed snapshot status code |

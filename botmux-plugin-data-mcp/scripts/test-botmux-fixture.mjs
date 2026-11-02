@@ -13,6 +13,12 @@ const log = process.env.FAKE_BOTMUX_LOG;
 const record = { args };
 const contentIndex = args.indexOf('--content-file');
 if (contentIndex >= 0) record.content = readFileSync(args[contentIndex + 1], 'utf8');
+if (process.env.FAKE_BOTMUX_CAPTURE_FILES === '1') {
+  record.files = args.flatMap((arg, index) => arg === '--files' ? [{
+    path: args[index + 1],
+    base64: readFileSync(args[index + 1]).toString('base64'),
+  }] : []);
+}
 if (log) appendFileSync(log, JSON.stringify(record) + '\\n');
 if (args[0] === 'observe') {
   if (fail === 'observe') process.exit(2);

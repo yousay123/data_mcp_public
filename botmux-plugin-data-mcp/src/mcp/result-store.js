@@ -207,8 +207,57 @@ export class ResultStore {
     }
   }
 
-  audit(identity, turnId, question, version, status, now = Date.now()) {
+  audit(identity, turnId, question, version, status, now = Date.now(), detail = {}) {
     const { bindingKey } = this.binding(identity);
+    const safeDetail = {};
+    if (detail?.stage === 'result_agent') safeDetail.stage = detail.stage;
+    if (typeof detail?.action === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(detail.action)) {
+      safeDetail.action = detail.action;
+    }
+    if (typeof detail?.errorCode === 'string'
+      && /^(?:result_agent_[a-z0-9_]{1,80}|result_model_network_not_private)$/.test(detail.errorCode)) {
+      safeDetail.error_code = detail.errorCode;
+    }
+    if (typeof detail?.queryId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(detail.queryId)) {
+      safeDetail.query_id = detail.queryId;
+    }
+    if (typeof detail?.providerTaskId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(detail.providerTaskId)) {
+      safeDetail.provider_task_id = detail.providerTaskId;
+    }
+    if (typeof detail?.modelId === 'string' && /^[A-Za-z0-9._:/-]{1,160}$/.test(detail.modelId)) {
+      safeDetail.model_id = detail.modelId;
+    }
+    if (typeof detail?.responseModel === 'string' && /^[A-Za-z0-9._:/-]{1,160}$/.test(detail.responseModel)) {
+      safeDetail.response_model = detail.responseModel;
+    }
+    if (typeof detail?.endpointHost === 'string' && detail.endpointHost.trim()) {
+      safeDetail.endpoint_host_hash = this.digest('model-endpoint-host-v1', [detail.endpointHost]).slice(0, 16);
+    }
+    if (typeof detail?.requestId === 'string' && detail.requestId.trim()) {
+      safeDetail.request_id_hash = this.digest('model-request-id-v1', [detail.requestId]).slice(0, 16);
+    }
+    if (typeof detail?.promptTemplateVersion === 'string'
+      && /^[A-Za-z0-9._-]{1,80}$/.test(detail.promptTemplateVersion)) {
+      safeDetail.prompt_template_version = detail.promptTemplateVersion;
+    }
+    for (const [source, target] of [
+      ['promptTemplateHash', 'prompt_template_hash'],
+      ['inputHash', 'input_hash'],
+      ['outputHash', 'output_hash'],
+    ]) {
+      if (typeof detail?.[source] === 'string' && /^[a-f0-9]{64}$/.test(detail[source])) {
+        safeDetail[target] = detail[source];
+      }
+    }
+    if (Number.isSafeInteger(detail?.inputRowCount) && detail.inputRowCount >= 0) {
+      safeDetail.input_row_count = detail.inputRowCount;
+    }
+    if (Number.isSafeInteger(detail?.latencyMs) && detail.latencyMs >= 0) {
+      safeDetail.latency_ms = detail.latencyMs;
+    }
+    if (Number.isSafeInteger(detail?.httpStatus) && detail.httpStatus >= 100 && detail.httpStatus <= 599) {
+      safeDetail.http_status = detail.httpStatus;
+    }
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),
@@ -216,6 +265,7 @@ export class ResultStore {
       question: this.digest('audit-question-v1', [question]).slice(0, 16),
       version,
       status,
+      ...safeDetail,
     };
     appendFileSync(this.auditPath, `${JSON.stringify(event)}\n`, { encoding: 'utf8', mode: 0o600 });
     chmodSync(this.auditPath, 0o600);

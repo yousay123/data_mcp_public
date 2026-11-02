@@ -153,6 +153,29 @@ const readmeSource = readFileSync(join(repoRoot, 'README.md'), 'utf-8');
 if (!readmeSource.includes('_meta.botmuxTrustedCaller')) {
   fail('README must document _meta.botmuxTrustedCaller as the trusted identity source');
 }
+const skillSource = readFileSync(join(repoRoot, 'skills', 'data-mcp', 'SKILL.md'), 'utf-8');
+const skillDescription = skillSource.match(/^description:\s*(.+)$/m)?.[1] ?? '';
+for (const requiredDescriptionRule of [
+  'explicit DLC request with a fully qualified table',
+  'never call search_metadata_snapshot',
+  'validate_sql_for_user with datasource=dlc',
+]) {
+  if (!skillDescription.includes(requiredDescriptionRule)) {
+    fail(`Data MCP skill description is missing DLC routing rule: ${requiredDescriptionRule}`);
+  }
+}
+for (const requiredRule of [
+  'Never rely on the tool schema\'s default data source',
+  'When the current user request does not name a data source, default to',
+  'Treat each new query request as a fresh source choice',
+  '`search_dlc_tables_for_user` only when the current request explicitly names',
+  'For `dlc` with a fully qualified table, do not call',
+  'validation performs live DLC principal, table metadata, partition, engine,',
+]) {
+  if (!skillSource.includes(requiredRule)) {
+    fail(`Data MCP skill is missing datasource routing rule: ${requiredRule}`);
+  }
+}
 if (!pkg.keywords?.includes('botmux-plugin')) fail('package.json must include keywords: ["botmux-plugin"]');
 if (!/^[a-z][a-z0-9._-]{0,63}$/.test(pkg.botmux?.id ?? '')) fail('package.json#botmux.id is invalid');
 if (!Array.isArray(pkg.files) || pkg.files.length !== 1 || pkg.files[0] !== 'dist/') {
@@ -167,6 +190,31 @@ assertNoSymlinks(runtimeRoot);
 const mcp = readJson(join(runtimeRoot, 'mcp', 'index.json'));
 const mcpServerSource = readFileSync(join(runtimeRoot, 'mcp', 'server.js'), 'utf-8');
 const mcpServerSourceFile = readFileSync(join(repoRoot, 'src', 'mcp', 'server.js'), 'utf-8');
+for (const source of [mcpServerSourceFile, mcpServerSource]) {
+  if (!source.includes('Never call this tool for an explicit DLC request with a fully qualified table')) {
+    fail('search_metadata_snapshot tool description must forbid explicit fully-qualified DLC routing');
+  }
+}
+const resultAgentClientSource = readFileSync(join(repoRoot, 'src', 'mcp', 'result-agent-client.js'), 'utf-8');
+if (!existsSync(join(runtimeRoot, 'result-agent', 'worker.js'))) {
+  fail('isolated result Agent worker must be built as a separate executable entry');
+}
+for (const forbidden of ['runInternalResultAgent', 'buildModelWorkbook', 'DATA_MCP_EXPORT_QUERY_ENDPOINT', '/agent/export-query-excel-file']) {
+  if (mcpServerSourceFile.includes(forbidden)) fail(`MCP server retained forbidden result/export responsibility: ${forbidden}`);
+}
+if (!resultAgentClientSource.includes('spawn(process.execPath, [workerPath]')
+  || !resultAgentClientSource.includes("env: Object.fromEntries(['PATH', 'TMPDIR', 'TMP', 'TEMP']")) {
+  fail('result Agent must execute in a separate process with an allowlisted environment');
+}
+if (!resultAgentClientSource.includes('const AGENT_TIMEOUT_MS = 30_000;')
+  || !resultAgentClientSource.includes("reject(new Error('result_agent_timeout'))")) {
+  fail('result Agent must terminate with an observable error before the outer tool deadline');
+}
+if (!mcpServerSourceFile.includes('resultAgentAuditStatus(error)')
+  || !mcpServerSourceFile.includes("'result_agent_timeout'")
+  || !mcpServerSourceFile.includes('const DELIVERY_BUDGET_MS = 55_000;')) {
+  fail('first-turn result Agent failures must emit a bounded non-sensitive audit status');
+}
 const trustedCallerStart = mcpServerSourceFile.indexOf('function trustedCallerFrom(request) {');
 const trustedCallerEnd = mcpServerSourceFile.indexOf('\n}\n\nfunction normalizeTrustedCaller', trustedCallerStart);
 if (trustedCallerStart < 0 || trustedCallerEnd < 0) {
@@ -1008,7 +1056,7 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
-        DATA_MCP_EXPORT_QUERY_ENDPOINT: 'data:application/json,%7B%22ok%22%3Atrue%7D',
+        DATA_MCP_ENABLED_DATASOURCES: 'tchouse-c,dlc',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
     });
@@ -1026,8 +1074,11 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
+    }
+    if (tools.some(tool => tool.name === 'export_query_to_excel_file')) {
+      fail('Data MCP must not expose a final-file export tool; file generation belongs to the result Agent');
     }
     for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
       if (tools.some(tool => tool.name === retiredName)) {
@@ -1047,7 +1098,6 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
     const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
     const visibleFollowupSchema = tools.find(tool => tool.name === 'continue_query_result_for_user')?.inputSchema;
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
@@ -1056,13 +1106,14 @@ try {
     if (!visibleRunSchema?.required?.includes('query_plan_id')) {
       fail('run_query_for_user schema must require query_plan_id');
     }
-    if (!visibleExportSchema?.required?.includes('query_plan_id')) {
-      fail('export_query_to_excel_file schema must require query_plan_id');
-    }
     if (!visibleDeliverySchema?.required?.includes('query_plan_id')
-      || !visibleDeliverySchema?.required?.includes('output_mode')
-      || JSON.stringify(visibleDeliverySchema?.properties?.output_mode?.enum) !== JSON.stringify(['analysis', 'excel'])) {
-      fail('deliver_query_result_for_user must require one explicit isolated output mode and query_plan_id');
+      || !visibleDeliverySchema?.required?.includes('question')
+      || JSON.stringify(visibleDeliverySchema?.properties?.requested_outputs?.items?.enum)
+        !== JSON.stringify(['analysis', 'excel', 'pdf', 'chart', 'document'])) {
+      fail('deliver_query_result_for_user must expose Agent-authored multi-output delivery');
+    }
+    if (Object.hasOwn(visibleDeliverySchema?.properties ?? {}, 'result_context')) {
+      fail('calling model must not supply canonical result context');
     }
     const followupSchemaText = JSON.stringify(visibleFollowupSchema ?? {});
     if (!visibleFollowupSchema?.required?.includes('question')) {
@@ -1076,10 +1127,22 @@ try {
     for (const [name, schema] of [
       ['validate_sql_for_user', visibleValidateSchema],
       ['run_query_for_user', visibleRunSchema],
-      ['export_query_to_excel_file', visibleExportSchema],
+      ['deliver_query_result_for_user', visibleDeliverySchema],
     ]) {
-      if (JSON.stringify(schema?.properties?.datasource?.enum) !== JSON.stringify(['tchouse-c'])) {
-        fail(`${name} datasource schema must allow only tchouse-c`);
+      if (
+        JSON.stringify(schema?.properties?.datasource?.enum)
+        !== JSON.stringify(['tchouse-c', 'dlc'])
+      ) {
+        fail(`${name} datasource schema must expose the configured datasource registry`);
+      }
+      if (schema?.properties?.datasource?.default !== 'tchouse-c') {
+        fail(`${name} datasource schema must default to tchouse-c when it is enabled`);
+      }
+    }
+    const dlcDiscoveryDescription = tools.find(tool => tool.name === 'search_dlc_tables_for_user')?.description ?? '';
+    for (const requiredText of ['explicitly names DLC/WeData', 'default to TChouse-C/ClickHouse', 'never infer DLC from an earlier query or test']) {
+      if (!dlcDiscoveryDescription.includes(requiredText)) {
+        fail(`search_dlc_tables_for_user description is missing datasource routing guard: ${requiredText}`);
       }
     }
     if (
@@ -1205,8 +1268,8 @@ try {
       fail('run_query_for_user must remain closed before any raw result can be returned');
     }
     const missingExportPlanText = byId.get(13)?.result?.content?.[0]?.text ?? '';
-    if (!missingExportPlanText.includes('isolated_delivery_required')) {
-      fail('export_query_to_excel_file must remain closed before any raw result can be returned');
+    if (!JSON.stringify(byId.get(13)).includes('unknown_tool:export_query_to_excel_file')) {
+      fail('removed Data MCP file export tool must stay unavailable');
     }
     const humanRefreshText = byId.get(14)?.result?.content?.[0]?.text ?? '';
     if (!humanRefreshText.includes('metadata_snapshot_schedule_identity_required')) {
