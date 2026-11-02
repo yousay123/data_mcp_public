@@ -66,9 +66,10 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                 "export_query_to_excel_file",
                 "refresh_metadata_snapshot",
                 "search_metadata_snapshot",
+                "search_dlc_tables_for_user",
             }
         ]
-        assert len(query_tools) == 5
+        assert len(query_tools) == 6
         for tool in query_tools:
             properties = tool.input_schema["properties"]
             assert set(properties).isdisjoint(hidden_fields)
@@ -99,6 +100,11 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                 )
             elif tool.name == "refresh_metadata_snapshot":
                 assert properties == {}
+            elif tool.name == "search_dlc_tables_for_user":
+                assert set(properties) == {"query", "limit"}
+                assert tool.input_schema["required"] == ["query"]
+                assert properties["limit"]["minimum"] == 1
+                assert properties["limit"]["maximum"] == 20
             else:
                 assert set(properties) == {"query", "limit", "priority"}
                 assert tool.input_schema["required"] == ["query"]
@@ -108,7 +114,8 @@ def test_tools_list_hides_injected_identity_fields() -> None:
                 "run_query_for_user",
                 "export_query_to_excel_file",
             }:
-                assert properties["datasource"]["const"] == "tchouse-c"
+                assert properties["datasource"]["type"] == "string"
+                assert properties["datasource"]["default"] == "tchouse-c"
         validate_tool = next(tool for tool in tools if tool.name == "validate_sql_for_user")
         assert validate_tool.input_schema["properties"]["execution_mode"]["enum"] == [
             "single",

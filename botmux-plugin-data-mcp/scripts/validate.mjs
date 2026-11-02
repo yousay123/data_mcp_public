@@ -153,6 +153,29 @@ const readmeSource = readFileSync(join(repoRoot, 'README.md'), 'utf-8');
 if (!readmeSource.includes('_meta.botmuxTrustedCaller')) {
   fail('README must document _meta.botmuxTrustedCaller as the trusted identity source');
 }
+const skillSource = readFileSync(join(repoRoot, 'skills', 'data-mcp', 'SKILL.md'), 'utf-8');
+const skillDescription = skillSource.match(/^description:\s*(.+)$/m)?.[1] ?? '';
+for (const requiredDescriptionRule of [
+  'explicit DLC request with a fully qualified table',
+  'never call search_metadata_snapshot',
+  'validate_sql_for_user with datasource=dlc',
+]) {
+  if (!skillDescription.includes(requiredDescriptionRule)) {
+    fail(`Data MCP skill description is missing DLC routing rule: ${requiredDescriptionRule}`);
+  }
+}
+for (const requiredRule of [
+  'Never rely on the tool schema\'s default data source',
+  'When the current user request does not name a data source, default to',
+  'Treat each new query request as a fresh source choice',
+  '`search_dlc_tables_for_user` only when the current request explicitly names',
+  'For `dlc` with a fully qualified table, do not call',
+  'validation performs live DLC principal, table metadata, partition, engine,',
+]) {
+  if (!skillSource.includes(requiredRule)) {
+    fail(`Data MCP skill is missing datasource routing rule: ${requiredRule}`);
+  }
+}
 if (!pkg.keywords?.includes('botmux-plugin')) fail('package.json must include keywords: ["botmux-plugin"]');
 if (!/^[a-z][a-z0-9._-]{0,63}$/.test(pkg.botmux?.id ?? '')) fail('package.json#botmux.id is invalid');
 if (!Array.isArray(pkg.files) || pkg.files.length !== 1 || pkg.files[0] !== 'dist/') {
@@ -167,6 +190,31 @@ assertNoSymlinks(runtimeRoot);
 const mcp = readJson(join(runtimeRoot, 'mcp', 'index.json'));
 const mcpServerSource = readFileSync(join(runtimeRoot, 'mcp', 'server.js'), 'utf-8');
 const mcpServerSourceFile = readFileSync(join(repoRoot, 'src', 'mcp', 'server.js'), 'utf-8');
+for (const source of [mcpServerSourceFile, mcpServerSource]) {
+  if (!source.includes('Never call this tool for an explicit DLC request with a fully qualified table')) {
+    fail('search_metadata_snapshot tool description must forbid explicit fully-qualified DLC routing');
+  }
+}
+const resultAgentClientSource = readFileSync(join(repoRoot, 'src', 'mcp', 'result-agent-client.js'), 'utf-8');
+if (!existsSync(join(runtimeRoot, 'result-agent', 'worker.js'))) {
+  fail('isolated result Agent worker must be built as a separate executable entry');
+}
+for (const forbidden of ['runInternalResultAgent', 'buildModelWorkbook', 'DATA_MCP_EXPORT_QUERY_ENDPOINT', '/agent/export-query-excel-file']) {
+  if (mcpServerSourceFile.includes(forbidden)) fail(`MCP server retained forbidden result/export responsibility: ${forbidden}`);
+}
+if (!resultAgentClientSource.includes('spawn(process.execPath, [workerPath]')
+  || !resultAgentClientSource.includes("env: Object.fromEntries(['PATH', 'TMPDIR', 'TMP', 'TEMP']")) {
+  fail('result Agent must execute in a separate process with an allowlisted environment');
+}
+if (!resultAgentClientSource.includes('const AGENT_TIMEOUT_MS = 30_000;')
+  || !resultAgentClientSource.includes("reject(new Error('result_agent_timeout'))")) {
+  fail('result Agent must terminate with an observable error before the outer tool deadline');
+}
+if (!mcpServerSourceFile.includes('resultAgentAuditStatus(error)')
+  || !mcpServerSourceFile.includes("'result_agent_timeout'")
+  || !mcpServerSourceFile.includes('const DELIVERY_BUDGET_MS = 55_000;')) {
+  fail('first-turn result Agent failures must emit a bounded non-sensitive audit status');
+}
 const trustedCallerStart = mcpServerSourceFile.indexOf('function trustedCallerFrom(request) {');
 const trustedCallerEnd = mcpServerSourceFile.indexOf('\n}\n\nfunction normalizeTrustedCaller', trustedCallerStart);
 if (trustedCallerStart < 0 || trustedCallerEnd < 0) {
@@ -474,9 +522,10 @@ try {
 
       const childEnvReport = join(runnerRoot, 'env-isolation', 'env.child-env-report');
       const envIsolationReady = join(runnerRoot, 'env-isolation', 'ready');
-      const envIsolation = spawnRunner('env-isolation', 'healthy', {
+      const envIsolation = spawnRunner('env-isolation', 'exit', {
         DATA_MCP_INTERNAL_AUTH_TOKEN: 'internal-child-canary',
         TCHOUSE_D_PASSWORD: 'database-child-canary',
+        FAKE_API_MODE: 'healthy',
         FAKE_READY_FILE: envIsolationReady,
         DATA_MCP_SERVICE_READY_TIMEOUT_MS: '5000',
       });
@@ -490,11 +539,7 @@ try {
         fail('Python API process environment must not contain internal auth or database secrets');
       }
       envIsolation.child.kill('SIGTERM');
-      const envIsolationResult = await waitForExit(
-        envIsolation.child,
-        15_000,
-        'env-isolation runner',
-      );
+      const envIsolationResult = await waitForExit(envIsolation.child, 15_000, 'env-isolation runner');
       if (envIsolationResult.code !== 0) {
         fail(`env-isolation runner must exit cleanly after SIGTERM, got ${envIsolationResult.code}`);
       }
@@ -956,14 +1001,17 @@ try {
         } },
       },
     };
-    const trustedHumanValidateCall = {
-      jsonrpc: '2.0', id: 35, method: 'tools/call',
+    const deliveryWithoutHostCapabilityCall = {
+      jsonrpc: '2.0', id: 40, method: 'tools/call',
       params: {
-        name: 'validate_sql_for_user',
-        arguments: { sql: 'SELECT * FROM analytics.secret_table', datasource: 'tchouse-c' },
+        name: 'deliver_query_result_for_user',
+        arguments: {
+          sql: 'SELECT 1', datasource: 'tchouse-c', query_plan_id: 'qplan_test',
+          output_mode: 'analysis', question: '汇总',
+        },
         _meta: { botmuxTrustedCaller: {
           requestUserOpenId: 'ou_user', requestUserUnionId: 'on_user',
-          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'turn-1',
+          requestLarkAppId: 'cli_test', senderType: 'user', turnId: 'om_test',
         } },
       },
     };
@@ -988,7 +1036,6 @@ try {
       emptySubjectScopeCall,
       excessiveTableScopeCall,
       invalidDatasourceCall,
-      trustedHumanValidateCall,
       mismatchedScheduleValidateCall,
       mismatchedScheduleRunCall,
       mismatchedScheduleExportCall,
@@ -996,6 +1043,7 @@ try {
       missingScheduleTurnCall,
       ...nearPrefixScheduleCalls,
       ...mismatchedScheduleToolCalls,
+      deliveryWithoutHostCapabilityCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
@@ -1008,7 +1056,7 @@ try {
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
-        DATA_MCP_EXPORT_QUERY_ENDPOINT: 'data:application/json,%7B%22ok%22%3Atrue%7D',
+        DATA_MCP_ENABLED_DATASOURCES: 'dlc,tchouse-c',
         DATA_MCP_VALIDATE_SQL_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22success%22%2C%22datasource%22%3A%22tchouse-c%22%2C%22tables%22%3A%5B%22analytics.secret_table%22%5D%2C%22columns%22%3A%5B%22secret_col%22%5D%2C%22normalized_sql%22%3A%22SELECT%20*%20FROM%20analytics.secret_table%22%2C%22sql_account_binding%22%3A%7B%22tchouse_account%22%3A%22secret_user%22%7D%7D',
       },
     });
@@ -1026,20 +1074,15 @@ try {
       fail('template MCP serverInfo.version must match package.json version');
     }
     const tools = byId.get(2)?.result?.tools ?? [];
-    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'export_query_to_excel_file', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
+    for (const name of ['data_mcp_identity_probe', 'data_mcp_query_plan', 'validate_sql_for_user', 'run_query_for_user', 'deliver_query_result_for_user', 'continue_query_result_for_user', 'refresh_metadata_snapshot', 'search_metadata_snapshot', 'audit_ck_default_role_baseline', 'inspect_ck_subjects_by_table', 'inspect_ck_resources_by_subject']) {
       if (!tools.some(tool => tool.name === name)) fail(`MCP tools/list is missing ${name}`);
+    }
+    if (tools.some(tool => tool.name === 'export_query_to_excel_file')) {
+      fail('Data MCP must not expose a final-file export tool; file generation belongs to the result Agent');
     }
     for (const retiredName of ['execute_frozen_query', 'frozen_query_raw']) {
       if (tools.some(tool => tool.name === retiredName)) {
         fail(`retired raw-result MCP tool must not be exposed: ${retiredName}`);
-      }
-    }
-    // main keeps the legacy query/export contract. The isolated two-model
-    // delivery tools must stay on their feature branch until every consumer
-    // is migrated and the rollout is explicitly approved.
-    for (const featureOnlyName of ['deliver_query_result_for_user', 'continue_query_result_for_user']) {
-      if (tools.some(tool => tool.name === featureOnlyName)) {
-        fail(`two-model delivery tool must not be exposed on main: ${featureOnlyName}`);
       }
     }
     const removedClusterComparisonTool = 'audit_ck_' + 'access_consistency';
@@ -1055,23 +1098,105 @@ try {
       fail('validate_sql_for_user schema must not expose trusted identity arguments');
     }
     const visibleRunSchema = tools.find(tool => tool.name === 'run_query_for_user')?.inputSchema;
-    const visibleExportSchema = tools.find(tool => tool.name === 'export_query_to_excel_file')?.inputSchema;
+    const visibleDeliverySchema = tools.find(tool => tool.name === 'deliver_query_result_for_user')?.inputSchema;
+    const visibleFollowupSchema = tools.find(tool => tool.name === 'continue_query_result_for_user')?.inputSchema;
     if (visibleValidateSchema?.required?.includes('query_plan_id')) {
       fail('validate_sql_for_user must not require query_plan_id before it can issue one');
     }
     if (!visibleRunSchema?.required?.includes('query_plan_id')) {
       fail('run_query_for_user schema must require query_plan_id');
     }
-    if (!visibleExportSchema?.required?.includes('query_plan_id')) {
-      fail('export_query_to_excel_file schema must require query_plan_id');
+    if (!visibleDeliverySchema?.required?.includes('query_plan_id')
+      || !visibleDeliverySchema?.required?.includes('question')
+      || JSON.stringify(visibleDeliverySchema?.properties?.requested_outputs?.items?.enum)
+        !== JSON.stringify(['analysis', 'excel', 'pdf', 'chart', 'document'])) {
+      fail('deliver_query_result_for_user must expose Agent-authored multi-output delivery');
+    }
+    if (Object.hasOwn(visibleDeliverySchema?.properties ?? {}, 'result_context')) {
+      fail('calling model must not supply canonical result context');
+    }
+    const followupSchemaText = JSON.stringify(visibleFollowupSchema ?? {});
+    if (!visibleFollowupSchema?.required?.includes('question')) {
+      fail('continue_query_result_for_user schema must require question');
+    }
+    for (const forbidden of ['result_id', 'session_id', 'union_id', 'app_id', 'identity']) {
+      if (followupSchemaText.includes(forbidden)) {
+        fail(`continue_query_result_for_user schema must not expose ${forbidden}`);
+      }
     }
     for (const [name, schema] of [
       ['validate_sql_for_user', visibleValidateSchema],
       ['run_query_for_user', visibleRunSchema],
-      ['export_query_to_excel_file', visibleExportSchema],
+      ['deliver_query_result_for_user', visibleDeliverySchema],
     ]) {
-      if (JSON.stringify(schema?.properties?.datasource?.enum) !== JSON.stringify(['tchouse-c'])) {
-        fail(`${name} datasource schema must allow only tchouse-c`);
+      if (
+        JSON.stringify(schema?.properties?.datasource?.enum)
+        !== JSON.stringify(['dlc', 'tchouse-c'])
+      ) {
+        fail(`${name} datasource schema must expose the configured datasource registry`);
+      }
+      if (schema?.properties?.datasource?.default !== 'tchouse-c') {
+        fail(`${name} datasource schema must default to tchouse-c when it is enabled`);
+      }
+    }
+    const dlcOnlyProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
+      cwd: cleanRoot,
+      input: [
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        },
+        {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: {
+            name: 'validate_sql_for_user',
+            arguments: { sql: 'SELECT 1' },
+            _meta: {
+              botmuxTrustedCaller: {
+                requestUserOpenId: 'ou_test',
+                requestUserUnionId: 'on_test',
+                requestLarkAppId: 'cli_test',
+              },
+            },
+          },
+        },
+      ].map(message => JSON.stringify(message)).join('\n') + '\n',
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: {
+        ...process.env,
+        BOTMUX_SESSION_ID: 'session_dlc_only_probe',
+        BOTMUX_TRUSTED_TURN_FILE: '',
+        SESSION_DATA_DIR: '',
+        DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
+        DATA_MCP_ENABLED_DATASOURCES: 'dlc',
+      },
+    });
+    if (dlcOnlyProbe.status !== 0) {
+      fail(`DLC-only default datasource probe failed: ${dlcOnlyProbe.stderr}`);
+    }
+    const dlcOnlyResponses = (dlcOnlyProbe.stdout ?? '')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const dlcOnlyById = new Map(dlcOnlyResponses.map(response => [response.id, response]));
+    const dlcOnlyValidateSchema = dlcOnlyById.get(1)?.result?.tools
+      ?.find(tool => tool.name === 'validate_sql_for_user')?.inputSchema;
+    if (Object.hasOwn(dlcOnlyValidateSchema?.properties?.datasource ?? {}, 'default')) {
+      fail('DLC-only schema must not advertise DLC as the implicit datasource');
+    }
+    const omittedDatasourceText = dlcOnlyById.get(2)?.result?.content?.[0]?.text ?? '';
+    if (!omittedDatasourceText.includes('unsupported_datasource')) {
+      fail('omitted datasource must fail closed instead of falling through to DLC');
+    }
+    const dlcDiscoveryDescription = tools.find(tool => tool.name === 'search_dlc_tables_for_user')?.description ?? '';
+    for (const requiredText of ['explicitly names DLC/WeData', 'default to TChouse-C/ClickHouse', 'never infer DLC from an earlier query or test']) {
+      if (!dlcDiscoveryDescription.includes(requiredText)) {
+        fail(`search_dlc_tables_for_user description is missing datasource routing guard: ${requiredText}`);
       }
     }
     if (
@@ -1193,12 +1318,12 @@ try {
       fail('MCP server must collapse validation responses for non-human callers without schema or permission oracle details');
     }
     const missingRunPlanText = byId.get(12)?.result?.content?.[0]?.text ?? '';
-    if (!missingRunPlanText.includes('query_plan_required')) {
-      fail('run_query_for_user must fail closed when query_plan_id is missing');
+    if (!missingRunPlanText.includes('isolated_delivery_required')) {
+      fail('run_query_for_user must remain closed before any raw result can be returned');
     }
     const missingExportPlanText = byId.get(13)?.result?.content?.[0]?.text ?? '';
-    if (!missingExportPlanText.includes('query_plan_required')) {
-      fail('export_query_to_excel_file must fail closed when query_plan_id is missing');
+    if (!JSON.stringify(byId.get(13)).includes('unknown_tool:export_query_to_excel_file')) {
+      fail('removed Data MCP file export tool must stay unavailable');
     }
     const humanRefreshText = byId.get(14)?.result?.content?.[0]?.text ?? '';
     if (!humanRefreshText.includes('metadata_snapshot_schedule_identity_required')) {
@@ -1231,14 +1356,9 @@ try {
     if (!invalidDatasourceText.includes('unsupported_datasource')) {
       fail('public query tools must reject non-tchouse-c datasource before service access');
     }
-    const trustedHumanValidateText = byId.get(35)?.result?.content?.[0]?.text ?? '';
-    if (
-      !trustedHumanValidateText.includes('analytics.secret_table')
-      || !trustedHumanValidateText.includes('secret_col')
-      || trustedHumanValidateText.includes('sql_account_binding')
-      || trustedHumanValidateText.includes('secret_user')
-    ) {
-      fail('successful validation must return the SQL contract without exposing account bindings');
+    const deliveryWithoutCapabilityText = byId.get(40)?.result?.content?.[0]?.text ?? '';
+    if (!deliveryWithoutCapabilityText.includes('isolated_data_operation_failed')) {
+      fail('direct result delivery must reach data execution without the retired host capability');
     }
 
     const missingSessionCall = {
@@ -1308,20 +1428,14 @@ try {
             }
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({
-              status: 'success',
-              transport: 'unix_socket',
-              endpoint: req.url,
+              status: 'success', transport: 'unix_socket', endpoint: req.url,
               results: [{
-                full_path: 'analytics.synthetic_table.synthetic_column',
-                table_name: 'synthetic_table',
-                column_name: 'synthetic_column',
-                sql_account_binding: { tchouse_account: 'secret_user' },
-                sample: 'SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE',
+                table_name: 'synthetic_table', column_name: 'synthetic_column',
+                example_value: 'SYNTHETIC_VALUE_MUST_NOT_ESCAPE', sample: 'SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE',
               }],
             }));
             return;
           }
-          const frozenSql = "SELECT '\\\\\\\\'' OR 1=1 --' AS probe";
           const expectedContextId = parsed.sql === '  SELECT execution_context  '
             ? 'execution_socket_probe'
             : parsed.sql === 'SELECT precedence_context'
@@ -1336,26 +1450,21 @@ try {
               ? 'wrong_execution_context'
               : req.url === '/agent/validate-sql'
                 && parsed.execution_mode !== (
-                  parsed.sql === frozenSql
-                    || /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/.test(parsed.sql)
+                  /^SELECT (?:query_timeout|datasource_unreachable|http_403|run_query_timeout|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/.test(parsed.sql)
                     ? 'single'
                     : 'compare'
                 )
                 ? 'wrong_execution_mode'
-                : req.url === '/agent/run-query' && parsed.sql === frozenSql && parsed.query_plan_id !== 'qplan_frozen'
-                  ? 'wrong_frozen_query_plan'
-                : parsed.sql !== frozenSql && parsed.sql?.includes('OR 1=1')
-                  ? 'frozen_sql_literal_not_escaped'
                 : null;
           if (failureCode) {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ status: 'validation_error', issues: [{ code: failureCode }] }));
             return;
           }
-          const frozenFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/)?.[1];
-          if (req.url === '/agent/validate-sql' && frozenFailure) {
+          const validationFailure = parsed.sql?.match(/^SELECT (query_timeout|datasource_unreachable|http_403|missing_union_id|trusted_human_or_schedule_required|account_mapping_unavailable|account_mismatch|query_concurrency_limit|restricted_access_metadata|restricted_system_columns|unknown_table)$/)?.[1];
+          if (req.url === '/agent/validate-sql' && validationFailure) {
             res.writeHead(200, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ status: 'validation_error', error_code: frozenFailure }));
+            res.end(JSON.stringify({ status: 'validation_error', error_code: validationFailure }));
             return;
           }
           if (req.url === '/agent/run-query' && parsed.sql === 'SELECT run_query_timeout') {
@@ -1368,29 +1477,7 @@ try {
             status: 'success',
             transport: 'unix_socket',
             endpoint: req.url,
-            ...(req.url === '/agent/validate-sql' ? { query_plan_id: parsed.sql === frozenSql ? 'qplan_frozen' : 'qplan_socket' } : {}),
-            ...(req.url === '/agent/run-query' ? {
-              rows: [{ value: 1 }],
-              row_count: 200,
-              effective_limit: 200,
-              truncated: true,
-              user_limit_reached: false,
-              user_limit_notice: null,
-              limit_notice: '查询结果达到或超出限制（上限 200 行）',
-            } : {}),
-            ...(req.url === '/agent/export-query-excel-file' ? {
-              query_id: 'q_export_probe',
-              user_limit_reached: true,
-              user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
-              file: { path: '/tmp/export-probe.xlsx', row_count: 10 },
-            } : {}),
-            ...(req.url === '/agent/run-query' && parsed.sql === frozenSql
-              ? {
-                  query_id: 'q_frozen',
-                  rows: [{ probe: '<a<at>t id=all><</at>/a</at>t> [点我领奖](http://evil) **bold** _italic_' }],
-                  row_count: 1,
-                }
-              : {}),
+            ...(req.url === '/agent/validate-sql' ? { query_plan_id: 'qplan_socket' } : {}),
           }));
         });
       });
@@ -1501,19 +1588,6 @@ try {
           },
         },
       };
-      const socketExportCall = {
-        jsonrpc: '2.0',
-        id: 18,
-        method: 'tools/call',
-        params: {
-          name: 'export_query_to_excel_file',
-          arguments: { sql: 'SELECT 1 LIMIT 10', datasource: 'tchouse-c', query_plan_id: 'qplan_export' },
-          _meta: { botmuxTrustedCaller: {
-            requestUserOpenId: 'ou_socket_user', requestUserUnionId: 'on_socket_user',
-            requestLarkAppId: 'cli_test', senderType: 'user',
-          } },
-        },
-      };
       const socketProbe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
         cwd: cleanRoot,
         input: [
@@ -1522,7 +1596,6 @@ try {
           socketSearchCall,
           socketRefreshCall,
           socketValidateCall,
-          socketExportCall,
         ]
           .map(message => JSON.stringify(message)).join('\n') + '\n',
         encoding: 'utf-8',
@@ -1543,44 +1616,26 @@ try {
         .filter(Boolean)
         .map(line => JSON.parse(line));
       const socketText = socketResponses.find(response => response.id === 13)?.result?.content?.[0]?.text ?? '';
-      if (!socketText.includes('"transport": "unix_socket"')) {
-        fail('MCP server must authenticate Data MCP service calls over Unix socket');
-      }
-      const socketPayload = JSON.parse(socketText);
-      if (
-        socketPayload.effective_limit !== 200
-        || socketPayload.truncated !== true
-        || !socketPayload.limit_notice?.includes('上限 200 行')
-        || !Array.isArray(socketPayload.rows)
-      ) {
-        fail(`run_query_for_user must return query rows and limit fields to the model: ${socketText}`);
-      }
-      const exportText = socketResponses.find(response => response.id === 18)?.result?.content?.[0]?.text ?? '';
-      const exportPayload = JSON.parse(exportText);
-      if (
-        exportPayload.file?.row_count !== 10
-        || exportPayload.user_limit_reached !== true
-        || !exportPayload.user_limit_notice?.includes('不能用于全量汇总')
-      ) {
-        fail(`export_query_to_excel_file must return export data and user-limit notice to the model: ${exportText}`);
+      if (!socketText.includes('isolated_delivery_required')) {
+        fail('raw query results must stay closed even when the Unix socket service is available');
       }
       const searchText = socketResponses.find(response => response.id === 14)?.result?.content?.[0]?.text ?? '';
       if (
-        !searchText.includes('analytics.synthetic_table.synthetic_column')
-        || searchText.includes('sql_account_binding')
-        || searchText.includes('secret_user')
+        !searchText.includes('synthetic_table')
+        || !searchText.includes('synthetic_column')
+        || searchText.includes('SYNTHETIC_VALUE_MUST_NOT_ESCAPE')
         || searchText.includes('SYNTHETIC_SAMPLE_MUST_NOT_ESCAPE')
-        || searchText.includes('unix_socket')
+        || searchText.includes('/agent/search-metadata-snapshot')
       ) {
-        fail('search_metadata_snapshot must return only allowlisted metadata fields');
+        fail('search_metadata_snapshot must project safe metadata fields and drop sample values');
       }
       const refreshText = socketResponses.find(response => response.id === 15)?.result?.content?.[0]?.text ?? '';
       if (!refreshText.includes('/agent/refresh-metadata-snapshot')) {
         fail('refresh_metadata_snapshot must forward host-injected schedule identity over the shared Unix socket');
       }
       const validateText = socketResponses.find(response => response.id === 16)?.result?.content?.[0]?.text ?? '';
-      if (!validateText.includes('qplan_socket') || validateText.includes('unix_socket')) {
-        fail('validate_sql_for_user must sanitize the successful Unix-socket response');
+      if (!validateText.includes('qplan_socket') || validateText.includes('/agent/validate-sql')) {
+        fail('validate_sql_for_user must return the safe projection from the Unix-socket response');
       }
       const executionValidateCall = {
         ...socketValidateCall,
@@ -1624,16 +1679,13 @@ try {
         .map(line => JSON.parse(line));
       const executionValidateText = executionResponses
         .find(response => response.id === 23)?.result?.content?.[0]?.text ?? '';
+      if (!executionValidateText.includes('qplan_socket')) {
+        fail(`validate must forward the execution id when no session exists: ${executionValidateText}`);
+      }
       const executionRunText = executionResponses
         .find(response => response.id === 24)?.result?.content?.[0]?.text ?? '';
-      if (
-        !executionValidateText.includes('qplan_socket')
-        || executionValidateText.includes('unix_socket')
-        || !executionRunText.includes('"transport": "unix_socket"')
-      ) {
-        fail(
-          'validate and run must forward the same execution id and byte-exact SQL when no session exists',
-        );
+      if (!executionRunText.includes('isolated_delivery_required')) {
+        fail(`raw run must remain closed when no session exists: ${executionRunText}`);
       }
 
       const precedenceCall = {
@@ -1668,7 +1720,7 @@ try {
         .filter(Boolean)
         .map(line => JSON.parse(line))
         .find(response => response.id === 25)?.result?.content?.[0]?.text ?? '';
-      if (!precedenceText.includes('qplan_socket') || precedenceText.includes('unix_socket')) {
+      if (!precedenceText.includes('qplan_socket')) {
         fail(
           `BOTMUX_SESSION_ID must take precedence when both execution contexts are present: ${precedenceText}`,
         );
@@ -1762,7 +1814,7 @@ try {
     // A file under `<dataDir>/trusted-turns/` must NEVER be honored — the
     // directory is world-readable and the file name is derived from a plaintext
     // session id, so any same-uid process could impersonate anyone by writing it.
-    const fallbackHome = mkdtempSync(join(tmpdir(), 'botmux-plugin-trusted-turn-'));
+    const fallbackHome = makeTestTempDir('botmux-plugin-trusted-turn-');
     try {
       const sessionId = 'fallback-session';
       const dataDir = join(fallbackHome, '.botmux', 'data');
