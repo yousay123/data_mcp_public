@@ -104,9 +104,6 @@ class TChouseDCredentialResolver(CredentialResolver):
             password=password,
             database=target.database,
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=5,
-            read_timeout=10,
-            write_timeout=10,
         )
         try:
             with connection.cursor() as cursor:

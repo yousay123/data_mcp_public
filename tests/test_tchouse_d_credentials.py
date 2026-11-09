@@ -90,6 +90,7 @@ def test_resolves_configured_tchouse_d_credential() -> None:
 def test_accepts_configured_credential_sql_aliases(monkeypatch) -> None:
     settings = _resolver_settings()
     resolver = TChouseDCredentialResolver(settings)
+    connect_options = {}
 
     class FakeCursor:
         def __enter__(self):
@@ -114,7 +115,11 @@ def test_accepts_configured_credential_sql_aliases(monkeypatch) -> None:
 
     import pymysql
 
-    monkeypatch.setattr(pymysql, "connect", lambda **kwargs: FakeConnection())
+    def connect(**kwargs):
+        connect_options.update(kwargs)
+        return FakeConnection()
+
+    monkeypatch.setattr(pymysql, "connect", connect)
 
     credential = resolver.resolve(
         UserContext(union_id="on_test", feishu_user_id="ou_test"),
@@ -126,6 +131,9 @@ def test_accepts_configured_credential_sql_aliases(monkeypatch) -> None:
     assert credential.user_email is None
     assert credential.tchouse_account == "agent_user"
     assert "user=agent_user;password=agent_password" in credential.jdbc_url
+    assert "connect_timeout" not in connect_options
+    assert "read_timeout" not in connect_options
+    assert "write_timeout" not in connect_options
 
 
 def test_raises_specific_error_when_union_id_mapping_missing(monkeypatch) -> None:
