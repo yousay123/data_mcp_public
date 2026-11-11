@@ -1,13 +1,13 @@
 from abc import ABC, abstractmethod
-from uuid import uuid4
 from urllib.error import HTTPError
+from uuid import uuid4
 
 from ksher_agent_data_mcp.config import Settings
 from ksher_agent_data_mcp.db.query_executor import (
     execute_clickhouse_json,
     parse_clickhouse_jdbc_url,
 )
-from ksher_agent_data_mcp.models.contracts import CredentialRef, TableMeta
+from ksher_agent_data_mcp.models.contracts import CredentialRef, ResolvedPrincipal, TableMeta
 
 
 class MetadataAccessDenied(Exception):
@@ -21,13 +21,13 @@ class MetadataLookupError(Exception):
 class MetadataCatalog(ABC):
     @abstractmethod
     def describe_table(
-        self, full_name: str, credential: CredentialRef | None = None
+        self, full_name: str, credential: ResolvedPrincipal | None = None
     ) -> TableMeta | None:
         """Return allowed TChouse-C table metadata."""
 
     @abstractmethod
     def suggest_tables(
-        self, full_name: str, limit: int = 5, credential: CredentialRef | None = None
+        self, full_name: str, limit: int = 5, credential: ResolvedPrincipal | None = None
     ) -> list[TableMeta]:
         """Return nearby allowed tables for user-facing clarification."""
 

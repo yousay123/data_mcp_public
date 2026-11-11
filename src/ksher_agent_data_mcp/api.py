@@ -96,6 +96,11 @@ class MetadataSnapshotSearchRequest(BaseModel):
     priority: str | None = None
 
 
+class DlcTableSearchRequest(MetadataSnapshotRefreshRequest):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
 class SubjectsByTableRequest(MetadataSnapshotRefreshRequest):
     target_tables: list[str]
 
@@ -160,6 +165,8 @@ def health() -> dict[str, Any]:
             "timeout_seconds": settings.query_timeout_seconds,
             "clickhouse_read_and_memory_limits": "cluster_profile",
             "max_concurrency": settings.query_max_concurrency,
+            "safe_retry_max_retries": settings.query_retry_max_retries,
+            "safe_retry_base_delay_seconds": settings.query_retry_base_delay_seconds,
             "repair_max_failures": settings.query_repair_max_failures,
             "query_plan_single_ttl_seconds": service.query_plans.ttl_seconds,
             "query_plan_compare_ttl_seconds": service.query_plans.compare_ttl_seconds,
@@ -280,6 +287,18 @@ def agent_search_metadata_snapshot(request: MetadataSnapshotSearchRequest) -> di
         query=request.query,
         limit=request.limit,
         priority=request.priority,
+    )
+
+
+@app.post("/agent/search-dlc-tables", dependencies=[Depends(require_internal_http_auth)])
+def agent_search_dlc_tables(request: DlcTableSearchRequest) -> dict[str, Any]:
+    return service.search_dlc_tables_for_user(
+        request.request_user_union_id,
+        request.request_user_open_id,
+        request.query,
+        request.request_lark_app_id,
+        audit_context=request.audit_context(),
+        limit=request.limit,
     )
 
 
