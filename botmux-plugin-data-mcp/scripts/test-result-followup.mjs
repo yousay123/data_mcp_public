@@ -186,9 +186,8 @@ function spawnPlugin(sessionId, envFile = hostEnvFile) {
 function toolPayload(response) {
   return JSON.parse(response?.result?.content?.[0]?.text || '{}');
 }
-function latestBotmuxContent() {
-  return readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
-    .map(JSON.parse).filter(row => row.args[0] === 'send').at(-1)?.content || '';
+function hostDelivery(response) {
+  return response?.result?._meta?.botmuxHostDelivery;
 }
 
 const callerA = {
@@ -219,7 +218,7 @@ const initial = await plugin.call('deliver_query_result_for_user', {
 }, callerA);
 const initialVisible = JSON.stringify(initial.result?.content ?? []);
 if (initialVisible.includes(rowSentinel) || initialVisible.includes(modelSentinel)) throw new Error('initial result leaked');
-if (toolPayload(initial).status !== 'delivered') {
+if (toolPayload(initial).status !== 'delivery_requested' || !hostDelivery(initial)?.markdown) {
   throw new Error('initial internal-model result was not directly delivered');
 }
 
@@ -230,7 +229,7 @@ const followup = await plugin.call('continue_query_result_for_user', {
 }, followupCaller);
 const followupVisible = JSON.stringify(followup.result?.content ?? []);
 if (followupVisible.includes(rowSentinel) || followupVisible.includes(modelSentinel)) throw new Error('follow-up result leaked');
-if (toolPayload(followup).status !== 'delivered') {
+if (toolPayload(followup).status !== 'delivery_requested' || !hostDelivery(followup)?.markdown) {
   throw new Error('follow-up internal-model result was not directly delivered');
 }
 const callsAfterFollowup = modelCalls;
@@ -279,7 +278,9 @@ const excelVisible = JSON.stringify(excel.result?.content ?? []);
 if (excelVisible.includes(rowSentinel) || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
   throw new Error('Excel direct-delivery receipt exposed rows or attachment paths');
 }
-if (toolPayload(excel).status !== 'delivered' || toolPayload(excel).attachmentCount !== 1) {
+if (toolPayload(excel).status !== 'delivery_requested'
+  || hostDelivery(excel)?.files?.length !== 1
+  || !statSync(hostDelivery(excel).files[0].path).isFile()) {
   throw new Error('Excel follow-up did not use the Agent tool and trusted delivery');
 }
 
@@ -323,7 +324,7 @@ const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
 }, { ...callerA, turnId: 'om_low_quota_initial' });
-if (toolPayload(lowQuotaInitial).status !== 'delivered') {
+if (toolPayload(lowQuotaInitial).status !== 'delivery_requested') {
   throw new Error('result-store quota failure broke first-turn direct delivery');
 }
 const callsAfterLowQuotaInitial = modelCalls;
@@ -354,7 +355,7 @@ const missingKeyInitial = await missingKey.call('deliver_query_result_for_user',
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
 }, { ...callerA, turnId: 'om_missing_key_initial' });
-if (toolPayload(missingKeyInitial).status !== 'delivered') {
+if (toolPayload(missingKeyInitial).status !== 'delivery_requested') {
   throw new Error('missing result-store HMAC key broke first-turn direct delivery');
 }
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
@@ -601,11 +602,11 @@ const publicDenied = await publicEndpoint.call('deliver_query_result_for_user', 
   sql: 'SELECT synthetic_value FROM synthetic.events', query_plan_id: 'synthetic-public-plan',
   output_mode: 'analysis', question: 'network guard',
 }, { ...callerA, turnId: 'om_public_endpoint' });
-if (toolPayload(publicDenied).status !== 'delivered') {
+if (toolPayload(publicDenied).status !== 'delivery_requested') {
   throw new Error('non-private model endpoint failure was not directly delivered');
 }
 await publicEndpoint.close();
-const publicFailureCard = latestBotmuxContent();
+const publicFailureCard = hostDelivery(publicDenied)?.markdown || '';
 if (!publicFailureCard.includes('result_model_network_not_private')
   || !publicFailureCard.includes('synthetic-public-plan')
   || publicFailureCard.includes(rowSentinel)) {
@@ -634,12 +635,12 @@ const redirectDenied = await redirected.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', query_plan_id: 'synthetic-redirect-plan',
   output_mode: 'analysis', question: 'redirect guard',
 }, { ...callerA, turnId: 'om_redirect_endpoint' });
-if (toolPayload(redirectDenied).status !== 'delivered'
+if (toolPayload(redirectDenied).status !== 'delivery_requested'
   || redirectHits !== 1 || modelCalls !== modelCallsBeforeRedirect) {
   throw new Error('internal model redirect was followed or not rejected');
 }
 await redirected.close();
-const redirectFailureCard = latestBotmuxContent();
+const redirectFailureCard = hostDelivery(redirectDenied)?.markdown || '';
 if (!redirectFailureCard.includes('result_agent_http_302')
   || !redirectFailureCard.includes('synthetic-redirect-plan')
   || redirectFailureCard.includes(rowSentinel)) {

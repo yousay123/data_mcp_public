@@ -188,20 +188,24 @@ const responses = await runPlugin([
 ]);
 const byId = new Map(responses.map(response => [response.id, response]));
 const toolPayload = response => JSON.parse(response?.result?.content?.[0]?.text || '{}');
-const botmuxRecords = () => readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
-const latestSend = () => botmuxRecords().filter(row => row.args[0] === 'send').at(-1);
-const analysisVisible = JSON.stringify(byId.get(1)?.result ?? {});
-if (toolPayload(byId.get(1)).status !== 'delivered') {
-  throw new Error('analysis was not directly delivered');
+const hostDelivery = response => response?.result?._meta?.botmuxHostDelivery;
+const analysisDelivery = hostDelivery(byId.get(1));
+const analysisVisible = JSON.stringify(byId.get(1)?.result?.content ?? {});
+if (toolPayload(byId.get(1)).status !== 'delivery_requested'
+  || !analysisDelivery?.markdown?.includes('amount（合计）')
+  || !analysisDelivery.markdown.includes('30')) {
+  throw new Error('analysis was not wrapped for trusted host delivery');
 }
 for (const forbidden of [sentinel, modelOutput, root]) {
   if (analysisVisible.includes(forbidden)) throw new Error(`calling model saw protected value: ${forbidden}`);
 }
-const excelVisible = JSON.stringify(byId.get(2)?.result ?? {});
-if (toolPayload(byId.get(2)).attachmentCount !== 3
+const artifactDelivery = hostDelivery(byId.get(2));
+const excelVisible = JSON.stringify(byId.get(2)?.result?.content ?? {});
+if (toolPayload(byId.get(2)).status !== 'delivery_requested'
+  || artifactDelivery?.files?.length !== 3
   || excelVisible.includes('.xlsx') || excelVisible.includes(root)
   || excelVisible.includes(sentinel)) {
-  throw new Error('multi-artifact receipt was unsafe or incomplete');
+  throw new Error('multi-artifact host delivery was unsafe or incomplete');
 }
 if (!JSON.stringify(byId.get(3)).includes('isolated_delivery_required')) {
   throw new Error('raw query path was not isolated');
@@ -210,22 +214,16 @@ if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
   throw new Error('internal result model did not receive the protected result, credential, and limit evidence');
 }
 if (queryCount !== 2) throw new Error(`each delivery must query exactly once; got ${queryCount} queries for 2 deliveries`);
-const initialBotmuxRecords = botmuxRecords();
-if (!initialBotmuxRecords.some(row => row.content?.includes('amount（合计）') && row.content.includes('30'))) {
-  throw new Error('source-bound analysis was not sent to Feishu');
+if (!artifactDelivery.markdown?.includes('```vega-lite')) {
+  throw new Error('inline chart was not included in trusted host delivery');
 }
-const fileRecord = initialBotmuxRecords.find(row => row.args[0] === 'send' && row.args.filter(arg => arg === '--files').length === 3);
-if (!fileRecord) {
-  throw new Error('Agent artifacts were not sent to Feishu together');
+if (!artifactDelivery.markdown?.includes('不能用于全量汇总')) {
+  throw new Error('trusted host delivery lost the user LIMIT advisory');
 }
-if (!initialBotmuxRecords.some(row => row.content?.includes('```vega-lite'))) {
-  throw new Error('inline chart was not sent in the Feishu result card');
+const stagedPaths = artifactDelivery.files.map(file => file.path);
+if (stagedPaths.some(path => !existsSync(path))) {
+  throw new Error('staged Agent artifact was removed before the host could snapshot it');
 }
-if (!initialBotmuxRecords.some(row => row.content?.includes('不能用于全量汇总'))) {
-  throw new Error('Excel direct delivery lost the user LIMIT advisory');
-}
-const stagedPaths = fileRecord.args.flatMap((arg, index) => arg === '--files' ? [fileRecord.args[index + 1]] : []);
-if (stagedPaths.some(existsSync)) throw new Error('staged Agent artifact was not removed after delivery');
 
 const dlcFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
@@ -236,10 +234,10 @@ const dlcFailure = await runPlugin([{
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_dlc_failure' } },
 }]);
 const dlcFailureVisible = JSON.stringify(dlcFailure[0].result ?? {});
-if (toolPayload(dlcFailure[0]).status !== 'delivered' || dlcFailureVisible.includes('RAW_DLC_ERROR_MUST_NOT_LEAK')) {
+if (toolPayload(dlcFailure[0]).status !== 'delivery_requested' || dlcFailureVisible.includes('RAW_DLC_ERROR_MUST_NOT_LEAK')) {
   throw new Error('DLC failure was not safely delivered');
 }
-const dlcFailureCard = latestSend()?.content || '';
+const dlcFailureCard = hostDelivery(dlcFailure[0])?.markdown || '';
 if (!dlcFailureCard.includes('PERM-002')
   || !dlcFailureCard.includes('DescribeTasks')
   || !dlcFailureCard.includes('dlc-task-safe-1')
@@ -254,21 +252,9 @@ const rejected = await runPlugin([{
   },
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'schedule:task:turn', callerSource: 'schedule_creator', taskId: 'task' } },
 }]);
-if (!JSON.stringify(rejected[0]).includes('direct_reply_identity_rejected')) {
-  throw new Error('synthetic scheduled turn was not rejected for direct reply');
-}
-
-const transportFailure = await runPlugin([{
-  name: 'deliver_query_result_for_user',
-  arguments: {
-    sql: 'SELECT amount FROM fixture', query_plan_id: 'failed-send', output_mode: 'analysis',
-  },
-  _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_failed' } },
-}], { FAKE_BOTMUX_FAIL: 'send' });
-const failedVisible = JSON.stringify(transportFailure[0].result?.content ?? {});
-if (!failedVisible.includes('direct_reply_transport_failed')
-  || failedVisible.includes(modelOutput) || failedVisible.includes(sentinel)) {
-  throw new Error('transport failure did not return a fixed, redacted error');
+if (toolPayload(rejected[0]).status !== 'delivery_requested'
+  || JSON.stringify(rejected[0].result?.content ?? {}).includes(sentinel)) {
+  throw new Error('scheduled result was not safely handed to the host identity boundary');
 }
 
 failNextModelCall = true;
@@ -281,10 +267,10 @@ const agentFailure = await runPlugin([{
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_failed' } },
 }]);
 const agentFailureVisible = JSON.stringify(agentFailure[0].result?.content ?? {});
-if (toolPayload(agentFailure[0]).status !== 'delivered'
+if (toolPayload(agentFailure[0]).status !== 'delivery_requested'
   || agentFailureVisible.includes('synthetic provider failure')
   || agentFailureVisible.includes(sentinel)) {
-  throw new Error('result Agent failure did not produce a safe direct reply');
+  throw new Error('result Agent failure did not produce a safe host delivery');
 }
 
 failNextModelCall = true;
@@ -296,10 +282,10 @@ const nonFallbackAgentFailure = await runPlugin([{
   },
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_artifact_failed' } },
 }]);
-if (toolPayload(nonFallbackAgentFailure[0]).status !== 'delivered') {
-  throw new Error('non-fallback result Agent failure was not directly delivered');
+if (toolPayload(nonFallbackAgentFailure[0]).status !== 'delivery_requested') {
+  throw new Error('non-fallback result Agent failure was not handed to host delivery');
 }
-const modelFailureCard = latestSend()?.content || '';
+const modelFailureCard = hostDelivery(nonFallbackAgentFailure[0])?.markdown || '';
 if (!modelFailureCard.includes('result_agent_http_503')
   || !modelFailureCard.includes('failed-agent-artifact')
   || modelFailureCard.includes(sentinel)) {
@@ -314,8 +300,8 @@ const missingModel = await runPlugin([{
   },
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_missing_model' } },
 }], { KSHER_AGENT_DATA_MCP_ENV_FILE: missingModelEnvFile });
-if (toolPayload(missingModel[0]).status !== 'delivered') {
-  throw new Error('missing result model did not return a safe direct reply');
+if (toolPayload(missingModel[0]).status !== 'delivery_requested') {
+  throw new Error('missing result model did not return a safe host delivery');
 }
 const auditRows = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8')
   .trim().split('\n').filter(Boolean).map(JSON.parse);
@@ -360,7 +346,7 @@ if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && Number.isSafeInteger(row.latency_ms))) {
   throw new Error('failed result Agent call did not emit its privacy-safe request trace');
 }
-if (!latestSend()?.content?.includes('result_agent_not_configured')
+if (!hostDelivery(missingModel[0])?.markdown?.includes('result_agent_not_configured')
   || JSON.stringify(missingModel[0]).includes('CONFIDENTIAL_BUSINESS_ROW_7319')) {
   throw new Error('missing-model reply did not explain the safe error or exposed raw rows');
 }

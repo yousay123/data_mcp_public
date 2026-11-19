@@ -245,6 +245,10 @@ function toolPayload(response) {
   return JSON.parse(response?.result?.content?.[0]?.text || '{}');
 }
 
+function hostDelivery(response) {
+  return response?.result?._meta?.botmuxHostDelivery;
+}
+
 const plugin = spawnPlugin();
 const selectedValidation = await plugin.call('validate_sql_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
@@ -272,7 +276,8 @@ const initial = await plugin.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'initial',
 }, caller(selectedAppId, 'om_initial'));
-if (toolPayload(initial).status !== 'delivered'
+if (toolPayload(initial).status !== 'delivery_requested'
+  || !hostDelivery(initial)?.markdown
   || JSON.stringify(initial.result?.content).includes(rowSentinel)
   || modelAuthorization !== 'Bearer synthetic-profile-api-key') {
   throw new Error('initial analysis did not use the selected model profile safely');
@@ -281,7 +286,8 @@ if (toolPayload(initial).status !== 'delivered'
 const followup = await plugin.call('continue_query_result_for_user', {
   question: 'follow up', output_mode: 'analysis',
 }, caller(selectedAppId, 'om_followup'));
-if (toolPayload(followup).status !== 'delivered'
+if (toolPayload(followup).status !== 'delivery_requested'
+  || !hostDelivery(followup)?.markdown
   || modelCalls !== 2) {
   throw new Error('follow-up did not reuse the selected model profile and base HMAC binding');
 }
@@ -289,8 +295,8 @@ if (toolPayload(followup).status !== 'delivered'
 const exported = await plugin.call('continue_query_result_for_user', {
   question: 'export', requested_outputs: ['excel'],
 }, caller(selectedAppId, 'om_export'));
-if (toolPayload(exported).status !== 'delivered'
-  || toolPayload(exported).attachmentCount !== 1
+if (toolPayload(exported).status !== 'delivery_requested'
+  || hostDelivery(exported)?.files?.length !== 1
   || modelCalls !== 3) {
   throw new Error('follow-up Excel did not use the selected internal Agent profile exclusively');
 }
@@ -374,7 +380,8 @@ const noOptionalResult = await noOptionalPlugin.call('deliver_query_result_for_u
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'signed-profile-plan', output_mode: 'analysis', question: 'no optional key',
 }, caller(selectedAppId, 'om_no_optional'));
-if (toolPayload(noOptionalResult).status !== 'delivered'
+if (toolPayload(noOptionalResult).status !== 'delivery_requested'
+  || !hostDelivery(noOptionalResult)?.markdown
   || modelAuthorization !== undefined) {
   throw new Error('missing optional profile key fell back to the default profile');
 }

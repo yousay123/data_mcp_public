@@ -113,7 +113,8 @@ const response = await new Promise((resolvePromise, rejectPromise) => {
 });
 
 const receipt = JSON.parse(response?.result?.content?.[0]?.text || '{}');
-if (receipt.status !== 'delivered' || receipt.attachmentCount !== 3) {
+const delivery = response?.result?._meta?.botmuxHostDelivery;
+if (receipt.status !== 'delivery_requested' || delivery?.files?.length !== 3 || !delivery?.markdown) {
   throw new Error(`exact chain delivery failed: ${JSON.stringify(response)}`);
 }
 if (modelRows?.[0]?.amount !== '9007199254740993.00'
@@ -121,10 +122,7 @@ if (modelRows?.[0]?.amount !== '9007199254740993.00'
   throw new Error('MCP or isolated-Agent IPC lost exact values');
 }
 
-const records = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
-const delivery = records.find(record => record.args[0] === 'send' && record.files?.length === 3);
-if (!delivery) throw new Error('trusted delivery did not capture every exact artifact');
-const deliveredText = records.map(record => record.content || '').join('\n');
+const deliveredText = delivery.markdown;
 const exactClaims = [
   '- **amount（合计）**：9,007,199,254,740,989.51',
   '- **amount（平均值）**：3,002,399,751,580,329.836667',
@@ -155,7 +153,7 @@ function zipEntries(bytes) {
   return entries;
 }
 
-const captured = Object.fromEntries(delivery.files.map(file => [file.path.split('.').pop(), Buffer.from(file.base64, 'base64')]));
+const captured = Object.fromEntries(delivery.files.map(file => [file.path.split('.').pop(), readFileSync(file.path)]));
 const document = captured.md.toString('utf8');
 const pdfText = captured.pdf.toString('latin1');
 const workbook = zipEntries(captured.xlsx).get('xl/worksheets/sheet1.xml')?.toString('utf8') || '';
@@ -172,7 +170,9 @@ if (!deliveredText.includes('```vega-lite')
   || !deliveredText.includes('"value_exact":"9007199254740993.00"')) {
   throw new Error('inline chart did not bind exact large-integer labels and values');
 }
-if (delivery.files.some(file => existsSync(file.path))) throw new Error('trusted delivery did not clean staged files');
+if (delivery.files.some(file => !existsSync(file.path))) {
+  throw new Error('staged artifacts were removed before the trusted host could snapshot them');
+}
 
 modelServer.close();
 serviceServer.close();
