@@ -732,6 +732,8 @@ export async function runInternalResultAgent(options) {
     modelResponse = await postModel(config, {
       model: config.model,
       temperature: 0,
+      max_tokens: 2048,
+      chat_template_kwargs: { enable_thinking: false },
       messages,
       tools,
       tool_choice: 'required',

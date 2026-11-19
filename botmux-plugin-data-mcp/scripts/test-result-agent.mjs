@@ -172,6 +172,10 @@ if (requests.length !== 1 || requests.some(entry => entry.authorization !== 'Bea
   throw new Error('result Agent model loop or authentication is incorrect');
 }
 const firstRequest = requests[0].payload;
+if (firstRequest.max_tokens !== 2048
+  || firstRequest.chat_template_kwargs?.enable_thinking !== false) {
+  throw new Error('result Agent did not bound output tokens and disable Qwen thinking mode');
+}
 const envelope = JSON.parse(firstRequest.messages.find(message => message.role === 'user').content);
 if (envelope.rows.length !== 2
   || envelope.result_manifest.columns[1].name !== 'amount'
