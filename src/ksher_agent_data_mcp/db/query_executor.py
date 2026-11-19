@@ -15,7 +15,6 @@ from ksher_agent_data_mcp.models.contracts import (
     ColumnMeta,
     CredentialRef,
     QueryResult,
-    ResolvedPrincipal,
     ResultClass,
     Status,
 )
@@ -40,7 +39,7 @@ class QueryExecutor(ABC):
     @abstractmethod
     def run(
         self,
-        credential: ResolvedPrincipal,
+        credential: CredentialRef,
         sql: str,
         timeout_seconds: int,
         max_rows: int | None = None,
@@ -289,11 +288,6 @@ def execute_clickhouse_json(
         "database": target.database,
         "query_id": query_id,
         "readonly": "2",
-        # Preserve values before they cross Python/JavaScript JSON parsers. ClickHouse
-        # Decimal and 64-bit integer values must arrive as decimal strings so the
-        # isolated result Agent can perform exact fixed-point arithmetic.
-        "output_format_json_quote_decimals": "1",
-        "output_format_json_quote_64bit_integers": "1",
     }
     for key, value in (query_settings or {}).items():
         if key in {
@@ -317,11 +311,7 @@ def execute_clickhouse_json(
     )
     with urlopen(request, timeout=timeout_seconds) as response:
         body = response.read().decode("utf-8")
-    # Defense in depth for an older/proxied ClickHouse that ignores the Decimal
-    # quoting setting. This preserves the JSON token text instead of first
-    # rounding it through Python float. The server-side quote settings above are
-    # still authoritative for Decimal scale and 64-bit integer fidelity.
-    return json.loads(body, parse_float=str)
+    return json.loads(body)
 
 
 def sanitize_clickhouse_error(exc: HTTPError, password: str) -> str:

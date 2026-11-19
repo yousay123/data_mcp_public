@@ -1,8 +1,8 @@
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.error import HTTPError, URLError
 from uuid import uuid4
+from urllib.error import HTTPError, URLError
 
 import sqlglot
 from sqlglot import exp
@@ -21,14 +21,15 @@ from ksher_agent_data_mcp.metadata.catalog import (
 )
 from ksher_agent_data_mcp.models.contracts import (
     CredentialRef,
-    DlcPrincipalRef,
-    ResolvedPrincipal,
     SqlValidationResult,
     Status,
     TableMeta,
     UserContext,
     ValidationIssue,
 )
+
+SUPPORTED_DATASOURCE = "tchouse-c"
+SQL_DIALECT = "clickhouse"
 
 CLICKHOUSE_PERMISSION_ERROR_NAMES = frozenset(
     {
@@ -119,15 +120,13 @@ SHOW_SETTINGS_CLAUSE = re.compile(
 class SqlGuard:
     settings: Settings
     catalog: MetadataCatalog
-    datasource: str = "tchouse-c"
-    dialect: str = "clickhouse"
 
     def validate(
         self,
         user: UserContext,
         sql: str,
         datasource: str = "tchouse-c",
-        credential: ResolvedPrincipal | None = None,
+        credential: CredentialRef | None = None,
         max_rows: int | None = None,
         max_rows_ceiling: int | None = None,
         default_rows: int | None = None,
@@ -137,12 +136,12 @@ class SqlGuard:
         effective_max_rows = min(max_rows or service_ceiling, service_ceiling)
         effective_default_rows = min(default_rows or self.settings.default_limit, effective_max_rows)
         datasource = datasource.lower()
-        if datasource != self.datasource:
+        if datasource != SUPPORTED_DATASOURCE:
             issues.append(
                 ValidationIssue(
                     code="unsupported_datasource",
                     severity="error",
-                    message=f"当前适配器仅支持 {self.datasource} SELECT / SHOW 查询：{datasource}",
+                    message=f"当前 MCP 仅支持 {SUPPORTED_DATASOURCE} SELECT / SHOW 查询：{datasource}",
                 )
             )
             return self._finish(datasource, None, [], [], issues)
@@ -158,7 +157,7 @@ class SqlGuard:
             return self._finish(datasource, None, [], [], issues)
 
         try:
-            expressions = sqlglot.parse(sql, read=self.dialect)
+            expressions = sqlglot.parse(sql, read=SQL_DIALECT)
         except Exception as exc:
             issues.append(
                 ValidationIssue(
@@ -185,7 +184,7 @@ class SqlGuard:
                 ValidationIssue(
                     code="query_settings_not_allowed",
                     severity="error",
-                    message="SQL 不允许包含 SETTINGS 子句；查询设置由服务与数据引擎统一管理",
+                    message="SQL 不允许包含 SETTINGS 子句；查询设置由服务与 ClickHouse 集群统一管理",
                 )
             )
             return self._finish(datasource, None, [], [], issues)
@@ -229,18 +228,6 @@ class SqlGuard:
         columns = sorted({column.name for column in expression.find_all(exp.Column) if column.name})
         tables, table_function_issues = _query_tables(expression)
         issues.extend(table_function_issues)
-        if isinstance(credential, DlcPrincipalRef):
-            for table in expression.find_all(exp.Table):
-                catalog = table.catalog
-                if catalog and catalog.lower() != credential.catalog.lower():
-                    issues.append(
-                        ValidationIssue(
-                            code="dlc_catalog_mismatch",
-                            severity="error",
-                            message=f"DLC 查询不允许跨到未配置的数据目录：{catalog}",
-                            suggested_action=f"仅使用已配置目录 {credential.catalog}",
-                        )
-                    )
         restricted_access_tables = sorted(set(tables) & RESTRICTED_ACCESS_SYSTEM_TABLES)
         if restricted_access_tables:
             issues.append(
@@ -338,7 +325,7 @@ class SqlGuard:
     def _describe_tables(
         self,
         tables: list[str],
-        credential: ResolvedPrincipal | None,
+        credential: CredentialRef | None,
     ) -> tuple[dict[str, TableMeta], set[str], list[ValidationIssue]]:
         if not tables:
             return {}, set(), []
@@ -358,13 +345,13 @@ class SqlGuard:
                     table_meta = futures[table].result()
                 except MetadataAccessDenied:
                     failed_tables.add(table)
-                    account = _principal_label(credential)
+                    account = credential.tchouse_account if credential else "当前账号"
                     issues.append(
                         ValidationIssue(
                             code="permission_denied",
                             severity="error",
                             message=f"数据库账号 {account} 没有访问表 {table} 的权限",
-                            suggested_action=f"请确认当前提问人的 {self.datasource} 身份已被授权该表 SELECT 权限",
+                            suggested_action="请确认当前提问人的 TChouse-C 账号已被授权该表 SELECT 权限",
                         )
                     )
                     continue
@@ -375,7 +362,7 @@ class SqlGuard:
                             code="metadata_lookup_error",
                             severity="error",
                             message=f"无法完成表目录预检：{table}",
-                            suggested_action=f"请稍后重试；若持续失败，请联系维护方检查 {self.datasource} 元数据探测链路",
+                            suggested_action="请稍后重试；若持续失败，请联系维护方检查 TChouse-C 元数据探测链路",
                         )
                     )
                     continue
@@ -385,11 +372,11 @@ class SqlGuard:
 
         return table_metas, failed_tables, issues
 
-    def _should_probe_query_access(self, credential: ResolvedPrincipal | None) -> bool:
+    def _should_probe_query_access(self, credential: CredentialRef | None) -> bool:
         return (
             isinstance(self.catalog, TChouseCMetadataCatalog)
             and credential is not None
-            and credential.datasource == "tchouse-c"
+            and credential.datasource == SUPPORTED_DATASOURCE
         )
 
     def _probe_query_access(
@@ -502,8 +489,9 @@ class SqlGuard:
         root_limit.set("expression", exp.Literal.number(max_rows))
         return self._normalize_sql(bounded), False, True, max_rows
 
-    def _normalize_sql(self, expression: exp.Expression) -> str:
-        return expression.sql(dialect=self.dialect, pretty=False)
+    @staticmethod
+    def _normalize_sql(expression: exp.Expression) -> str:
+        return expression.sql(dialect=SQL_DIALECT, pretty=False)
 
     @staticmethod
     def _is_show_command(expression: exp.Expression) -> bool:
@@ -695,7 +683,7 @@ def _query_tables(expression: exp.Expression) -> tuple[list[str], list[Validatio
 
     for table in expression.find_all(exp.Table):
         if not table.name:
-            unsupported_functions.append(table.sql())
+            unsupported_functions.append(table.sql(dialect=SQL_DIALECT))
             continue
         if not table.db and table.name.lower() in cte_names:
             continue
@@ -706,7 +694,7 @@ def _query_tables(expression: exp.Expression) -> tuple[list[str], list[Validatio
             ValidationIssue(
                 code="unsupported_table_function",
                 severity="error",
-                message="暂不支持在 FROM/JOIN 中使用数据源表函数",
+                message="暂不支持在 FROM/JOIN 中使用 ClickHouse 表函数",
                 suggested_action=(
                     "请改为查询已授权的物理表或视图；当前表函数："
                     + "、".join(unsupported_functions)
@@ -718,15 +706,7 @@ def _query_tables(expression: exp.Expression) -> tuple[list[str], list[Validatio
 
 
 def _candidate_tables(
-    catalog: MetadataCatalog, table: str, credential: ResolvedPrincipal | None
+    catalog: MetadataCatalog, table: str, credential: CredentialRef | None
 ) -> list[str]:
     candidates = catalog.suggest_tables(table, limit=5, credential=credential)
     return [candidate.full_name for candidate in candidates]
-
-
-def _principal_label(credential: ResolvedPrincipal | None) -> str:
-    if isinstance(credential, CredentialRef):
-        return credential.tchouse_account
-    if isinstance(credential, DlcPrincipalRef):
-        return "当前 CAM 身份"
-    return "当前身份"
