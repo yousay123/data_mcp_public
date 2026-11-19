@@ -16,7 +16,7 @@ import {
 import { createHmac, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_RESULT_BYTES = 5 * 1024 * 1024;
@@ -102,7 +102,10 @@ export class ResultStore {
       const stat = lstatSync(path);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('result_store_unsafe_record');
       const record = JSON.parse(readFileSync(path, 'utf8'));
-      if (record?.schemaVersion !== SCHEMA_VERSION) throw new Error('result_store_schema_mismatch');
+      if (record?.schemaVersion !== SCHEMA_VERSION) {
+        safeUnlink(path);
+        return null;
+      }
       return record;
     } catch (error) {
       if (error?.code === 'ENOENT') return null;
@@ -132,6 +135,7 @@ export class ResultStore {
       schemaVersion: SCHEMA_VERSION,
       bindingKey,
       ownerKey,
+      generation: randomUUID(),
       version: (previous?.version ?? 0) + 1,
       createdAt,
       updatedAt: now,
@@ -147,9 +151,11 @@ export class ResultStore {
     return record;
   }
 
-  replaceIfVersion(identity, expectedVersion, payload, now = Date.now()) {
+  replaceIfVersion(identity, expectedVersion, payload, now = Date.now(), expectedGeneration) {
     const current = this.read(identity, now);
-    if (current.status !== 'active' || current.record.version !== expectedVersion) {
+    if (current.status !== 'active'
+      || current.record.version !== expectedVersion
+      || (expectedGeneration !== undefined && current.record.generation !== expectedGeneration)) {
       throw new Error('result_store_version_changed');
     }
     const record = {
@@ -173,16 +179,25 @@ export class ResultStore {
     safeUnlink(this.recordPath(bindingKey));
   }
 
-  assertVersion(identity, expectedVersion, now = Date.now()) {
+  clearIfGeneration(identity, expectedGeneration) {
+    const current = this.read(identity);
+    if (current.status !== 'active' || current.record.generation !== expectedGeneration) return false;
+    safeUnlink(this.recordPath(current.record.bindingKey));
+    return true;
+  }
+
+  assertVersion(identity, expectedVersion, now = Date.now(), expectedGeneration) {
     const current = this.read(identity, now);
-    if (current.status !== 'active' || current.record.version !== expectedVersion) {
+    if (current.status !== 'active'
+      || current.record.version !== expectedVersion
+      || (expectedGeneration !== undefined && current.record.generation !== expectedGeneration)) {
       throw new Error('result_store_version_changed');
     }
     return current.record;
   }
 
-  touch(identity, expectedVersion, now = Date.now()) {
-    const current = this.assertVersion(identity, expectedVersion, now);
+  touch(identity, expectedVersion, now = Date.now(), expectedGeneration) {
+    const current = this.assertVersion(identity, expectedVersion, now, expectedGeneration);
     const updated = {
       ...current,
       updatedAt: now,

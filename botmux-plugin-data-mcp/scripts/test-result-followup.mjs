@@ -27,9 +27,18 @@ const bindingSecret = '0123456789abcdef0123456789abcdef';
 const ipv4 = (...octets) => octets.join('.');
 const privateV4 = ipv4(10, 2, 3, 4);
 let planCounter = 0;
+let runCalls = 0;
 let modelCalls = 0;
 const modelPayloads = [];
 let mutateActiveResultDuringModelCall;
+const modelStartResolvers = new Map();
+
+function modelStartBarrier(question) {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  modelStartResolvers.set(question, resolve);
+  return promise;
+}
 
 function jsonResponse(res, value, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -51,6 +60,7 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/run') {
+      runCalls += 1;
       jsonResponse(res, {
         status: 'success', datasource: 'tchouse-c', row_count: 1,
         rows_before_limit_at_least: 1, truncated: false,
@@ -85,8 +95,21 @@ const model = createServer((req, res) => {
       const tools = (body.tools ?? []).map(tool => tool.function?.name);
       if (!tools.includes('create_excel')) throw new Error('internal result Agent did not receive Excel tool');
       const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
+      if (content.user_request.startsWith('SEMANTIC_GAP_')) {
+        jsonResponse(res, { choices: [{ message: {
+          content: null,
+          tool_calls: [{
+            id: 'semantic_gap_followup', type: 'function',
+            function: {
+              name: 'report_semantic_gap',
+              arguments: JSON.stringify({ reason: 'missing_dimension' }),
+            },
+          }],
+        } }] });
+        return;
+      }
       const analysis = content.requested_outputs.includes('analysis');
-      jsonResponse(res, { choices: [{ message: {
+      const response = { choices: [{ message: {
         content: null,
         tool_calls: [{
           id: analysis ? 'call_analysis_followup' : 'call_excel_followup', type: 'function',
@@ -99,7 +122,14 @@ const model = createServer((req, res) => {
             }),
           },
         }],
-      } }] });
+      } }] };
+      if (content.user_request.startsWith('SLOW_')) {
+        modelStartResolvers.get(content.user_request)?.();
+        modelStartResolvers.delete(content.user_request);
+        setTimeout(() => jsonResponse(res, response), 250);
+      } else {
+        jsonResponse(res, response);
+      }
       return;
     }
     jsonResponse(res, { choices: [{ message: { content: modelOutput } }] });
@@ -232,10 +262,108 @@ if (followupVisible.includes(rowSentinel) || followupVisible.includes(modelSenti
 if (toolPayload(followup).status !== 'delivery_requested' || !hostDelivery(followup)?.markdown) {
   throw new Error('follow-up internal-model result was not directly delivered');
 }
-const callsAfterFollowup = modelCalls;
+const concurrentCaller = {
+  ...callerA,
+  requestUserOpenId: 'ou_concurrent',
+  requestUserUnionId: 'on_concurrent',
+};
+const concurrentPlugin = spawnPlugin('session-concurrent');
+const slowFirstStarted = modelStartBarrier('SLOW_FIRST_QUERY');
+const slowFirst = concurrentPlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-concurrent-slow', output_mode: 'analysis', question: 'SLOW_FIRST_QUERY',
+}, { ...concurrentCaller, turnId: 'om_concurrent_slow' });
+await slowFirstStarted;
+const fastSecond = concurrentPlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-concurrent-fast', output_mode: 'analysis', question: 'FAST_SECOND_QUERY',
+}, { ...concurrentCaller, turnId: 'om_concurrent_fast' });
+const [slowFirstResponse, fastSecondResponse] = await Promise.all([slowFirst, fastSecond]);
+if (toolPayload(slowFirstResponse).status !== 'result_superseded'
+  || slowFirstResponse.result?._meta?.botmuxHostDelivery
+  || toolPayload(fastSecondResponse).status !== 'delivery_requested'
+  || !hostDelivery(fastSecondResponse)?.markdown) {
+  throw new Error('concurrent first-turn requests did not suppress the superseded delivery');
+}
+
+const abaCaller = {
+  ...callerA,
+  requestUserOpenId: 'ou_aba',
+  requestUserUnionId: 'on_aba',
+};
+const abaPlugin = spawnPlugin('session-aba');
+const abaInitial = await abaPlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-aba-initial', output_mode: 'analysis', question: 'ABA_INITIAL',
+}, { ...abaCaller, turnId: 'om_aba_initial' });
+if (toolPayload(abaInitial).status !== 'delivery_requested') throw new Error('ABA fixture initial bind failed');
+const abaFollowupStarted = modelStartBarrier('SLOW_ABA_FOLLOWUP');
+const abaStaleFollowup = abaPlugin.call('continue_query_result_for_user', {
+  question: 'SLOW_ABA_FOLLOWUP', output_mode: 'analysis',
+}, { ...abaCaller, turnId: 'om_aba_followup' });
+await abaFollowupStarted;
+const abaReplacementResponse = await abaPlugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'synthetic-aba-replacement', output_mode: 'analysis', question: 'ABA_REPLACEMENT',
+}, { ...abaCaller, turnId: 'om_aba_replacement' });
+const abaStaleFollowupResponse = await abaStaleFollowup;
+if (toolPayload(abaReplacementResponse).status !== 'delivery_requested'
+  || toolPayload(abaStaleFollowupResponse).status !== 'delivery_failed'
+  || abaStaleFollowupResponse.result?._meta?.botmuxHostDelivery) {
+  throw new Error('clear/put ABA allowed a stale follow-up delivery');
+}
+
+const generationStore = new ResultStore({
+  pluginHome: join(root, 'generation-store'),
+  secret: bindingSecret,
+  config: { idleTtlMs: 10, absoluteTtlMs: 1000 },
+});
+const generationIdentity = { unionId: 'on_generation', appId: 'cli_generation', sessionId: 'session_generation' };
+const oldReservation = generationStore.put(generationIdentity, { pending: true }, 100);
+const oldBound = generationStore.replaceIfVersion(
+  generationIdentity,
+  oldReservation.version,
+  { result: { rows: ['old'] } },
+  101,
+  oldReservation.generation,
+);
+const newReservation = generationStore.put(generationIdentity, { pending: true }, 112);
+const newBound = generationStore.replaceIfVersion(
+  generationIdentity,
+  newReservation.version,
+  { result: { rows: ['new'] } },
+  113,
+  newReservation.generation,
+);
+let staleGenerationRejected = false;
+try {
+  generationStore.assertVersion(generationIdentity, oldBound.version, 114, oldBound.generation);
+} catch {
+  staleGenerationRejected = true;
+}
+if (oldBound.version !== newBound.version
+  || oldBound.generation === newBound.generation
+  || !staleGenerationRejected) {
+  throw new Error('generation token did not reject an expiry-driven version ABA');
+}
+
+const runsBeforeSemanticGap = runCalls;
+const semanticGap = await plugin.call('continue_query_result_for_user', {
+  question: 'SEMANTIC_GAP_SYNTHETIC', output_mode: 'analysis',
+}, { ...callerA, turnId: 'om_semantic_gap' });
+const semanticGapPayload = toolPayload(semanticGap);
+if (semanticGapPayload.status !== 'needs_new_query'
+  || semanticGapPayload.reason !== 'missing_dimension'
+  || semanticGapPayload.requires_user_confirmation !== true
+  || semanticGapPayload.requery_performed !== false
+  || semanticGap.result?._meta?.botmuxHostDelivery
+  || runCalls !== runsBeforeSemanticGap) {
+  throw new Error('semantic gap did not return a bounded no-requery signal');
+}
+const callsAfterSemanticGap = modelCalls;
 
 const repeated = await plugin.call('continue_query_result_for_user', { question: 'repeat' }, followupCaller);
-if (!JSON.stringify(repeated).includes('rate_limited') || modelCalls !== callsAfterFollowup) {
+if (!JSON.stringify(repeated).includes('rate_limited') || modelCalls !== callsAfterSemanticGap) {
   throw new Error('per-turn follow-up limit failed');
 }
 
@@ -250,6 +378,13 @@ mutateActiveResultDuringModelCall = () => {
   if (current.status !== 'active') throw new Error('CAS fixture could not find active result');
   liveStore.put(liveIdentity, current.record.payload);
 };
+const staleSemanticGap = await plugin.call('continue_query_result_for_user', {
+  question: 'SEMANTIC_GAP_CAS_REPLACE_SYNTHETIC', output_mode: 'analysis',
+}, { ...callerA, turnId: 'om_semantic_gap_cas_replace' });
+if (!JSON.stringify(staleSemanticGap).includes('delivery_failed')
+  || staleSemanticGap.result?._meta?.botmuxHostDelivery) {
+  throw new Error('result replacement during semantic-gap evaluation did not fail closed');
+}
 const staleFollowup = await plugin.call('continue_query_result_for_user', {
   question: 'CAS_REPLACE_SYNTHETIC', output_mode: 'analysis',
 }, { ...callerA, turnId: 'om_cas_replace' });
@@ -310,6 +445,8 @@ for (const expected of [
 }
 
 await plugin.close();
+await concurrentPlugin.close();
+await abaPlugin.close();
 
 const lowQuotaFile = join(root, 'low-quota.env');
 writeFileSync(lowQuotaFile, [
@@ -320,12 +457,15 @@ writeFileSync(lowQuotaFile, [
   'DATA_MCP_RESULT_MAX_BYTES=256',
 ].join('\n') + '\n', { mode: 0o600 });
 const lowQuota = spawnPlugin('session-synthetic-a', lowQuotaFile);
+const callsBeforeLowQuotaInitial = modelCalls;
 const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
 }, { ...callerA, turnId: 'om_low_quota_initial' });
-if (toolPayload(lowQuotaInitial).status !== 'delivery_requested') {
-  throw new Error('result-store quota failure broke first-turn direct delivery');
+if (toolPayload(lowQuotaInitial).status !== 'delivery_requested'
+  || !hostDelivery(lowQuotaInitial)?.markdown?.includes('结果绑定未能安全完成')
+  || modelCalls !== callsBeforeLowQuotaInitial) {
+  throw new Error('result-store quota failure did not stop before model execution');
 }
 const callsAfterLowQuotaInitial = modelCalls;
 const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {

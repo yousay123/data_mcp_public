@@ -20,6 +20,7 @@ export function runIsolatedResultAgent(options) {
     result: options.result,
     question: options.question,
     requestedOutputs: options.requestedOutputs,
+    allowSemanticGap: options.allowSemanticGap === true,
     pluginHome: options.pluginHome,
     config: Object.fromEntries(CONFIG_KEYS.map(key => [key, options.runtimeConfig.value(key)])),
   };

@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { clearAllStoredResults, ResultStore } from './result-store.js';
+import { ResultStore } from './result-store.js';
 import { runIsolatedResultAgent } from './result-agent-client.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 
@@ -698,13 +698,14 @@ function requestedOutputs(args) {
   return ['analysis'];
 }
 
-async function runResultAgent(result, args, runtimeConfig, timeoutMs) {
+async function runResultAgent(result, args, runtimeConfig, timeoutMs, allowSemanticGap = false) {
   return runIsolatedResultAgent({
     result,
     question: typeof args.question === 'string' && args.question.trim()
       ? args.question.trim()
       : '请基于本次查询结果生成用户要求的产物',
     requestedOutputs: requestedOutputs(args),
+    allowSemanticGap,
     runtimeConfig,
     pluginHome: nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
     onTestExceptionUsed: hostname => resultStoreFor().auditModelEndpointException(hostname),
@@ -973,27 +974,82 @@ function fixedFollowupResult(code) {
   };
 }
 
+function semanticGapResult(reason) {
+  return {
+    status: 'needs_new_query',
+    reason,
+    requires_user_confirmation: true,
+    requery_performed: false,
+    message: '现有绑定结果无法回答该追问；请先确认新增或扩大的查询口径，再生成新的只读 SQL。',
+  };
+}
+
+function resultBindingFailureDelivery() {
+  return {
+    schemaVersion: 1,
+    deliveryId: `data-result-binding-error-${randomUUID()}`,
+    markdown: [
+      '# 查询结果暂不可用',
+      '',
+      '结果绑定未能安全完成，本次未调用结果模型，也未生成或投递任何业务数据产物。',
+      '',
+      '请维护方恢复结果存储后，由真人重新发起查询。',
+    ].join('\n'),
+    responseKind: 'final',
+  };
+}
+
+function discardAuthoredFiles(authored) {
+  for (const file of authored?.files ?? []) {
+    if (typeof file?.path !== 'string') continue;
+    try { unlinkSync(file.path); } catch { /* best-effort cleanup for a superseded result */ }
+    stagedOutboundArtifacts.delete(file.path);
+  }
+}
+
+function resultSuperseded() {
+  return { error: fixedFollowupResult('result_superseded') };
+}
+
 async function deliverQueryResult(caller, args, runtimeConfig) {
   const deliveryStartedAt = Date.now();
   let identity;
   let store;
+  let reservation;
+  let boundRecord;
   if (caller.senderType === 'user') {
     try {
       identity = activeResultIdentity(caller);
       store = resultStoreFor(caller);
-      // A new first-turn query invalidates the old active result before any
-      // work starts. If the new snapshot cannot be stored, follow-ups must see
-      // no result rather than silently using data from the previous query.
-      store.clear(identity);
+      // Reserve the active-result slot before querying. The generation token
+      // prevents an older request from committing or delivering after a newer
+      // request has replaced its reservation, including clear/put ABA cycles.
+      try {
+        reservation = store.put(identity, { pending: true, result: null });
+      } catch {
+        // put() is synchronous, so clearing this exact binding here cannot
+        // race with another request in the same MCP process. Do not retain a
+        // previous result after a new first-turn request failed to reserve.
+        store.clear(identity);
+        return { delivery: resultBindingFailureDelivery() };
+      }
     } catch {
-      try { clearAllStoredResults(nonBlankProcessEnv('BOTMUX_PLUGIN_HOME')); }
-      catch { /* fail safe: follow-up store creation still remains unavailable */ }
       identity = undefined;
       store = undefined;
+      reservation = undefined;
     }
+    if (!store || !identity || !reservation) return { delivery: resultBindingFailureDelivery() };
   }
   const result = await callDataMcpService('run', caller, args, runtimeConfig);
   if (result?.status !== 'success') {
+    if (store && identity && reservation) {
+      try {
+        store.assertVersion(identity, reservation.version, Date.now(), reservation.generation);
+        store.clearIfGeneration(identity, reservation.generation);
+      } catch {
+        return resultSuperseded();
+      }
+    }
     const failure = deterministicDlcFailure(result, args);
     if (!failure) return { error: isolatedDeliveryFailure() };
     return {
@@ -1004,6 +1060,27 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
         responseKind: 'final',
       },
     };
+  }
+  if (store && identity) {
+    try {
+      boundRecord = store.replaceIfVersion(
+        identity,
+        reservation.version,
+        storedPayload(args, result),
+        Date.now(),
+        reservation.generation,
+      );
+      store.audit(identity, caller.turnId || 'initial', args.question || '', boundRecord.version, 'result_bound');
+    } catch {
+      const superseded = store.read(identity);
+      if (superseded.status === 'active' && superseded.record.generation !== reservation.generation) {
+        return resultSuperseded();
+      }
+      store.clearIfGeneration(identity, reservation.generation);
+      try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
+      catch { /* best-effort non-sensitive audit */ }
+      return { delivery: resultBindingFailureDelivery() };
+    }
   }
   let authored;
   try {
@@ -1048,12 +1125,12 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     }
     authored = deterministicResultAgentFailure(result, args, errorCode);
   }
-  if (store) {
-    try { store.put(identity, storedPayload(args, result)); }
-    catch {
-      store.clear(identity);
-      try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
-      catch { /* best-effort non-sensitive audit */ }
+  if (store && identity && boundRecord) {
+    try {
+      store.assertVersion(identity, boundRecord.version, Date.now(), boundRecord.generation);
+    } catch {
+      discardAuthoredFiles(authored);
+      return resultSuperseded();
     }
   }
   return {
@@ -1090,13 +1167,29 @@ async function continueQueryResult(caller, args, runtimeConfig) {
     return { error: fixedFollowupResult('rate_limited') };
   }
   const expectedVersion = active.record.version;
+  const expectedGeneration = active.record.generation;
   const payload = active.record.payload;
+  let authored;
   try {
     if (!payload.result) throw new Error('followup_result_unavailable');
-    const authored = await runResultAgent(payload.result, {
+    authored = await runResultAgent(payload.result, {
       ...args,
       question,
-    }, runtimeConfig);
+    }, runtimeConfig, undefined, true);
+    if (authored.status === 'semantic_gap') {
+      store.audit(
+        identity,
+        caller.turnId,
+        question,
+        expectedVersion,
+        'semantic_gap',
+        Date.now(),
+        resultAgentAuditDetail(authored.audit, payload.result),
+      );
+      store.assertVersion(identity, expectedVersion, Date.now(), expectedGeneration);
+      store.touch(identity, expectedVersion, Date.now(), expectedGeneration);
+      return { result: semanticGapResult(authored.semanticGap.reason) };
+    }
     store.audit(
       identity,
       caller.turnId,
@@ -1107,8 +1200,8 @@ async function continueQueryResult(caller, args, runtimeConfig) {
       resultAgentAuditDetail(authored.audit, payload.result),
     );
     delete authored.audit;
-    store.assertVersion(identity, expectedVersion);
-    store.touch(identity, expectedVersion);
+    store.assertVersion(identity, expectedVersion, Date.now(), expectedGeneration);
+    store.touch(identity, expectedVersion, Date.now(), expectedGeneration);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
     return {
       delivery: {
@@ -1120,6 +1213,7 @@ async function continueQueryResult(caller, args, runtimeConfig) {
       },
     };
   } catch (error) {
+    discardAuthoredFiles(authored);
     const errorCode = resultAgentAuditStatus(error);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed', Date.now(), {
       ...resultAgentAuditDetail(error?.resultAgentAudit, payload.result),
@@ -1590,7 +1684,11 @@ async function handleToolCall(request) {
     } catch {
       prepared = { error: isolatedDeliveryFailure() };
     }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+    ok(request.id, prepared.error
+      ? jsonTool(prepared.error)
+      : prepared.result
+        ? jsonTool(prepared.result)
+        : hostDeliveryTool(prepared.delivery));
     return;
   }
 
@@ -1610,7 +1708,11 @@ async function handleToolCall(request) {
     } catch {
       prepared = { error: fixedFollowupResult('delivery_failed') };
     }
-    ok(request.id, prepared.error ? jsonTool(prepared.error) : hostDeliveryTool(prepared.delivery));
+    ok(request.id, prepared.error
+      ? jsonTool(prepared.error)
+      : prepared.result
+        ? jsonTool(prepared.result)
+        : hostDeliveryTool(prepared.delivery));
     return;
   }
 

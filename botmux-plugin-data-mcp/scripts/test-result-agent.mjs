@@ -49,6 +49,17 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[1]] } }] }));
       return;
     }
+    if (responseMode === 'semantic-gap' || responseMode === 'semantic-gap-mixed') {
+      const gap = {
+        id: 'gap', type: 'function',
+        function: { name: 'report_semantic_gap', arguments: JSON.stringify({ reason: 'missing_dimension' }) },
+      };
+      res.end(JSON.stringify({ choices: [{ message: {
+        content: null,
+        tool_calls: responseMode === 'semantic-gap-mixed' ? [gap, toolCalls[0]] : [gap],
+      } }] }));
+      return;
+    }
     if (responseMode.startsWith('free-text-')) {
       const injection = {
         'free-text-chinese': { title: '总金额为九十九万' },
@@ -161,7 +172,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -186,6 +197,43 @@ const expectedTools = ['create_analysis', 'create_excel', 'create_pdf', 'create_
 for (const name of expectedTools) {
   if (!firstRequest.tools.some(tool => tool.function?.name === name)) throw new Error(`missing Agent tool ${name}`);
 }
+if (firstRequest.tools.some(tool => tool.function?.name === 'report_semantic_gap')) {
+  throw new Error('initial request exposed the follow-up-only semantic gap tool');
+}
+
+responseMode = 'semantic-gap';
+requests = [];
+const semanticGap = await runInternalResultAgent({
+  result,
+  question: '按当前结果没有的地区维度继续分析',
+  requestedOutputs: ['analysis'],
+  allowSemanticGap: true,
+  runtimeConfig,
+  pluginHome,
+});
+if (semanticGap.status !== 'semantic_gap'
+  || semanticGap.semanticGap?.reason !== 'missing_dimension'
+  || semanticGap.artifactTypes.length !== 0
+  || !requests[0]?.payload?.tools?.some(tool => tool.function?.name === 'report_semantic_gap')) {
+  throw new Error('follow-up semantic gap was not returned as a bounded structured result');
+}
+
+responseMode = 'semantic-gap-mixed';
+let mixedGapError;
+try {
+  await runInternalResultAgent({
+    result,
+    question: '不要混合补查与产物',
+    requestedOutputs: ['analysis'],
+    allowSemanticGap: true,
+    runtimeConfig,
+    pluginHome,
+  });
+} catch (error) { mixedGapError = error; }
+if (mixedGapError?.message !== 'result_agent_semantic_gap_mismatch') {
+  throw new Error(`mixed semantic gap must fail closed, got ${mixedGapError?.message}`);
+}
+responseMode = 'tools';
 
 responseMode = 'row-count';
 const rowCountResult = {
@@ -399,7 +447,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

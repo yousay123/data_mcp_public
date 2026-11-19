@@ -20,7 +20,16 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v2';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v3';
+const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
+const SEMANTIC_GAP_REASONS = new Set([
+  'missing_metric',
+  'missing_dimension',
+  'missing_time_range',
+  'missing_filter',
+  'insufficient_granularity',
+  'result_not_relevant',
+]);
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -636,7 +645,7 @@ function executePdf(args, envelope, pluginHome) {
   return { type: 'pdf', filename, path: stageArtifact(pluginHome, filename, bytes), bytes: bytes.length };
 }
 
-function toolDefinitions() {
+function toolDefinitions(allowSemanticGap = false) {
   const claims = {
     type: 'array', minItems: 1, maxItems: 20,
     description: 'Claims computed with arbitrary-precision decimal arithmetic from protected rows. No labels or prose are accepted.',
@@ -655,21 +664,43 @@ function toolDefinitions() {
     table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
-  return [
+  const tools = [
     { type: 'function', function: { name: 'create_analysis', description: 'Create a decision-oriented analysis from source-bound claims. For ordered series, prefer latest, change, minimum/maximum with label_column, and largest_change. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { claims }, required: ['claims'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
     { type: 'function', function: { name: 'create_pdf', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
   ];
+  if (allowSemanticGap) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: SEMANTIC_GAP_TOOL,
+        description: 'Use only when the bound result cannot answer the follow-up without a new database query. Report a fixed semantic-gap category; do not provide prose or row values.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { reason: { type: 'string', enum: [...SEMANTIC_GAP_REASONS] } },
+          required: ['reason'],
+        },
+      },
+    });
+  }
+  return tools;
 }
 
-function parseToolCall(call) {
+function parseToolCall(call, allowSemanticGap = false) {
   const name = call?.function?.name;
-  if (!OUTPUT_BY_TOOL[name] || typeof call?.id !== 'string' || !call.id) throw new Error('result_agent_unknown_tool');
+  if ((!OUTPUT_BY_TOOL[name] && !(allowSemanticGap && name === SEMANTIC_GAP_TOOL))
+    || typeof call?.id !== 'string' || !call.id) throw new Error('result_agent_unknown_tool');
   let args;
   try { args = JSON.parse(call.function.arguments || '{}'); } catch { throw new Error('result_agent_invalid_tool_arguments'); }
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('result_agent_invalid_tool_arguments');
+  if (name === SEMANTIC_GAP_TOOL) {
+    assertOnlyKeys(args, new Set(['reason']), 'result_agent_invalid_semantic_gap');
+    if (!SEMANTIC_GAP_REASONS.has(args.reason)) throw new Error('result_agent_invalid_semantic_gap');
+    return { id: call.id, name, args, semanticGap: true };
+  }
   return { id: call.id, name, args, output: OUTPUT_BY_TOOL[name] };
 }
 
@@ -692,6 +723,7 @@ function normalizedOutputs(requestedOutputs) {
 
 export async function runInternalResultAgent(options) {
   const outputs = normalizedOutputs(options.requestedOutputs);
+  const allowSemanticGap = options.allowSemanticGap === true;
   const envelope = resultEnvelope(options.result, options.result?.result_context);
   const config = modelConfig(options.runtimeConfig);
   const serialized = JSON.stringify({
@@ -707,16 +739,21 @@ export async function runInternalResultAgent(options) {
       content: [
         '你是企业内网中的数据结果 Agent。只依据 result_manifest 和 rows 工作，不补造数据。',
         '分析与文件产物都必须由你调用对应工具生成；Data MCP 不生成最终文件。',
-        '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
+        allowSemanticGap
+          ? '如果现有结果可以回答，只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。'
+          : '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
         '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、趋势证据、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
         '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
+        ...(allowSemanticGap ? [
+          '这是基于已绑定结果的追问。如果现有 rows、schema 与 context 无法回答且必须重新查询数据库，只调用 report_semantic_gap 一次，不调用任何产物工具；不得猜测、自动补查或扩大口径。',
+        ] : []),
       ].join('\n'),
     },
     { role: 'user', content: serialized },
   ];
-  const tools = toolDefinitions();
+  const tools = toolDefinitions(allowSemanticGap);
   const baseAudit = {
     schemaVersion: 1,
     status: 'started',
@@ -744,8 +781,25 @@ export async function runInternalResultAgent(options) {
   const first = modelResponse.message;
   let calls;
   try {
-    calls = Array.isArray(first.tool_calls) ? first.tool_calls.map(parseToolCall) : [];
+    calls = Array.isArray(first.tool_calls)
+      ? first.tool_calls.map(call => parseToolCall(call, allowSemanticGap))
+      : [];
     if (!calls.length) throw new Error('result_agent_tool_call_required');
+    const semanticGaps = calls.filter(call => call.semanticGap);
+    if (semanticGaps.length) {
+      if (!allowSemanticGap || calls.length !== 1) throw new Error('result_agent_semantic_gap_mismatch');
+      return {
+        status: 'semantic_gap',
+        semanticGap: { reason: semanticGaps[0].args.reason },
+        artifactTypes: [],
+        manifest: envelope.manifest,
+        audit: {
+          ...baseAudit,
+          ...modelResponse.trace,
+          status: 'semantic_gap',
+        },
+      };
+    }
     if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
       throw new Error('result_agent_unrequested_tool');
     }

@@ -1045,6 +1045,12 @@ try {
       ...mismatchedScheduleToolCalls,
       deliveryWithoutHostCapabilityCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
+    const initializeProbeHostEnv = join(cleanRoot, 'initialize-probe-host.env');
+    writeFileSync(
+      initializeProbeHostEnv,
+      'DATA_MCP_RESULT_BINDING_HMAC_KEY=0123456789abcdef0123456789abcdef\n',
+      { mode: 0o600 },
+    );
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
       input,
@@ -1053,6 +1059,8 @@ try {
       env: {
         ...process.env,
         BOTMUX_SESSION_ID: 'session_validate_probe',
+        BOTMUX_PLUGIN_HOME: cleanRoot,
+        KSHER_AGENT_DATA_MCP_ENV_FILE: initializeProbeHostEnv,
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',

@@ -16,6 +16,7 @@ input.on('line', async line => {
       result: request.result,
       question: request.question,
       requestedOutputs: request.requestedOutputs,
+      allowSemanticGap: request.allowSemanticGap === true,
       pluginHome: request.pluginHome,
       runtimeConfig: { value: name => values[name] },
       onTestExceptionUsed: hostname => { exceptionHostname = hostname; },

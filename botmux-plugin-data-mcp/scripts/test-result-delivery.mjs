@@ -178,7 +178,12 @@ const responses = await runPlugin([
       requested_outputs: ['excel', 'chart', 'pdf', 'document'],
       question: '生成 Excel、图表、PDF 和文档',
     },
-    _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_excel' } },
+    _meta: { botmuxTrustedCaller: {
+      ...caller,
+      requestUserOpenId: 'ou_test_artifacts',
+      requestUserUnionId: 'on_test_artifacts',
+      turnId: 'om_excel',
+    } },
   },
   {
     name: 'run_query_for_user',
@@ -272,6 +277,17 @@ if (toolPayload(agentFailure[0]).status !== 'delivery_requested'
   || agentFailureVisible.includes(sentinel)) {
   throw new Error('result Agent failure did not produce a safe host delivery');
 }
+const queriesAfterAgentFailure = queryCount;
+const recoveredFromBoundResult = await runPlugin([{
+  name: 'continue_query_result_for_user',
+  arguments: { question: '基于失败前已绑定的结果重试分析', output_mode: 'analysis' },
+  _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_failed_retry' } },
+}]);
+if (toolPayload(recoveredFromBoundResult[0]).status !== 'delivery_requested'
+  || !hostDelivery(recoveredFromBoundResult[0])?.markdown
+  || queryCount !== queriesAfterAgentFailure) {
+  throw new Error('result was not reusable without requery after the initial model failure');
+}
 
 failNextModelCall = true;
 const nonFallbackAgentFailure = await runPlugin([{
@@ -327,7 +343,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v2'
+  && row.prompt_template_version === 'result-agent-tool-contract-v3'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -339,7 +355,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v2'
+  && row.prompt_template_version === 'result-agent-tool-contract-v3'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503
