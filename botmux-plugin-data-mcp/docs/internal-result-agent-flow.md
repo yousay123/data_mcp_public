@@ -14,16 +14,20 @@ The dual-model delivery path has one owner for each responsibility:
    canonical context over bounded stdio IPC to a separate private-network Agent
    child process with an allowlisted environment.
 5. The result Agent interprets the requested output types and calls its own
-   `create_excel`, `create_pdf`, `create_chart`, or `create_document` tools.
+   `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or
+   `create_document` tools.
 6. Artifact tools bind values to the same protected rows and schema. The Agent
    chooses columns, aggregations, chart type, and layout but cannot supply raw
    values or any free-text title, paragraph, label, annotation, sheet name, or
    filename. Controlled templates render every word. Numeric claims declare a
-   source column and aggregation and are calculated with arbitrary-precision
-   decimal arithmetic, preserving the source Decimal scale and deterministic
-   average rounding.
-7. The Agent process stages the artifacts, the trusted delivery layer verifies the
-   caller/session/app binding, and Botmux sends them to the signed Lark turn.
+   source column and a summary or ordered-series operation (including latest,
+   interval change, labelled extrema, and largest adjacent change) and are
+   calculated with arbitrary-precision decimal arithmetic, preserving the
+   source Decimal scale and deterministic average rounding.
+7. Charts are rendered inline as Feishu-native Vega-Lite card content. The
+   Agent process stages only requested file artifacts, the trusted delivery
+   layer verifies caller/session/app binding, and Botmux sends the result to the
+   signed Lark turn.
 8. The calling model receives only a fixed delivery receipt. Rows, model text,
    filenames, paths, and file bytes do not cross that boundary.
 

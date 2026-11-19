@@ -12,7 +12,14 @@ let responseMode = 'tools';
 let requests = [];
 
 const toolCalls = [
-  ['call_analysis', 'create_analysis', { claims: [{ operation: 'sum', column: 'amount' }] }],
+  ['call_analysis', 'create_analysis', { claims: [
+    { operation: 'sum', column: 'amount' },
+    { operation: 'latest', column: 'amount', label_column: 'stat_date' },
+    { operation: 'change', column: 'amount', label_column: 'stat_date' },
+    { operation: 'minimum', column: 'amount', label_column: 'stat_date' },
+    { operation: 'maximum', column: 'amount', label_column: 'stat_date' },
+    { operation: 'largest_change', column: 'amount', label_column: 'stat_date' },
+  ] }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
@@ -133,14 +140,28 @@ if (!delivered.markdown.includes('## 查询口径')
   || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
   throw new Error('analysis did not combine result and query scope');
 }
-if (delivered.files.length !== 4 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
+if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
   throw new Error('result Agent did not create every requested artifact');
+}
+for (const expected of [
+  '2026-03-02 为 18.75',
+  'amount（区间变化（2026-03-01 → 2026-03-02））',
+  '上升 6.25（50.00%）',
+  'amount（最小值）**：2026-03-01 为 12.50',
+  'amount（最大值）**：2026-03-02 为 18.75',
+  'amount（最大单期变化（2026-03-01 → 2026-03-02））',
+  '## 分析建议',
+  '不能单独证明因果关系',
+  '```vega-lite',
+  '"value_exact":"18.75"',
+]) {
+  if (!delivered.markdown.includes(expected)) throw new Error(`decision-oriented delivery missing ${expected}`);
 }
 if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -205,9 +226,6 @@ for (const file of delivered.files) {
   const content = readFileSync(file.path);
   if (file.type === 'excel' && content.subarray(0, 2).toString() !== 'PK') throw new Error('invalid xlsx');
   if (file.type === 'pdf' && content.subarray(0, 5).toString() !== '%PDF-') throw new Error('invalid pdf');
-  if (file.type === 'chart' && (!content.toString().includes('<svg') || !content.toString().includes('2026-03-02'))) {
-    throw new Error('chart did not use protected source rows');
-  }
   if (file.type === 'document' && !content.toString().includes('18.75')) throw new Error('document did not use protected source rows');
 }
 
@@ -306,8 +324,9 @@ for (const claim of exactClaims) {
   const utf16 = Buffer.from(`\ufeff${claim}`, 'utf16le').swap16().toString('hex').toUpperCase();
   if (!readFileSync(pdf.path).toString().includes(utf16)) throw new Error(`missing exact PDF claim: ${claim}`);
 }
-if (!readFileSync(precision.files.find(file => file.type === 'chart').path, 'utf8').includes('<svg')) {
-  throw new Error('high-precision chart was not generated from exact decimal inputs');
+if (!precision.markdown.includes('```vega-lite')
+  || !precision.markdown.includes('"value_exact":"9007199254740993.00"')) {
+  throw new Error('high-precision inline chart was not generated from exact decimal inputs');
 }
 
 responseMode = 'invalid-decimal';
@@ -376,7 +395,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

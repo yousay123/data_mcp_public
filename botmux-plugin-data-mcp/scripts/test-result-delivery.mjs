@@ -198,7 +198,7 @@ for (const forbidden of [sentinel, modelOutput, root]) {
   if (analysisVisible.includes(forbidden)) throw new Error(`calling model saw protected value: ${forbidden}`);
 }
 const excelVisible = JSON.stringify(byId.get(2)?.result ?? {});
-if (toolPayload(byId.get(2)).attachmentCount !== 4
+if (toolPayload(byId.get(2)).attachmentCount !== 3
   || excelVisible.includes('.xlsx') || excelVisible.includes(root)
   || excelVisible.includes(sentinel)) {
   throw new Error('multi-artifact receipt was unsafe or incomplete');
@@ -214,9 +214,12 @@ const initialBotmuxRecords = botmuxRecords();
 if (!initialBotmuxRecords.some(row => row.content?.includes('amount（合计）') && row.content.includes('30'))) {
   throw new Error('source-bound analysis was not sent to Feishu');
 }
-const fileRecord = initialBotmuxRecords.find(row => row.args[0] === 'send' && row.args.filter(arg => arg === '--files').length === 4);
+const fileRecord = initialBotmuxRecords.find(row => row.args[0] === 'send' && row.args.filter(arg => arg === '--files').length === 3);
 if (!fileRecord) {
   throw new Error('Agent artifacts were not sent to Feishu together');
+}
+if (!initialBotmuxRecords.some(row => row.content?.includes('```vega-lite'))) {
+  throw new Error('inline chart was not sent in the Feishu result card');
 }
 if (!initialBotmuxRecords.some(row => row.content?.includes('不能用于全量汇总'))) {
   throw new Error('Excel direct delivery lost the user LIMIT advisory');
@@ -338,7 +341,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v1'
+  && row.prompt_template_version === 'result-agent-tool-contract-v2'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -350,7 +353,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v1'
+  && row.prompt_template_version === 'result-agent-tool-contract-v2'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

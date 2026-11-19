@@ -53,7 +53,8 @@ already-active turn from using that turn's preserved caller identity.
 
 Trusted artifact delivery is one-shot. The internal result Agent runs in a
 separate child process with an allowlisted environment, selects and invokes the
-Excel/PDF/chart/document tool, and stages atomic outbound files;
+analysis/Excel/PDF/chart/document tool, renders charts inline as native
+Vega-Lite card content, and stages only requested file artifacts atomically;
 the Botmux host consumes it into bounded memory and removes the staged source
 before any send. Plugin shutdown cleans files still owned by that process, and
 startup removes abandoned Data MCP artifacts older than 15 minutes.
@@ -233,7 +234,7 @@ without rerunning the query. The internal result Agent must call the matching
 analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
 stored result. Artifact tools accept no model-authored titles, paragraphs,
 labels, annotations, sheet names, or filenames. The model selects only columns,
-aggregations, chart type, and layout; controlled templates render every word,
+source-bound summary/trend operations, chart type, and layout; controlled templates render every word,
 and arbitrary-precision decimal arithmetic computes every numerical claim.
 The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
 so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per

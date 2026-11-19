@@ -20,7 +20,7 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v1';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v2';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -253,12 +253,6 @@ function stageArtifact(pluginHome, filename, content) {
   }
 }
 
-function xml(value) {
-  return String(value).replace(/[&<>"']/g, character => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
-  })[character]);
-}
-
 function executeExcel(args, envelope, pluginHome) {
   assertOnlyKeys(args, new Set(['sheets']));
   if (envelope.rows.length > 9_999) throw new Error('result_agent_artifact_row_limit');
@@ -279,7 +273,7 @@ function executeExcel(args, envelope, pluginHome) {
   return { type: 'excel', filename, path: stageArtifact(pluginHome, filename, bytes), bytes: bytes.length };
 }
 
-function executeChart(args, envelope, pluginHome) {
+function executeChart(args, envelope) {
   assertOnlyKeys(args, new Set(['type', 'label_column', 'value_column', 'max_points']));
   const label = boundedString(args.label_column, 200, 'result_agent_invalid_chart_plan');
   const value = boundedString(args.value_column, 200, 'result_agent_invalid_chart_plan');
@@ -293,35 +287,29 @@ function executeChart(args, envelope, pluginHome) {
     value: parseDecimal(row[value], 'result_agent_invalid_chart_value'),
   })).filter(point => point.value !== null);
   if (points.length < 2) throw new Error('result_agent_invalid_chart_plan');
-  const width = 960; const height = 540; const left = 90; const top = 55; const bottom = 85; const right = 35;
-  const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const chartScale = Math.max(...points.map(point => point.value.scale));
-  const scaledValues = points.map(point => rescaleExact(point.value, chartScale, 'result_agent_invalid_chart_value'));
-  const zero = 0n;
-  const minimum = scaledValues.reduce((current, item) => item < current ? item : current, zero);
-  const maximum = scaledValues.reduce((current, item) => item > current ? item : current, zero);
-  const span = maximum - minimum || 1n;
-  const ratio = item => Number(((item - minimum) * 1_000_000_000n) / span) / 1_000_000_000;
-  const baselineY = top + plotHeight - ratio(zero) * plotHeight;
-  const step = plotWidth / points.length;
-  const title = '查询结果图表';
-  const elements = [`<rect width="100%" height="100%" fill="#fff"/>`, `<text x="${width / 2}" y="30" text-anchor="middle" font-size="20" fill="#173d67">${xml(title)}</text>`, `<line x1="${left}" y1="${top}" x2="${left}" y2="${top + plotHeight}" stroke="#789"/>`, `<line x1="${left}" y1="${top + plotHeight}" x2="${left + plotWidth}" y2="${top + plotHeight}" stroke="#789"/>`];
-  const coordinates = points.map((point, index) => ({
-    ...point,
-    x: left + step * (index + 0.5),
-    y: top + plotHeight - ratio(scaledValues[index]) * plotHeight,
-  }));
-  if (args.type === 'bar') {
-    for (const point of coordinates) elements.push(`<rect x="${point.x - Math.min(step * 0.32, 22)}" y="${Math.min(point.y, baselineY)}" width="${Math.min(step * 0.64, 44)}" height="${Math.max(Math.abs(baselineY - point.y), 1)}" fill="#4276b8"/>`);
-  } else {
-    elements.push(`<polyline fill="none" stroke="#4276b8" stroke-width="3" points="${coordinates.map(point => `${point.x},${point.y}`).join(' ')}"/>`);
-    for (const point of coordinates) elements.push(`<circle cx="${point.x}" cy="${point.y}" r="4" fill="#4276b8"/>`);
-  }
-  for (const point of coordinates) elements.push(`<text x="${point.x}" y="${top + plotHeight + 20}" text-anchor="middle" font-size="10" fill="#496174">${xml(point.label.slice(0, 12))}</text>`);
-  if (envelope.rows.length > points.length) elements.push(`<text x="${left}" y="${height - 20}" font-size="11" fill="#9a5a00">仅展示前 ${points.length} 个数据点，共 ${envelope.rows.length} 行。</text>`);
-  const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${elements.join('')}</svg>`);
-  const filename = safeFilename('query-result-chart', 'svg');
-  return { type: 'chart', filename, path: stageArtifact(pluginHome, filename, svg), bytes: svg.length };
+  const values = points.map(point => {
+    const exact = formatDecimal(point.value.coefficient, point.value.scale, point.value.scale);
+    const numeric = Number(exact);
+    if (!Number.isFinite(numeric)) throw new Error('result_agent_invalid_chart_value');
+    return { label: point.label, value: numeric, value_exact: exact };
+  });
+  const spec = {
+    title: '查询结果趋势',
+    data: { values },
+    mark: args.type,
+    encoding: {
+      x: { field: 'label', type: 'ordinal', title: label },
+      y: { field: 'value', type: 'quantitative', title: value },
+    },
+  };
+  const pointNotice = envelope.rows.length > points.length
+    ? `图表仅展示前 ${points.length} 个数据点，共 ${envelope.rows.length} 行。`
+    : '';
+  const notes = `\n\n> ${pointNotice}图表坐标用于趋势展示，精确数值以核心结论和明细为准。`;
+  return {
+    type: 'chart',
+    markdown: `## 趋势图\n\n\`\`\`vega-lite\n${JSON.stringify(spec)}\n\`\`\`${notes}`,
+  };
 }
 
 function powerOfTen(scale) {
@@ -438,24 +426,83 @@ function roundedDivide(numerator, denominator) {
   return negative ? -quotient : quotient;
 }
 
+function decimalRows(column, envelope) {
+  if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
+  const rows = envelope.rows.map(row => ({
+    row,
+    value: parseDecimal(row[column]),
+  })).filter(item => item.value !== null);
+  if (!rows.length) throw new Error('result_agent_invalid_claim_value');
+  const inferredScale = Math.max(...rows.map(item => item.value.scale));
+  const scale = declaredDecimalScale(column, envelope) ?? inferredScale;
+  return {
+    rows: rows.map(item => ({ ...item, exact: rescaleExact(item.value, scale) })),
+    scale,
+  };
+}
+
+function claimLabel(claim, item, envelope) {
+  if (!claim.label_column) return null;
+  const labelColumn = boundedString(claim.label_column, 200, 'result_agent_invalid_claim_column');
+  if (!envelope.columns.includes(labelColumn)) throw new Error('result_agent_invalid_claim_column');
+  return String(item.row[labelColumn] ?? '');
+}
+
+function formatClaimDecimal(coefficient, scale) {
+  return groupedNumber(formatDecimal(coefficient, scale, scale));
+}
+
+function percentChange(first, last) {
+  if (first === 0n) return null;
+  return formatDecimal(roundedDivide((last - first) * 10_000n, first < 0n ? -first : first), 2, 2);
+}
+
 function computedClaims(args, envelope) {
   const claims = Array.isArray(args.claims) ? args.claims : [];
   if (claims.length > 20) throw new Error('result_agent_invalid_claims');
   return claims.map(claim => {
-    assertOnlyKeys(claim, new Set(['operation', 'column']));
+    assertOnlyKeys(claim, new Set(['operation', 'column', 'label_column']));
     const operation = claim?.operation;
-    if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(operation)) {
+    if (!['count', 'sum', 'average', 'minimum', 'maximum', 'latest', 'change', 'largest_change'].includes(operation)) {
       throw new Error('result_agent_invalid_claim_operation');
     }
     if (operation === 'count') return `**返回记录数：${groupedNumber(envelope.rows.length)} 行**`;
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
-    if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
-    const values = envelope.rows.map(row => parseDecimal(row[column])).filter(value => value !== null);
-    if (!values.length) throw new Error('result_agent_invalid_claim_value');
-    const inferredScale = Math.max(...values.map(value => value.scale));
-    const scale = declaredDecimalScale(column, envelope) ?? inferredScale;
+    const decimal = decimalRows(column, envelope);
+    const { rows, scale } = decimal;
     if (!Number.isInteger(scale) || scale < 0 || scale > 100) throw new Error('result_agent_invalid_claim_value');
-    const exact = values.map(value => rescaleExact(value, scale));
+    const exact = rows.map(item => item.exact);
+    if (operation === 'latest') {
+      const item = rows.at(-1);
+      const label = claimLabel(claim, item, envelope);
+      return `- **${column}（最新值）**：${label ? `${label} 为 ` : ''}${formatClaimDecimal(item.exact, scale)}`;
+    }
+    if (operation === 'change') {
+      if (rows.length < 2) throw new Error('result_agent_invalid_claim_value');
+      const first = rows[0]; const last = rows.at(-1);
+      const delta = last.exact - first.exact;
+      const percent = percentChange(first.exact, last.exact);
+      const firstLabel = claimLabel(claim, first, envelope);
+      const lastLabel = claimLabel(claim, last, envelope);
+      const direction = delta > 0n ? '上升' : delta < 0n ? '下降' : '持平';
+      const period = firstLabel || lastLabel ? `（${firstLabel || '期初'} → ${lastLabel || '期末'}）` : '';
+      return `- **${column}（区间变化${period}）**：${direction} ${formatClaimDecimal(delta < 0n ? -delta : delta, scale)}${percent === null ? '' : `（${percent}%）`}`;
+    }
+    if (operation === 'largest_change') {
+      if (rows.length < 2) throw new Error('result_agent_invalid_claim_value');
+      let winner = { previous: rows[0], current: rows[1], delta: rows[1].exact - rows[0].exact };
+      for (let index = 2; index < rows.length; index += 1) {
+        const delta = rows[index].exact - rows[index - 1].exact;
+        if ((delta < 0n ? -delta : delta) > (winner.delta < 0n ? -winner.delta : winner.delta)) {
+          winner = { previous: rows[index - 1], current: rows[index], delta };
+        }
+      }
+      const previousLabel = claimLabel(claim, winner.previous, envelope);
+      const currentLabel = claimLabel(claim, winner.current, envelope);
+      const direction = winner.delta > 0n ? '增长' : winner.delta < 0n ? '下降' : '无变化';
+      const period = previousLabel || currentLabel ? `（${previousLabel || '上一期'} → ${currentLabel || '当期'}）` : '';
+      return `- **${column}（最大单期变化${period}）**：${direction} ${formatClaimDecimal(winner.delta < 0n ? -winner.delta : winner.delta, scale)}`;
+    }
     let coefficient;
     let outputScale = scale;
     if (operation === 'sum' || operation === 'average') coefficient = exact.reduce((total, item) => total + item, 0n);
@@ -470,29 +517,60 @@ function computedClaims(args, envelope) {
     const operationLabel = {
       sum: '合计', average: '平均值', minimum: '最小值', maximum: '最大值',
     }[operation];
+    if (operation === 'minimum' || operation === 'maximum') {
+      const item = rows.find(row => row.exact === coefficient);
+      const label = claimLabel(claim, item, envelope);
+      return `- **${column}（${operationLabel}）**：${label ? `${label} 为 ` : ''}${value}`;
+    }
     return `- **${column}（${operationLabel}）**：${value}`;
   });
 }
 
-function narrativeLines(args, envelope) {
-  const lines = ['查询结果', '', '## 数据结论', ''];
+function summaryLines(args, envelope) {
+  const lines = ['查询结果', '', '## 核心结论', ''];
   const claims = computedClaims(args, envelope);
   if (claims.length) lines.push(...claims, '');
-  lines.push(...queryContextLines(envelope), '');
+  const operations = new Set(args.claims.map(claim => claim?.operation));
+  if (operations.has('largest_change')) {
+    lines.push(
+      '## 分析建议',
+      '',
+      '- 已定位最大单期变化，建议优先核对对应时段的业务活动、渠道、产品或数据链路变更。',
+      '> 本结果仅识别数值变化，不能单独证明因果关系。',
+      '',
+    );
+  } else if (operations.has('change')) {
+    lines.push(
+      '## 分析建议',
+      '',
+      '- 已给出区间起止变化；如需定位原因，建议继续按渠道、产品或地区维度下钻。',
+      '> 本结果仅识别数值变化，不能单独证明因果关系。',
+      '',
+    );
+  }
+  return lines;
+}
+
+function contextLines(envelope) {
+  const lines = [...queryContextLines(envelope), ''];
+  const notice = scopeNotice(envelope.manifest);
+  if (notice) lines.push(`> 数据范围说明：${notice}`);
   return lines;
 }
 
 function executeAnalysis(args, envelope) {
   assertOnlyKeys(args, new Set(['claims']));
   if (!Array.isArray(args.claims) || !args.claims.length) throw new Error('result_agent_invalid_claims');
-  const lines = narrativeLines(args, envelope);
-  const notice = scopeNotice(envelope.manifest);
-  if (notice) lines.push(`数据范围说明：${notice}`);
-  return { type: 'analysis', markdown: `# ${lines.shift()}\n\n${lines.join('\n')}\n` };
+  const lines = summaryLines(args, envelope);
+  return {
+    type: 'analysis',
+    markdown: `# ${lines.shift()}\n\n${lines.join('\n')}\n`,
+    contextMarkdown: contextLines(envelope).join('\n'),
+  };
 }
 
 function documentLines(args, envelope, maxRows) {
-  const lines = narrativeLines(args, envelope);
+  const lines = [...summaryLines(args, envelope), ...contextLines(envelope), ''];
   if (Array.isArray(args.table_columns) && args.table_columns.length) {
     const columns = selectedColumns(args, envelope.columns, 'table_columns');
     lines.push(columns.join(' | '));
@@ -501,8 +579,6 @@ function documentLines(args, envelope, maxRows) {
     if (envelope.rows.length > maxRows) lines.push(`仅展示前 ${maxRows} 行，共 ${envelope.rows.length} 行。`);
     lines.push('');
   }
-  const notice = scopeNotice(envelope.manifest);
-  if (notice) lines.push(`数据范围说明：${notice}`);
   return lines;
 }
 
@@ -567,8 +643,9 @@ function toolDefinitions() {
     items: {
       type: 'object', additionalProperties: false,
       properties: {
-        operation: { type: 'string', enum: ['count', 'sum', 'average', 'minimum', 'maximum'] },
+        operation: { type: 'string', enum: ['count', 'sum', 'average', 'minimum', 'maximum', 'latest', 'change', 'largest_change'] },
         column: { type: 'string' },
+        label_column: { type: 'string', description: 'Optional source column used to identify dates or categories for extrema and changes.' },
       },
       required: ['operation'],
     },
@@ -579,9 +656,9 @@ function toolDefinitions() {
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
   return [
-    { type: 'function', function: { name: 'create_analysis', description: 'Select only source-bound computed claims. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { claims }, required: ['claims'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Create a decision-oriented analysis from source-bound claims. For ordered series, prefer latest, change, minimum/maximum with label_column, and largest_change. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { claims }, required: ['claims'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
-    { type: 'function', function: { name: 'create_chart', description: 'Create an SVG chart from exact source columns. The tool owns title, annotations, and filename; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
+    { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
     { type: 'function', function: { name: 'create_pdf', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
   ];
@@ -599,7 +676,7 @@ function parseToolCall(call) {
 function executeTool(call, envelope, pluginHome) {
   if (call.name === 'create_analysis') return executeAnalysis(call.args, envelope);
   if (call.name === 'create_excel') return executeExcel(call.args, envelope, pluginHome);
-  if (call.name === 'create_chart') return executeChart(call.args, envelope, pluginHome);
+  if (call.name === 'create_chart') return executeChart(call.args, envelope);
   if (call.name === 'create_document') return executeDocument(call.args, envelope, pluginHome);
   if (call.name === 'create_pdf') return executePdf(call.args, envelope, pluginHome);
   throw new Error('result_agent_unknown_tool');
@@ -632,7 +709,8 @@ export async function runInternalResultAgent(options) {
         '分析与文件产物都必须由你调用对应工具生成；Data MCP 不生成最终文件。',
         '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
-        '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
+        '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、趋势证据、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
+        '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
       ].join('\n'),
     },
@@ -678,20 +756,25 @@ export async function runInternalResultAgent(options) {
   const artifacts = [];
   try {
     let analysis;
+    const inline = [];
     for (const call of calls) {
       const artifact = executeTool(call, envelope, options.pluginHome);
       if (artifact.type === 'analysis') analysis = artifact;
+      else if (artifact.markdown) inline.push(artifact);
       else artifacts.push(artifact);
     }
-    const notice = scopeNotice(envelope.manifest);
-    const markdown = analysis?.markdown || [
-      `已按同一份受控查询结果生成 ${artifacts.length} 个产物。`,
-      notice ? `数据范围说明：${notice}` : null,
+    const lead = analysis?.markdown || (inline.length
+      ? '# 查询结果'
+      : `# 查询结果\n\n已按同一份受控查询结果生成 ${artifacts.length} 个文件产物。`);
+    const markdown = [
+      lead,
+      ...inline.map(artifact => artifact.markdown),
+      analysis?.contextMarkdown || contextLines(envelope).join('\n'),
     ].filter(Boolean).join('\n\n');
     return {
       markdown,
       files: artifacts.map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),
-      artifactTypes: artifacts.map(artifact => artifact.type),
+      artifactTypes: calls.filter(call => call.output !== 'analysis').map(call => call.output),
       manifest: envelope.manifest,
       audit: {
         ...baseAudit,
