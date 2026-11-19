@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any
+from typing import Any, TypeAlias
 
 from pydantic import BaseModel, Field
 
@@ -43,6 +43,61 @@ class CredentialRef(BaseModel):
             "datasource": self.datasource,
             "engine": self.engine or self.datasource,
         }
+
+
+class DlcPolicy(BaseModel):
+    catalog: str = "DataLakeCatalog"
+    database: str = ""
+    table: str = ""
+    operation: str = ""
+    policy_type: str = ""
+    source: str = ""
+    data_engine: str = ""
+
+
+class DlcPrincipalRef(BaseModel):
+    """Caller-bound DLC subject resolved from a trusted Botmux union_id.
+
+    The signer used to invoke Tencent Cloud remains a deployment credential.  It
+    is deliberately not represented here and can therefore never be returned to
+    a model or persisted in a query plan.
+    """
+
+    user_union_id: str
+    cam_uin: str
+    datasource: str = "dlc"
+    region: str = "ap-hongkong"
+    project_id: str | None = None
+    catalog: str = "DataLakeCatalog"
+    default_database: str
+    data_engine_name: str
+    data_engine_type: str
+    user_type: str = "COMMON"
+    policies: list[DlcPolicy] = Field(default_factory=list)
+    engine_allowed: bool = False
+    has_row_filters: bool = False
+    has_data_masks: bool = False
+    permission_version: str
+
+    def masked(self) -> dict[str, str]:
+        masked_uin = (
+            f"{self.cam_uin[:4]}...{self.cam_uin[-3:]}"
+            if len(self.cam_uin) > 8
+            else "***"
+        )
+        return {
+            "user_union_id": self.user_union_id,
+            "cam_uin": masked_uin,
+            "datasource": self.datasource,
+            "region": self.region,
+            "project_id": self.project_id or "",
+            "engine": self.data_engine_name,
+            "engine_type": self.data_engine_type,
+            "permission_version": self.permission_version,
+        }
+
+
+ResolvedPrincipal: TypeAlias = CredentialRef | DlcPrincipalRef
 
 
 class ColumnMeta(BaseModel):
@@ -112,6 +167,12 @@ class QueryResult(BaseModel):
     error_code: str | None = None
     error_name: str | None = None
     retryable: bool = False
+    failure_stage: str | None = None
+    failure_action: str | None = None
+    diagnostic_source: str | None = None
+    diagnostic_case: str | None = None
+    diagnostic_summary: str | None = None
+    suggested_action: str | None = None
 
 
 def mask_jdbc_url(jdbc_url: str) -> str:

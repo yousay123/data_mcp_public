@@ -58,7 +58,6 @@ export default {
           serviceSocketPath: configValue('DATA_MCP_SERVICE_SOCKET_PATH') || join(homedir(), '.cache', 'ksher-agent-data-mcp', 'run', 'api.sock'),
           validateSqlEndpoint: configValue('DATA_MCP_VALIDATE_SQL_ENDPOINT') || null,
           runQueryEndpoint: configValue('DATA_MCP_RUN_QUERY_ENDPOINT') || configValue('DATA_MCP_QUERY_ENDPOINT') || null,
-          exportQueryEndpoint: configValue('DATA_MCP_EXPORT_QUERY_ENDPOINT') || configValue('DATA_MCP_EXPORT_ENDPOINT') || null,
           internalAuth: !!configValue('DATA_MCP_INTERNAL_AUTH_TOKEN'),
         },
       }, null, 2);
