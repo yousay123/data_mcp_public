@@ -20,7 +20,7 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v3';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v4';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
   'missing_metric',
@@ -216,6 +216,51 @@ function selectedColumns(args, available, key = 'columns') {
     throw new Error('result_agent_invalid_column_selection');
   }
   return [...new Set(values)];
+}
+
+const COLUMN_TOKEN_LABELS = new Map([
+  ['stat', '统计'], ['date', '日期'], ['day', '日期'], ['type', '类型'],
+  ['registered', '注册'], ['merchant', '商户'], ['shop', '店铺'], ['user', '用户'],
+  ['transaction', '交易'], ['payment', '支付'], ['order', '订单'], ['success', '成功'],
+  ['count', '数'], ['amount', '金额'], ['total', '总计'], ['rate', '比率'],
+]);
+
+function displayColumnLabel(column) {
+  const normalized = String(column || '').trim().toLowerCase();
+  const exact = {
+    stat_date: '日期', date: '日期', day_type: '日期类型', row_count: '记录数',
+    registered_merchant_count: '注册商户数', merchant_count: '商户数',
+  }[normalized];
+  if (exact) return exact;
+  const tokens = normalized.split('_').filter(Boolean);
+  if (!tokens.length || tokens.some(token => !COLUMN_TOKEN_LABELS.has(token))) return String(column);
+  return tokens.map(token => COLUMN_TOKEN_LABELS.get(token)).join('');
+}
+
+function markdownCell(value) {
+  if (value === null || value === undefined) return '';
+  const text = String(value);
+  if (text.length > 500) throw new Error('result_agent_table_value_too_large');
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('|', '\\|')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+function tableLines(args, envelope, maxRows) {
+  if (!Array.isArray(args.table_columns) || !args.table_columns.length) return [];
+  const columns = selectedColumns(args, envelope.columns, 'table_columns');
+  const lines = [
+    '## 数据明细',
+    '',
+    `| ${columns.map(displayColumnLabel).map(markdownCell).join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+    ...envelope.rows.slice(0, maxRows).map(row => `| ${columns.map(column => markdownCell(row[column])).join(' | ')} |`),
+  ];
+  if (envelope.rows.length > maxRows) lines.push('', `> 仅展示前 ${maxRows} 行，共 ${envelope.rows.length} 行。`);
+  return [...lines, ''];
 }
 
 function assertOnlyKeys(value, allowed, code = 'result_agent_free_text_not_allowed') {
@@ -477,6 +522,7 @@ function computedClaims(args, envelope) {
     }
     if (operation === 'count') return `**返回记录数：${groupedNumber(envelope.rows.length)} 行**`;
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
+    const columnLabel = displayColumnLabel(column);
     const decimal = decimalRows(column, envelope);
     const { rows, scale } = decimal;
     if (!Number.isInteger(scale) || scale < 0 || scale > 100) throw new Error('result_agent_invalid_claim_value');
@@ -484,7 +530,7 @@ function computedClaims(args, envelope) {
     if (operation === 'latest') {
       const item = rows.at(-1);
       const label = claimLabel(claim, item, envelope);
-      return `- **${column}（最新值）**：${label ? `${label} 为 ` : ''}${formatClaimDecimal(item.exact, scale)}`;
+      return `- **${columnLabel}（最新值）**：${label ? `${label} 为 ` : ''}${formatClaimDecimal(item.exact, scale)}`;
     }
     if (operation === 'change') {
       if (rows.length < 2) throw new Error('result_agent_invalid_claim_value');
@@ -495,7 +541,7 @@ function computedClaims(args, envelope) {
       const lastLabel = claimLabel(claim, last, envelope);
       const direction = delta > 0n ? '上升' : delta < 0n ? '下降' : '持平';
       const period = firstLabel || lastLabel ? `（${firstLabel || '期初'} → ${lastLabel || '期末'}）` : '';
-      return `- **${column}（区间变化${period}）**：${direction} ${formatClaimDecimal(delta < 0n ? -delta : delta, scale)}${percent === null ? '' : `（${percent}%）`}`;
+      return `- **${columnLabel}（区间变化${period}）**：${direction} ${formatClaimDecimal(delta < 0n ? -delta : delta, scale)}${percent === null ? '' : `（${percent}%）`}`;
     }
     if (operation === 'largest_change') {
       if (rows.length < 2) throw new Error('result_agent_invalid_claim_value');
@@ -510,7 +556,7 @@ function computedClaims(args, envelope) {
       const currentLabel = claimLabel(claim, winner.current, envelope);
       const direction = winner.delta > 0n ? '增长' : winner.delta < 0n ? '下降' : '无变化';
       const period = previousLabel || currentLabel ? `（${previousLabel || '上一期'} → ${currentLabel || '当期'}）` : '';
-      return `- **${column}（最大单期变化${period}）**：${direction} ${formatClaimDecimal(winner.delta < 0n ? -winner.delta : winner.delta, scale)}`;
+      return `- **${columnLabel}（最大单期变化${period}）**：${direction} ${formatClaimDecimal(winner.delta < 0n ? -winner.delta : winner.delta, scale)}`;
     }
     let coefficient;
     let outputScale = scale;
@@ -529,9 +575,9 @@ function computedClaims(args, envelope) {
     if (operation === 'minimum' || operation === 'maximum') {
       const item = rows.find(row => row.exact === coefficient);
       const label = claimLabel(claim, item, envelope);
-      return `- **${column}（${operationLabel}）**：${label ? `${label} 为 ` : ''}${value}`;
+      return `- **${columnLabel}（${operationLabel}）**：${label ? `${label} 为 ` : ''}${value}`;
     }
-    return `- **${column}（${operationLabel}）**：${value}`;
+    return `- **${columnLabel}（${operationLabel}）**：${value}`;
   });
 }
 
@@ -568,9 +614,12 @@ function contextLines(envelope) {
 }
 
 function executeAnalysis(args, envelope) {
-  assertOnlyKeys(args, new Set(['claims']));
+  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
   if (!Array.isArray(args.claims) || !args.claims.length) throw new Error('result_agent_invalid_claims');
+  const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
+  if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_plan');
   const lines = summaryLines(args, envelope);
+  lines.push(...tableLines(args, envelope, maxRows));
   return {
     type: 'analysis',
     markdown: `# ${lines.shift()}\n\n${lines.join('\n')}\n`,
@@ -580,14 +629,7 @@ function executeAnalysis(args, envelope) {
 
 function documentLines(args, envelope, maxRows) {
   const lines = [...summaryLines(args, envelope), ...contextLines(envelope), ''];
-  if (Array.isArray(args.table_columns) && args.table_columns.length) {
-    const columns = selectedColumns(args, envelope.columns, 'table_columns');
-    lines.push(columns.join(' | '));
-    lines.push(columns.map(() => '---').join(' | '));
-    for (const row of envelope.rows.slice(0, maxRows)) lines.push(columns.map(column => String(row[column] ?? '')).join(' | '));
-    if (envelope.rows.length > maxRows) lines.push(`仅展示前 ${maxRows} 行，共 ${envelope.rows.length} 行。`);
-    lines.push('');
-  }
+  lines.push(...tableLines(args, envelope, maxRows));
   return lines;
 }
 
@@ -665,7 +707,7 @@ function toolDefinitions(allowSemanticGap = false) {
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
   const tools = [
-    { type: 'function', function: { name: 'create_analysis', description: 'Create a decision-oriented analysis from source-bound claims. For ordered series, prefer latest, change, minimum/maximum with label_column, and largest_change. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { claims }, required: ['claims'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Create a decision-oriented inline analysis from source-bound claims. When the user asks for per-day, row-level, detail, list, or full-table output, include table_columns and table_max_rows so the inline answer contains the requested rows. For ordered series, prefer latest, change, minimum/maximum with label_column, and largest_change. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['claims'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
@@ -745,6 +787,7 @@ export async function runInternalResultAgent(options) {
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
         '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、趋势证据、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
         '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
+        '用户要求“按日”、“逐行”、“明细”、“列表”或“完整表格”时，create_analysis 必须选择必要的 table_columns，table_max_rows 必须覆盖用户要求的行数；摘要不能替代明细。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
         ...(allowSemanticGap ? [
           '这是基于已绑定结果的追问。如果现有 rows、schema 与 context 无法回答且必须重新查询数据库，只调用 report_semantic_gap 一次，不调用任何产物工具；不得猜测、自动补查或扩大口径。',

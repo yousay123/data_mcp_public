@@ -197,7 +197,7 @@ const hostDelivery = response => response?.result?._meta?.botmuxHostDelivery;
 const analysisDelivery = hostDelivery(byId.get(1));
 const analysisVisible = JSON.stringify(byId.get(1)?.result?.content ?? {});
 if (toolPayload(byId.get(1)).status !== 'delivery_requested'
-  || !analysisDelivery?.markdown?.includes('amount（合计）')
+  || !analysisDelivery?.markdown?.includes('金额（合计）')
   || !analysisDelivery.markdown.includes('30')) {
   throw new Error('analysis was not wrapped for trusted host delivery');
 }
@@ -343,7 +343,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v3'
+  && row.prompt_template_version === 'result-agent-tool-contract-v4'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -355,7 +355,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v3'
+  && row.prompt_template_version === 'result-agent-tool-contract-v4'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

@@ -19,7 +19,7 @@ const toolCalls = [
     { operation: 'minimum', column: 'amount', label_column: 'stat_date' },
     { operation: 'maximum', column: 'amount', label_column: 'stat_date' },
     { operation: 'largest_change', column: 'amount', label_column: 'stat_date' },
-  ] }],
+  ], table_columns: ['stat_date', 'amount'], table_max_rows: 2 }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
@@ -156,13 +156,16 @@ if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel
 }
 for (const expected of [
   '2026-03-02 为 18.75',
-  'amount（区间变化（2026-03-01 → 2026-03-02））',
+  '金额（区间变化（2026-03-01 → 2026-03-02））',
   '上升 6.25（50.00%）',
-  'amount（最小值）**：2026-03-01 为 12.50',
-  'amount（最大值）**：2026-03-02 为 18.75',
-  'amount（最大单期变化（2026-03-01 → 2026-03-02））',
+  '金额（最小值）**：2026-03-01 为 12.50',
+  '金额（最大值）**：2026-03-02 为 18.75',
+  '金额（最大单期变化（2026-03-01 → 2026-03-02））',
   '## 分析建议',
   '不能单独证明因果关系',
+  '## 数据明细',
+  '| 日期 | 金额 |',
+  '| 2026-03-01 | 12.5 |',
   '```vega-lite',
   '"value_exact":"18.75"',
 ]) {
@@ -172,7 +175,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -196,6 +199,12 @@ if (envelope.rows.length !== 2
 const expectedTools = ['create_analysis', 'create_excel', 'create_pdf', 'create_chart', 'create_document'];
 for (const name of expectedTools) {
   if (!firstRequest.tools.some(tool => tool.function?.name === name)) throw new Error(`missing Agent tool ${name}`);
+}
+const analysisTool = firstRequest.tools.find(tool => tool.function?.name === 'create_analysis');
+if (!analysisTool?.function?.parameters?.properties?.table_columns
+  || !analysisTool.function.parameters.properties.table_max_rows
+  || !firstRequest.messages.find(message => message.role === 'system')?.content?.includes('摘要不能替代明细')) {
+  throw new Error('analysis tool did not expose or require inline row-detail semantics');
 }
 if (firstRequest.tools.some(tool => tool.function?.name === 'report_semantic_gap')) {
   throw new Error('initial request exposed the follow-up-only semantic gap tool');
@@ -363,10 +372,10 @@ const precision = await runInternalResultAgent({
   pluginHome,
 });
 const exactClaims = [
-  '- **amount（合计）**：9,007,199,254,740,989.51',
-  '- **amount（平均值）**：3,002,399,751,580,329.836667',
-  '- **amount（最小值）**：-3.50',
-  '- **amount（最大值）**：9,007,199,254,740,993.00',
+  '- **金额（合计）**：9,007,199,254,740,989.51',
+  '- **金额（平均值）**：3,002,399,751,580,329.836667',
+  '- **金额（最小值）**：-3.50',
+  '- **金额（最大值）**：9,007,199,254,740,993.00',
 ];
 for (const claim of exactClaims) {
   if (!precision.markdown.includes(claim)) throw new Error(`missing exact analysis claim: ${claim}`);
@@ -393,7 +402,7 @@ const decimalResult = {
 const decimalSum = await runInternalResultAgent({
   result: decimalResult, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!decimalSum.markdown.includes('amount（合计）**：0.30')) {
+if (!decimalSum.markdown.includes('金额（合计）**：0.30')) {
   throw new Error(`decimal addition lost scale or precision: ${decimalSum.markdown}`);
 }
 const negativeSum = await runInternalResultAgent({
@@ -408,7 +417,7 @@ const negativeSum = await runInternalResultAgent({
   },
   question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!negativeSum.markdown.includes('amount（合计）**：-5.00')) {
+if (!negativeSum.markdown.includes('金额（合计）**：-5.00')) {
   throw new Error(`negative decimal aggregation is incorrect: ${negativeSum.markdown}`);
 }
 for (const invalid of ['not-a-number', 9007199254740992]) {
@@ -447,7 +456,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
