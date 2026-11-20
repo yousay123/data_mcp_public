@@ -21,7 +21,7 @@ const SENSITIVE_PROCESS_ENV_KEYS = [
 ];
 const OUTBOUND_ARTIFACT_PREFIXES = ['data-mcp-', 'result-agent-'];
 const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
-const DELIVERY_BUDGET_MS = 55_000;
+const DELIVERY_BUDGET_MS = 330_000;
 const stagedOutboundArtifacts = new Set();
 let hostEnvCache;
 let packageVersionCache;

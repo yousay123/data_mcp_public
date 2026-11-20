@@ -168,14 +168,16 @@ Environment contract:
 - `DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS`
   - Exponential retry base delay, default `250` ms, allowed `0` to `2000` ms.
 - `DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS`
-  - Per-attempt timeout, default `25000` ms, allowed `1000` to `30000` ms. The
-    isolated result-agent process has a 55-second overall deadline.
+  - Per-attempt timeout, default `140000` ms, allowed `1000` to `300000` ms.
+    With the default two attempts, the isolated result-agent process has a
+    300-second overall deadline; the full query-and-delivery path reserves
+    330 seconds, below Botmux's configured 600-second plugin-tool timeout.
 - `DATA_MCP_RESULT_BINDING_HMAC_KEY`
   - Required, host-only secret of at least 32 characters for interactive result
     bindings. Missing keys fail closed. Keep it in the same host-only env file.
 
-结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
-55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
+结果代理在独立子进程中运行，单独最多 300 秒；首次查询交付从调用 Data MCP 开始共享
+330 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
 使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
 首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
 `stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
