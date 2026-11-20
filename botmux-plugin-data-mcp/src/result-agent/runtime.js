@@ -23,7 +23,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v6';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v7';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
   'missing_metric',
@@ -673,45 +673,68 @@ function summaryLines(args, envelope) {
   return lines;
 }
 
-function numericTokens(value) {
-  return String(value || '').match(/[+-]?\d[\d,]*(?:\.\d+)?%?/g)?.map(token => {
-    const percent = token.endsWith('%');
-    const raw = token.replaceAll(',', '').replace(/%$/, '');
-    const parsed = parseDecimal(raw, 'result_agent_invalid_analysis_markdown');
-    let coefficient = parsed.coefficient;
-    let scale = parsed.scale;
-    while (scale > 0 && coefficient % 10n === 0n) {
-      coefficient /= 10n;
-      scale -= 1;
-    }
-    return `${coefficient}:${scale}${percent ? '%' : ''}`;
-  }) || [];
+function analysisLayoutHeadings(args) {
+  const labels = [...new Set(args.claims
+    .map(claim => typeof claim?.column === 'string' ? displayColumnLabel(claim.column) : '')
+    .filter(Boolean))];
+  const title = labels.length ? `${labels.join('、')}分析` : '查询结果分析';
+  return new Map([
+    ['title_analysis', `# ${title}`],
+    ['section_overview', '## 概览'],
+    ['section_scale_distribution', '## 规模与分布'],
+    ['section_latest_change', '## 最新与变化'],
+    ['section_extrema_volatility', '## 极值与波动'],
+    ['section_trend_change', '## 趋势与变化'],
+  ]);
 }
 
 function authoredAnalysis(args, envelope) {
   const markdown = boundedString(args.analysis_markdown, 6_000, 'result_agent_invalid_analysis_markdown');
-  if (/<\/?(?:script|style|iframe)\b|javascript:|file:\/\//iu.test(markdown)) {
-    throw new Error('result_agent_invalid_analysis_markdown');
-  }
   const exactClaims = computedClaims(args, envelope);
-  const allowedNumbers = new Set(numericTokens([
-    JSON.stringify(envelope.rows),
-    JSON.stringify(envelope.manifest.context),
-    exactClaims.join('\n'),
-    envelope.rows.length,
-  ].join('\n')));
-  if (numericTokens(markdown).some(token => !allowedNumbers.has(token))) {
+  const headings = analysisLayoutHeadings(args);
+  const seen = new Set();
+  const seenHeadings = new Set();
+  let lastClaimLine = -1;
+  const rendered = markdown.split('\n').map((line, lineIndex) => {
+    const trimmed = line.trim();
+    if (!trimmed) return '';
+    const heading = trimmed.match(/^\{\{(title_analysis|section_[a-z_]+)\}\}$/u);
+    if (heading) {
+      if (!headings.has(heading[1]) || seenHeadings.has(heading[1])) throw new Error('result_agent_ungrounded_analysis');
+      seenHeadings.add(heading[1]);
+      return headings.get(heading[1]);
+    }
+    const placeholder = trimmed.match(/^\{\{claim_(\d+)\}\}$/u);
+    if (!placeholder) throw new Error('result_agent_ungrounded_analysis');
+    const index = Number(placeholder[1]) - 1;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= exactClaims.length || seen.has(index)) {
+      throw new Error('result_agent_ungrounded_analysis');
+    }
+    seen.add(index);
+    lastClaimLine = lineIndex;
+    return exactClaims[index];
+  });
+  const firstContent = markdown.split('\n').find(line => line.trim())?.trim();
+  if (seen.size !== exactClaims.length || firstContent !== '{{title_analysis}}' || !seenHeadings.has('title_analysis')) {
     throw new Error('result_agent_ungrounded_analysis');
   }
-  return markdown;
+  return rendered.slice(0, lastClaimLine + 1).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function groundedFallbackAnalysis(args, envelope) {
-  const labels = [...new Set(args.claims
-    .map(claim => typeof claim?.column === 'string' ? displayColumnLabel(claim.column) : '')
-    .filter(Boolean))];
-  const title = labels.length ? `${labels.join('、')}概览` : '查询结果';
-  return [`# ${title}`, '', ...computedClaims(args, envelope)].join('\n');
+  const scaleClaims = [];
+  const changeClaims = [];
+  args.claims.forEach((claim, index) => {
+    const reference = `{{claim_${index + 1}}}`;
+    if (['latest', 'change', 'largest_change'].includes(claim.operation)) changeClaims.push(reference);
+    else scaleClaims.push(reference);
+  });
+  return [
+    '{{title_analysis}}',
+    '',
+    ...(scaleClaims.length ? ['{{section_scale_distribution}}', '', ...scaleClaims, ''] : []),
+    ...(changeClaims.length ? ['{{section_trend_change}}', '', ...changeClaims] : []),
+  ].join('\n').trim();
 }
 
 function contextLines(envelope) {
@@ -818,11 +841,11 @@ function toolDefinitions(allowSemanticGap = false) {
     ...documentProperties,
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 6000,
-      description: 'User-facing Markdown authored from the protected rows and exact claims. Be concise, question-specific, and professional. Do not include the detail table or query scope; the tool appends them. Do not add unrequested fields or unsupported causes.',
+      description: 'Layout tokens only. First line must be {{title_analysis}}. Then use optional unique section tokens {{section_overview}}, {{section_scale_distribution}}, {{section_latest_change}}, {{section_extrema_volatility}}, or {{section_trend_change}}, plus standalone {{claim_N}} lines where N is the 1-based index in claims. Every claim must appear exactly once. No free headings, prose, numbers, dates, lists, tables, or other text.',
     },
   };
   const tools = [
-    { type: 'function', function: { name: 'create_analysis', description: 'Author the user-facing Markdown analysis and bind every numeric statement to source-derived claims. Match the user question instead of using a generic template. When the user asks for per-day, row-level, detail, list, or full-table output, include only the requested table_columns and enough table_max_rows. Do not add convenience or derived fields the user did not request.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['claims', 'analysis_markdown'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Choose exact source-derived claims and organize them with a question-specific Markdown heading layout using {{claim_N}} references only. The host owns all rendered facts. When the user asks for per-day, row-level, detail, list, or full-table output, include only the requested table_columns and enough table_max_rows. Do not add convenience or derived fields the user did not request.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['claims', 'analysis_markdown'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
@@ -861,8 +884,8 @@ function parseToolCall(call, allowSemanticGap = false) {
   return { id: call.id, name, args, output: OUTPUT_BY_TOOL[name] };
 }
 
-function executeTool(call, envelope, pluginHome) {
-  if (call.name === 'create_analysis') return executeAnalysis(call.args, envelope);
+function executeTool(call, envelope, pluginHome, question = '') {
+  if (call.name === 'create_analysis') return executeAnalysis(call.args, envelope, question);
   if (call.name === 'create_excel') return executeExcel(call.args, envelope, pluginHome);
   if (call.name === 'create_chart') return executeChart(call.args, envelope);
   if (call.name === 'create_document') return executeDocument(call.args, envelope, pluginHome);
@@ -948,7 +971,7 @@ export async function runInternalResultAgent(options) {
           ? '如果现有结果可以回答，只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。'
           : '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
-        'create_analysis 必须使用 analysis_markdown 撰写面向用户的专业 Markdown 正文，根据问题选择结构和表达，不得套用固定模板。所有数值必须能从 rows、context 或 claims 精确推导，不得猜测原因。',
+        'create_analysis 由你选择 claims、分组和顺序；analysis_markdown 首行必须是 {{title_analysis}}，之后只能使用工具说明列出的 section tokens 与单独成行的 {{claim_N}}，每个 claim 恰好引用一次。不得写自由标题、正文、数字、日期、列表或原因判断；宿主负责渲染全部标题与精确事实。',
         '除 create_analysis 外，产物工具不接受标题、段落、标签、文件名等自由文本；表格、图表和文件的数据必须从同一份 rows 绑定生成。',
         '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
         '用户要求“按日”、“逐行”、“明细”、“列表”或“完整表格”时，create_analysis 必须选择必要的 table_columns，table_max_rows 必须覆盖用户要求的行数；摘要不能替代明细。',
@@ -1012,7 +1035,7 @@ export async function runInternalResultAgent(options) {
     let analysis;
     const inline = [];
     for (const call of calls) {
-      const artifact = executeTool(call, envelope, options.pluginHome);
+      const artifact = executeTool(call, envelope, options.pluginHome, options.question);
       if (artifact.type === 'analysis') analysis = artifact;
       else if (artifact.markdown) inline.push(artifact);
       else artifacts.push(artifact);
@@ -1050,10 +1073,17 @@ export async function runInternalResultAgent(options) {
           ...analysisCall.args,
           analysis_markdown: groundedFallbackAnalysis(analysisCall.args, envelope),
         };
-        modelResponse.trace = { ...modelResponse.trace, analysisFallbackUsed: true };
+        modelResponse.trace = {
+          ...modelResponse.trace,
+          analysisFallbackUsed: true,
+        };
         continue;
       }
       if (repairAttempt >= 2) throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
+      const failedAnalysisCall = calls.find(call => call.name === 'create_analysis');
+      const trustedFacts = failedAnalysisCall
+        ? computedClaims(failedAnalysisCall.args, envelope)
+        : [];
       const repairMessages = [
         ...messages,
         modelResponse.message,
@@ -1061,7 +1091,11 @@ export async function runInternalResultAgent(options) {
           role: 'tool',
           tool_call_id: call.id,
           content: call.function?.name === 'create_analysis'
-            ? '数字校验失败：正文包含无法从 rows、context 或已声明 claims 验证的数字。请重新生成全部要求的工具调用；正文中的每个汇总、平均、极值、变化量和比例都必须在 claims 中声明，不得自行心算或增加新数字。'
+            ? [
+                '分析结构校验失败。请重新生成全部要求的工具调用。',
+                'create_analysis.analysis_markdown 首行必须是 {{title_analysis}}；之后只能使用工具说明列出的 section tokens 和单独成行的 {{claim_N}}。N 是 claims 中从 1 开始的序号，每个 claim 必须恰好引用一次。不得写自由标题、正文、数字、日期、列表、结论或原因判断，宿主会渲染全部标题和下面的精确事实。',
+                ...trustedFacts,
+              ].join('\n')
             : '上一轮分析校验失败，本轮请重新生成该产物调用。',
         })),
       ];
@@ -1077,12 +1111,41 @@ export async function runInternalResultAgent(options) {
           tool_choice: 'required',
         }, options.runtimeConfig, options.onTestExceptionUsed);
       } catch (repairError) {
-        throw attachAudit(repairError, {
-          ...baseAudit,
+        if (!modelRequestRetryable(repairError)) {
+          throw attachAudit(repairError, {
+            ...baseAudit,
+            ...modelResponse.trace,
+            ...(repairError?.modelTrace || {}),
+            modelRepairCount: (modelResponse.trace.modelRepairCount || 0) + 1,
+          });
+        }
+        const analysisCall = calls.find(call => call.name === 'create_analysis');
+        if (!analysisCall) {
+          throw attachAudit(repairError, {
+            ...baseAudit,
+            ...modelResponse.trace,
+            ...(repairError?.modelTrace || {}),
+            modelRepairCount: (modelResponse.trace.modelRepairCount || 0) + 1,
+          });
+        }
+        analysisCall.args = {
+          ...analysisCall.args,
+          analysis_markdown: groundedFallbackAnalysis(analysisCall.args, envelope),
+        };
+        const repairTrace = repairError?.modelTrace || {};
+        modelResponse.trace = {
           ...modelResponse.trace,
-          ...(repairError?.modelTrace || {}),
-          modelRepairCount: 1,
-        });
+          latencyMs: (modelResponse.trace.latencyMs || 0) + (repairTrace.latencyMs || 0),
+          modelAttemptCount: (modelResponse.trace.modelAttemptCount || 0) + (repairTrace.modelAttemptCount || 0),
+          modelRetriesUsed: (modelResponse.trace.modelRetriesUsed || 0) + (repairTrace.modelRetriesUsed || 0),
+          modelRepairCount: (modelResponse.trace.modelRepairCount || 0) + 1,
+          repairFailureCode: repairError?.message,
+          ...(repairTrace.httpStatus === undefined ? {} : { repairHttpStatus: repairTrace.httpStatus }),
+          ...(repairTrace.requestId === undefined ? {} : { repairRequestId: repairTrace.requestId }),
+          analysisFallbackUsed: true,
+          repairTransportFallback: true,
+        };
+        continue;
       }
       repairedResponse.trace = combinedModelTrace(modelResponse.trace, repairedResponse.trace);
       modelResponse = repairedResponse;

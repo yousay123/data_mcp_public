@@ -4,21 +4,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runInternalResultAgent } from '../src/result-agent/runtime.js';
 import { runIsolatedResultAgent } from '../src/mcp/result-agent-client.js';
+import { ResultStore } from '../src/mcp/result-store.js';
 import { canonicalContext } from './test-result-context-fixture.mjs';
 
 const root = mkdtempSync(join(tmpdir(), 'data-mcp-result-agent-'));
 const pluginHome = join(root, 'plugin-home');
 let responseMode = 'tools';
 let requests = [];
+let adversarialMarkdown = '';
 const analysisMarkdown = [
-  '# 金额趋势概览',
+  '{{title_analysis}}',
   '',
-  '近两日金额由 12.500 上升至 18.750，增加 6.250（50%）。',
+  '{{section_scale_distribution}}',
   '',
-  '## 关注点',
+  '{{claim_1}}',
+  '{{claim_4}}',
+  '{{claim_5}}',
   '',
-  '- 2026-03-02 为区间高点，2026-03-01 为区间低点。',
-  '> 数值变化本身不能证明因果关系。',
+  '{{section_trend_change}}',
+  '',
+  '{{claim_2}}',
+  '{{claim_3}}',
+  '{{claim_6}}',
 ].join('\n');
 
 const toolCalls = [
@@ -51,6 +58,13 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'unauthorized') {
       res.writeHead(401, responseHeaders);
       res.end(JSON.stringify({ error: { message: 'unauthorized' } }));
+      return;
+    }
+    if ((responseMode === 'repair-503' || responseMode === 'repair-401')
+      && payload.messages.some(message => message.role === 'tool')) {
+      const status = responseMode === 'repair-503' ? 503 : 401;
+      res.writeHead(status, responseHeaders);
+      res.end(JSON.stringify({ error: { message: 'repair unavailable' } }));
       return;
     }
     res.writeHead(200, responseHeaders);
@@ -112,7 +126,7 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'precision') {
       const claims = ['sum', 'average', 'minimum', 'maximum'].map(operation => ({ operation, column: 'amount' }));
       const calls = [
-        ['pa', 'create_analysis', { claims, analysis_markdown: '# 高精度汇总\n\n已按原始精度完成聚合。' }],
+        ['pa', 'create_analysis', { claims, analysis_markdown: '{{title_analysis}}\n\n{{section_scale_distribution}}\n\n{{claim_1}}\n{{claim_2}}\n{{claim_3}}\n{{claim_4}}' }],
         ['pd', 'create_document', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pp', 'create_pdf', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pc', 'create_chart', { type: 'bar', label_column: 'stat_date', value_column: 'amount' }],
@@ -128,8 +142,16 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
-    if (responseMode === 'analysis-ungrounded') {
+    if (responseMode === 'analysis-ungrounded' || responseMode === 'repair-503' || responseMode === 'repair-401') {
       const call = { id: 'ungrounded', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], analysis_markdown: '# 汇总\n\n总额为 999999。' }) } };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'analysis-adversarial') {
+      const call = { id: 'adversarial', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
+        claims: [{ operation: 'sum', column: 'amount' }, { operation: 'latest', column: 'amount', label_column: 'stat_date' }],
+        analysis_markdown: adversarialMarkdown,
+      }) } };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
@@ -147,7 +169,7 @@ const modelServer = createServer((req, res) => {
         id: 'count', type: 'function',
         function: {
           name: 'create_analysis',
-          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }], analysis_markdown: '# 数据量\n\n查询结果为 1,261,699 行。' }),
+          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }], analysis_markdown: '{{title_analysis}}\n\n{{claim_1}}' }),
         },
       };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
@@ -199,10 +221,9 @@ if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel
   throw new Error('result Agent did not create every requested artifact');
 }
 for (const expected of [
-  '# 金额趋势概览',
-  '由 12.500 上升至 18.750，增加 6.250（50%）',
-  '## 关注点',
-  '不能证明因果关系',
+  '# 金额分析',
+  '**金额（区间变化（2026-03-01 → 2026-03-02））**：上升 6.25（50.00%）',
+  '## 趋势与变化',
   '## 数据明细',
   '| 日期 | 金额 |',
   '| 2026-03-01 | 12.5 |',
@@ -215,7 +236,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -350,7 +371,7 @@ const rowCountDelivery = await runInternalResultAgent({
   question: '查询昨天数据量', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
 for (const expected of [
-  '查询结果为 1,261,699 行',
+  '**数据量：1,261,699 行**',
   '## 数据口径',
   'DLC',
   'ksher_dim.dim_kgp_va_account',
@@ -374,7 +395,7 @@ requests = [];
 const groundedFallback = await runInternalResultAgent({
   result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!groundedFallback.markdown.includes('# 金额概览')
+if (!groundedFallback.markdown.includes('# 金额分析')
   || groundedFallback.markdown.includes('999999')
   || groundedFallback.audit?.modelRepairCount !== 1
   || groundedFallback.audit?.analysisFallbackUsed !== true
@@ -387,13 +408,82 @@ requests = [];
 const repairedAnalysis = await runInternalResultAgent({
   result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!repairedAnalysis.markdown.includes('# 金额趋势概览')
+if (!repairedAnalysis.markdown.includes('# 金额分析')
   || repairedAnalysis.audit?.modelRepairCount !== 1
   || repairedAnalysis.audit?.modelAttemptCount !== 2
   || repairedAnalysis.audit?.modelRetriesUsed !== 0
   || repairedAnalysis.audit?.analysisFallbackUsed === true
   || requests.length !== 2) {
   throw new Error('grounding repair did not recover with a complete audit trace');
+}
+const repairEvidence = requests[1]?.payload?.messages
+  ?.filter(message => message.role === 'tool')
+  .map(message => message.content)
+  .join('\n') || '';
+if (!repairEvidence.includes('宿主会渲染') || !repairEvidence.includes('31.25')) {
+  throw new Error('grounding repair did not provide exact host-computed facts to the model');
+}
+
+for (const forbidden of [
+  '# 互换数字\n\n合计金额为 18.75，最新值为 31.25。',
+  '# 虚构结论\n\n营销活动推动金额强劲增长，总金额已经达到九十九万，当前表现远高于合理预期。',
+]) {
+  responseMode = 'analysis-adversarial';
+  adversarialMarkdown = forbidden;
+  requests = [];
+  const rejected = await runInternalResultAgent({
+    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+  if (rejected.markdown.includes(forbidden.split('\n').at(-1))
+    || rejected.audit?.analysisFallbackUsed !== true
+    || requests.length !== 2) {
+    throw new Error('unbound model-authored claim bypassed typed claim rendering');
+  }
+}
+
+for (const attack of [
+  { question: '营销活动是否推动金额增长？', heading: '# 营销活动推动金额增长' },
+  { question: '请判断 31.25 是否最新、18.75 是否合计', heading: '# 31.25最新，18.75合计' },
+]) {
+  responseMode = 'analysis-adversarial';
+  adversarialMarkdown = `${attack.heading}\n\n{{claim_1}}\n{{claim_2}}`;
+  requests = [];
+  const rejectedHeading = await runInternalResultAgent({
+    result, question: attack.question, requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+  if (rejectedHeading.markdown.includes(attack.heading)
+    || rejectedHeading.audit?.analysisFallbackUsed !== true
+    || requests.length !== 2) {
+    throw new Error('question vocabulary was rearranged into an untrusted analysis heading');
+  }
+}
+
+responseMode = 'repair-503';
+requests = [];
+const repairTransportFallback = await runInternalResultAgent({
+  result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!repairTransportFallback.markdown.includes('# 金额分析')
+  || repairTransportFallback.audit?.repairTransportFallback !== true
+  || repairTransportFallback.audit?.analysisFallbackUsed !== true
+  || repairTransportFallback.audit?.repairHttpStatus !== 503
+  || repairTransportFallback.audit?.repairFailureCode !== 'result_agent_http_503'
+  || !/^[a-f0-9]{64}$/.test(repairTransportFallback.audit?.outputHash || '')) {
+  throw new Error('repair transport failure did not preserve an exact host-rendered result');
+}
+
+responseMode = 'repair-401';
+requests = [];
+let repairAuthError;
+try {
+  await runInternalResultAgent({
+    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+} catch (error) {
+  repairAuthError = error;
+}
+if (repairAuthError?.message !== 'result_agent_http_401') {
+  throw new Error('repair authentication failure did not remain fail-closed');
 }
 for (const file of delivered.files) {
   if (!existsSync(file.path)) throw new Error(`missing generated ${file.type}`);
@@ -514,7 +604,7 @@ const decimalResult = {
 const decimalSum = await runInternalResultAgent({
   result: decimalResult, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!decimalSum.markdown.includes('合计为 0.30')) {
+if (!decimalSum.markdown.includes('**金额（合计）**：0.30')) {
   throw new Error(`decimal addition lost scale or precision: ${decimalSum.markdown}`);
 }
 const negativeSum = await runInternalResultAgent({
@@ -529,7 +619,7 @@ const negativeSum = await runInternalResultAgent({
   },
   question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!negativeSum.markdown.includes('合计为 -5.00')) {
+if (!negativeSum.markdown.includes('**金额（合计）**：-5.00')) {
   throw new Error(`negative decimal aggregation is incorrect: ${negativeSum.markdown}`);
 }
 for (const invalid of ['not-a-number', 9007199254740992]) {
@@ -568,10 +658,38 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
+
+const auditHome = join(root, 'audit-store');
+const auditStore = new ResultStore({ pluginHome: auditHome, secret: 'a'.repeat(32) });
+auditStore.audit(
+  { unionId: 'on_audit', appId: 'cli_audit', sessionId: 'session_audit' },
+  'turn_audit',
+  'question_audit',
+  1,
+  'result_agent_succeeded',
+  Date.now(),
+  {
+    modelAttemptCount: 8,
+    modelRetriesUsed: 6,
+    repairTransportFallback: true,
+    repairFailureCode: 'result_agent_http_503',
+    repairHttpStatus: 503,
+    repairRequestId: 'repair-request-safe',
+  },
+);
+const persistedAudit = JSON.parse(readFileSync(join(auditHome, 'active-results-v1', 'audit.jsonl'), 'utf8').trim());
+if (persistedAudit.model_attempt_count !== 8
+  || persistedAudit.model_retries_used !== 6
+  || persistedAudit.repair_transport_fallback !== true
+  || persistedAudit.repair_failure_code !== 'result_agent_http_503'
+  || persistedAudit.repair_http_status !== 503
+  || !/^[a-f0-9]{16}$/.test(persistedAudit.repair_request_id_hash || '')) {
+  throw new Error('repair fallback audit lost lifecycle attempts or safe failure provenance');
+}
 
 for (const file of delivered.files) rmSync(file.path, { force: true });
 for (const file of precision.files) rmSync(file.path, { force: true });

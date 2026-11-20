@@ -117,7 +117,7 @@ const model = createServer((req, res) => {
             name: analysis ? 'create_analysis' : 'create_excel',
             arguments: JSON.stringify(analysis ? {
               claims: [{ operation: 'count' }],
-              analysis_markdown: '# 追问结果\n\n已基于绑定结果完成分析。',
+              analysis_markdown: '{{title_analysis}}\n\n{{claim_1}}',
             } : {
               sheets: [{ columns: ['synthetic_value'] }],
             }),

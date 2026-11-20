@@ -251,6 +251,9 @@ export class ResultStore {
     if (typeof detail?.requestId === 'string' && detail.requestId.trim()) {
       safeDetail.request_id_hash = this.digest('model-request-id-v1', [detail.requestId]).slice(0, 16);
     }
+    if (typeof detail?.repairRequestId === 'string' && detail.repairRequestId.trim()) {
+      safeDetail.repair_request_id_hash = this.digest('model-repair-request-id-v1', [detail.repairRequestId]).slice(0, 16);
+    }
     if (typeof detail?.promptTemplateVersion === 'string'
       && /^[A-Za-z0-9._-]{1,80}$/.test(detail.promptTemplateVersion)) {
       safeDetail.prompt_template_version = detail.promptTemplateVersion;
@@ -273,16 +276,25 @@ export class ResultStore {
     if (Number.isSafeInteger(detail?.httpStatus) && detail.httpStatus >= 100 && detail.httpStatus <= 599) {
       safeDetail.http_status = detail.httpStatus;
     }
-    if (Number.isSafeInteger(detail?.modelAttemptCount) && detail.modelAttemptCount >= 1 && detail.modelAttemptCount <= 4) {
+    if (Number.isSafeInteger(detail?.repairHttpStatus)
+      && detail.repairHttpStatus >= 100 && detail.repairHttpStatus <= 599) {
+      safeDetail.repair_http_status = detail.repairHttpStatus;
+    }
+    if (Number.isSafeInteger(detail?.modelAttemptCount) && detail.modelAttemptCount >= 1 && detail.modelAttemptCount <= 8) {
       safeDetail.model_attempt_count = detail.modelAttemptCount;
     }
-    if (Number.isSafeInteger(detail?.modelRetriesUsed) && detail.modelRetriesUsed >= 0 && detail.modelRetriesUsed <= 3) {
+    if (Number.isSafeInteger(detail?.modelRetriesUsed) && detail.modelRetriesUsed >= 0 && detail.modelRetriesUsed <= 6) {
       safeDetail.model_retries_used = detail.modelRetriesUsed;
     }
     if (Number.isSafeInteger(detail?.modelRepairCount) && detail.modelRepairCount >= 0 && detail.modelRepairCount <= 1) {
       safeDetail.model_repair_count = detail.modelRepairCount;
     }
     if (detail?.analysisFallbackUsed === true) safeDetail.analysis_fallback_used = true;
+    if (detail?.repairTransportFallback === true) safeDetail.repair_transport_fallback = true;
+    if (typeof detail?.repairFailureCode === 'string'
+      && /^result_agent_(?:timeout|network_error|http_(?:408|425|429|5\d\d))$/.test(detail.repairFailureCode)) {
+      safeDetail.repair_failure_code = detail.repairFailureCode;
+    }
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),

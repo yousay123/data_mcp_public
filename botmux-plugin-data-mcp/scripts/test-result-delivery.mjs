@@ -98,7 +98,7 @@ const modelServer = createServer((req, res) => {
       ];
       const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
         claims: [{ operation: 'sum', column: 'amount' }],
-        analysis_markdown: '# 合成结果\n\n合计为 30。',
+        analysis_markdown: '{{title_analysis}}\n\n{{claim_1}}',
       }) } };
       const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
       res.end(JSON.stringify({
@@ -200,7 +200,7 @@ const hostDelivery = response => response?.result?._meta?.botmuxHostDelivery;
 const analysisDelivery = hostDelivery(byId.get(1));
 const analysisVisible = JSON.stringify(byId.get(1)?.result?.content ?? {});
 if (toolPayload(byId.get(1)).status !== 'delivery_requested'
-  || !analysisDelivery?.markdown?.includes('# 合成结果')
+  || !analysisDelivery?.markdown?.includes('# 金额分析')
   || !analysisDelivery.markdown.includes('30')) {
   throw new Error('analysis was not wrapped for trusted host delivery');
 }
@@ -275,7 +275,7 @@ const transientAgentFailure = await runPlugin([{
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_transient' } },
 }]);
 if (toolPayload(transientAgentFailure[0]).status !== 'delivery_requested'
-  || !hostDelivery(transientAgentFailure[0])?.markdown?.includes('# 合成结果')) {
+  || !hostDelivery(transientAgentFailure[0])?.markdown?.includes('# 金额分析')) {
   throw new Error('transient result Agent failure did not recover automatically');
 }
 
@@ -360,7 +360,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v6'
+  && row.prompt_template_version === 'result-agent-tool-contract-v7'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -374,7 +374,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v6'
+  && row.prompt_template_version === 'result-agent-tool-contract-v7'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

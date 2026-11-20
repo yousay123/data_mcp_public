@@ -188,10 +188,12 @@ Environment contract:
 Qwen 请求仅在传输失败、单次请求超时、HTTP 408/425/429 和 5xx 时重试；鉴权失败、
 参数错误、非法 JSON 与模型协议错误会立即失败。审计记录包含最终请求
 次数和已用重试次数，但不记录凭据或响应正文。
-若 Qwen 首轮分析包含无法从原始行、规范上下文或精确 claims 验证的数字，
-结果代理会在同一份受保护结果上发起一次有界纠正，不重查数据库；第二次
-仍不合法则改用仅由精确 claims 和原始明细生成的确定性分析正文。审计另记录
-`model_repair_count` 和 `analysis_fallback_used`。
+分析正文使用 typed layout/claim references：Qwen 只选择 claims、宿主枚举的标题/分组 token
+与 `{{claim_N}}` 顺序；标题、指标名、方向、日期与数值全部由宿主基于受保护结果精确渲染。
+自由标题/正文、数字互换、中文数词和无依据因果判断不会进入最终结果。
+结构校验失败时，结果代理会在同一份受保护结果上发起一次有界纠正，不重查数据库；
+第二次仍不合法，或纠正请求发生传输故障时，改用按 claim 类型自适应分组的宿主正文。
+审计另记录 `model_repair_count` 和 `analysis_fallback_used`。
 - `DATA_MCP_TEST_PROFILE_APP_ID` / `DATA_MCP_TEST_PROFILE_ENV_FILE`
   - Optional test-only selector. When the host-signed per-call
     `requestLarkAppId` exactly matches the configured app id, the plugin loads
