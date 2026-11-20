@@ -279,6 +279,10 @@ export class ResultStore {
     if (Number.isSafeInteger(detail?.modelRetriesUsed) && detail.modelRetriesUsed >= 0 && detail.modelRetriesUsed <= 3) {
       safeDetail.model_retries_used = detail.modelRetriesUsed;
     }
+    if (Number.isSafeInteger(detail?.modelRepairCount) && detail.modelRepairCount >= 0 && detail.modelRepairCount <= 1) {
+      safeDetail.model_repair_count = detail.modelRepairCount;
+    }
+    if (detail?.analysisFallbackUsed === true) safeDetail.analysis_fallback_used = true;
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),

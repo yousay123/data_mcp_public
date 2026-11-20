@@ -186,8 +186,12 @@ Environment contract:
 可信飞书回复通道确定性展示原始查询表格；不做口径推断。模型 endpoint/重定向、
 上下文完整性、进程隔离、附件产物等安全边界失败仍然 fail closed。
 Qwen 请求仅在传输失败、单次请求超时、HTTP 408/425/429 和 5xx 时重试；鉴权失败、
-参数错误、非法 JSON、模型协议错误与结果校验错误都会立即失败。审计记录包含最终请求
+参数错误、非法 JSON 与模型协议错误会立即失败。审计记录包含最终请求
 次数和已用重试次数，但不记录凭据或响应正文。
+若 Qwen 首轮分析包含无法从原始行、规范上下文或精确 claims 验证的数字，
+结果代理会在同一份受保护结果上发起一次有界纠正，不重查数据库；第二次
+仍不合法则改用仅由精确 claims 和原始明细生成的确定性分析正文。审计另记录
+`model_repair_count` 和 `analysis_fallback_used`。
 - `DATA_MCP_TEST_PROFILE_APP_ID` / `DATA_MCP_TEST_PROFILE_ENV_FILE`
   - Optional test-only selector. When the host-signed per-call
     `requestLarkAppId` exactly matches the configured app id, the plugin loads

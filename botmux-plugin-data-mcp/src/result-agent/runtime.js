@@ -674,9 +674,18 @@ function summaryLines(args, envelope) {
 }
 
 function numericTokens(value) {
-  return String(value || '').match(/[+-]?\d[\d,]*(?:\.\d+)?%?/g)?.map(token => (
-    token.replaceAll(',', '').replace(/^\+/, '')
-  )) || [];
+  return String(value || '').match(/[+-]?\d[\d,]*(?:\.\d+)?%?/g)?.map(token => {
+    const percent = token.endsWith('%');
+    const raw = token.replaceAll(',', '').replace(/%$/, '');
+    const parsed = parseDecimal(raw, 'result_agent_invalid_analysis_markdown');
+    let coefficient = parsed.coefficient;
+    let scale = parsed.scale;
+    while (scale > 0 && coefficient % 10n === 0n) {
+      coefficient /= 10n;
+      scale -= 1;
+    }
+    return `${coefficient}:${scale}${percent ? '%' : ''}`;
+  }) || [];
 }
 
 function authoredAnalysis(args, envelope) {
@@ -695,6 +704,14 @@ function authoredAnalysis(args, envelope) {
     throw new Error('result_agent_ungrounded_analysis');
   }
   return markdown;
+}
+
+function groundedFallbackAnalysis(args, envelope) {
+  const labels = [...new Set(args.claims
+    .map(claim => typeof claim?.column === 'string' ? displayColumnLabel(claim.column) : '')
+    .filter(Boolean))];
+  const title = labels.length ? `${labels.join('、')}概览` : '查询结果';
+  return [`# ${title}`, '', ...computedClaims(args, envelope)].join('\n');
 }
 
 function contextLines(envelope) {
@@ -865,6 +882,50 @@ function inlineDetailRequested(question) {
   return /按日|逐日|每天|逐行|明细|列表|完整(?:数据|表格)?|全部(?:数据|行)?/u.test(String(question || ''));
 }
 
+function validatedToolCalls(message, outputs, allowSemanticGap, question, envelope) {
+  const calls = Array.isArray(message?.tool_calls)
+    ? message.tool_calls.map(call => parseToolCall(call, allowSemanticGap))
+    : [];
+  if (!calls.length) throw new Error('result_agent_tool_call_required');
+  const semanticGaps = calls.filter(call => call.semanticGap);
+  if (semanticGaps.length) {
+    if (!allowSemanticGap || calls.length !== 1) throw new Error('result_agent_semantic_gap_mismatch');
+    return { calls, semanticGap: semanticGaps[0] };
+  }
+  if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
+    throw new Error('result_agent_unrequested_tool');
+  }
+  for (const output of outputs) {
+    if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
+  }
+  if (outputs.includes('analysis') && inlineDetailRequested(question)) {
+    const analysisCall = calls.find(call => call.name === 'create_analysis');
+    if (!analysisCall) throw new Error('result_agent_tool_call_mismatch');
+    const requiredRows = Math.min(envelope.rows.length, 200);
+    analysisCall.args = {
+      ...analysisCall.args,
+      table_columns: Array.isArray(analysisCall.args.table_columns) && analysisCall.args.table_columns.length
+        ? analysisCall.args.table_columns
+        : [...envelope.columns],
+      table_max_rows: Math.max(
+        Number.isSafeInteger(analysisCall.args.table_max_rows) ? analysisCall.args.table_max_rows : 0,
+        requiredRows,
+      ),
+    };
+  }
+  return { calls };
+}
+
+function combinedModelTrace(previous, next) {
+  return {
+    ...next,
+    latencyMs: (previous.latencyMs || 0) + (next.latencyMs || 0),
+    modelAttemptCount: (previous.modelAttemptCount || 0) + (next.modelAttemptCount || 0),
+    modelRetriesUsed: (previous.modelRetriesUsed || 0) + (next.modelRetriesUsed || 0),
+    modelRepairCount: (previous.modelRepairCount || 0) + 1,
+  };
+}
+
 export async function runInternalResultAgent(options) {
   const outputs = normalizedOutputs(options.requestedOutputs);
   const allowSemanticGap = options.allowSemanticGap === true;
@@ -925,19 +986,14 @@ export async function runInternalResultAgent(options) {
   } catch (error) {
     throw attachAudit(error, { ...baseAudit, ...(error?.modelTrace || {}) });
   }
-  const first = modelResponse.message;
   let calls;
   try {
-    calls = Array.isArray(first.tool_calls)
-      ? first.tool_calls.map(call => parseToolCall(call, allowSemanticGap))
-      : [];
-    if (!calls.length) throw new Error('result_agent_tool_call_required');
-    const semanticGaps = calls.filter(call => call.semanticGap);
-    if (semanticGaps.length) {
-      if (!allowSemanticGap || calls.length !== 1) throw new Error('result_agent_semantic_gap_mismatch');
+    const validated = validatedToolCalls(modelResponse.message, outputs, allowSemanticGap, options.question, envelope);
+    calls = validated.calls;
+    if (validated.semanticGap) {
       return {
         status: 'semantic_gap',
-        semanticGap: { reason: semanticGaps[0].args.reason },
+        semanticGap: { reason: validated.semanticGap.args.reason },
         artifactTypes: [],
         manifest: envelope.manifest,
         audit: {
@@ -947,32 +1003,12 @@ export async function runInternalResultAgent(options) {
         },
       };
     }
-    if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
-      throw new Error('result_agent_unrequested_tool');
-    }
-    for (const output of outputs) {
-      if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
-    }
-    if (outputs.includes('analysis') && inlineDetailRequested(options.question)) {
-      const analysisCall = calls.find(call => call.name === 'create_analysis');
-      if (!analysisCall) throw new Error('result_agent_tool_call_mismatch');
-      const requiredRows = Math.min(envelope.rows.length, 200);
-      analysisCall.args = {
-        ...analysisCall.args,
-        table_columns: Array.isArray(analysisCall.args.table_columns) && analysisCall.args.table_columns.length
-          ? analysisCall.args.table_columns
-          : [...envelope.columns],
-        table_max_rows: Math.max(
-          Number.isSafeInteger(analysisCall.args.table_max_rows) ? analysisCall.args.table_max_rows : 0,
-          requiredRows,
-        ),
-      };
-    }
   } catch (error) {
     throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
   }
-  const artifacts = [];
-  try {
+  for (let repairAttempt = 0; repairAttempt <= 2; repairAttempt += 1) {
+    const artifacts = [];
+    try {
     let analysis;
     const inline = [];
     for (const call of calls) {
@@ -1000,10 +1036,64 @@ export async function runInternalResultAgent(options) {
         status: 'succeeded',
       },
     };
-  } catch (error) {
-    for (const artifact of artifacts) {
-      try { unlinkSync(artifact.path); } catch { /* best effort */ }
+    } catch (error) {
+      for (const artifact of artifacts) {
+        try { unlinkSync(artifact.path); } catch { /* best effort */ }
+      }
+      if (error?.message !== 'result_agent_ungrounded_analysis') {
+        throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
+      }
+      if (repairAttempt === 1) {
+        const analysisCall = calls.find(call => call.name === 'create_analysis');
+        if (!analysisCall) throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
+        analysisCall.args = {
+          ...analysisCall.args,
+          analysis_markdown: groundedFallbackAnalysis(analysisCall.args, envelope),
+        };
+        modelResponse.trace = { ...modelResponse.trace, analysisFallbackUsed: true };
+        continue;
+      }
+      if (repairAttempt >= 2) throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
+      const repairMessages = [
+        ...messages,
+        modelResponse.message,
+        ...modelResponse.message.tool_calls.map(call => ({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: call.function?.name === 'create_analysis'
+            ? '数字校验失败：正文包含无法从 rows、context 或已声明 claims 验证的数字。请重新生成全部要求的工具调用；正文中的每个汇总、平均、极值、变化量和比例都必须在 claims 中声明，不得自行心算或增加新数字。'
+            : '上一轮分析校验失败，本轮请重新生成该产物调用。',
+        })),
+      ];
+      let repairedResponse;
+      try {
+        repairedResponse = await postModel(config, {
+          model: config.model,
+          temperature: 0,
+          max_tokens: 2048,
+          chat_template_kwargs: { enable_thinking: false },
+          messages: repairMessages,
+          tools,
+          tool_choice: 'required',
+        }, options.runtimeConfig, options.onTestExceptionUsed);
+      } catch (repairError) {
+        throw attachAudit(repairError, {
+          ...baseAudit,
+          ...modelResponse.trace,
+          ...(repairError?.modelTrace || {}),
+          modelRepairCount: 1,
+        });
+      }
+      repairedResponse.trace = combinedModelTrace(modelResponse.trace, repairedResponse.trace);
+      modelResponse = repairedResponse;
+      try {
+        const validated = validatedToolCalls(modelResponse.message, outputs, allowSemanticGap, options.question, envelope);
+        if (validated.semanticGap) throw new Error('result_agent_semantic_gap_mismatch');
+        calls = validated.calls;
+      } catch (validationError) {
+        throw attachAudit(validationError, { ...baseAudit, ...modelResponse.trace });
+      }
     }
-    throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
   }
+  throw attachAudit(new Error('result_agent_failed'), { ...baseAudit, ...modelResponse.trace });
 }

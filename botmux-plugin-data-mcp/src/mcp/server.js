@@ -733,6 +733,8 @@ function resultAgentAuditDetail(trace, result) {
     httpStatus: detail.httpStatus,
     modelAttemptCount: detail.modelAttemptCount,
     modelRetriesUsed: detail.modelRetriesUsed,
+    modelRepairCount: detail.modelRepairCount,
+    analysisFallbackUsed: detail.analysisFallbackUsed,
   };
 }
 

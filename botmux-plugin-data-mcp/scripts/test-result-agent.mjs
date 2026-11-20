@@ -13,7 +13,7 @@ let requests = [];
 const analysisMarkdown = [
   '# 金额趋势概览',
   '',
-  '近两日金额由 12.50 上升至 18.75，增加 6.25（50.00%）。',
+  '近两日金额由 12.500 上升至 18.750，增加 6.250（50%）。',
   '',
   '## 关注点',
   '',
@@ -133,6 +133,15 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
+    if (responseMode === 'analysis-repair') {
+      const repairing = payload.messages.some(message => message.role === 'tool');
+      const call = repairing ? toolCalls[0] : {
+        id: 'repairable', type: 'function',
+        function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], analysis_markdown: '# 汇总\n\n总额为 999999。' }) },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
     if (responseMode === 'row-count') {
       const call = {
         id: 'count', type: 'function',
@@ -191,7 +200,7 @@ if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel
 }
 for (const expected of [
   '# 金额趋势概览',
-  '由 12.50 上升至 18.75，增加 6.25（50.00%）',
+  '由 12.500 上升至 18.750，增加 6.250（50%）',
   '## 关注点',
   '不能证明因果关系',
   '## 数据明细',
@@ -361,14 +370,30 @@ if (JSON.stringify(nonAnalysisCalls).includes('18.75') || JSON.stringify(nonAnal
 }
 
 responseMode = 'analysis-ungrounded';
-let ungroundedError;
-try {
-  await runInternalResultAgent({
-    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
-  });
-} catch (error) { ungroundedError = error; }
-if (ungroundedError?.message !== 'result_agent_ungrounded_analysis') {
-  throw new Error(`ungrounded analysis must fail closed, got ${ungroundedError?.message}`);
+requests = [];
+const groundedFallback = await runInternalResultAgent({
+  result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!groundedFallback.markdown.includes('# 金额概览')
+  || groundedFallback.markdown.includes('999999')
+  || groundedFallback.audit?.modelRepairCount !== 1
+  || groundedFallback.audit?.analysisFallbackUsed !== true
+  || requests.length !== 2) {
+  throw new Error('repeated ungrounded analysis did not use the exact deterministic fallback');
+}
+
+responseMode = 'analysis-repair';
+requests = [];
+const repairedAnalysis = await runInternalResultAgent({
+  result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!repairedAnalysis.markdown.includes('# 金额趋势概览')
+  || repairedAnalysis.audit?.modelRepairCount !== 1
+  || repairedAnalysis.audit?.modelAttemptCount !== 2
+  || repairedAnalysis.audit?.modelRetriesUsed !== 0
+  || repairedAnalysis.audit?.analysisFallbackUsed === true
+  || requests.length !== 2) {
+  throw new Error('grounding repair did not recover with a complete audit trace');
 }
 for (const file of delivered.files) {
   if (!existsSync(file.path)) throw new Error(`missing generated ${file.type}`);
