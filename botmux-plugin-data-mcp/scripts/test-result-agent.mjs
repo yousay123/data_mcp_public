@@ -10,6 +10,16 @@ const root = mkdtempSync(join(tmpdir(), 'data-mcp-result-agent-'));
 const pluginHome = join(root, 'plugin-home');
 let responseMode = 'tools';
 let requests = [];
+const analysisMarkdown = [
+  '# 金额趋势概览',
+  '',
+  '近两日金额由 12.50 上升至 18.75，增加 6.25（50.00%）。',
+  '',
+  '## 关注点',
+  '',
+  '- 2026-03-02 为区间高点，2026-03-01 为区间低点。',
+  '> 数值变化本身不能证明因果关系。',
+].join('\n');
 
 const toolCalls = [
   ['call_analysis', 'create_analysis', { claims: [
@@ -19,7 +29,7 @@ const toolCalls = [
     { operation: 'minimum', column: 'amount', label_column: 'stat_date' },
     { operation: 'maximum', column: 'amount', label_column: 'stat_date' },
     { operation: 'largest_change', column: 'amount', label_column: 'stat_date' },
-  ] }],
+  ], analysis_markdown: analysisMarkdown, table_columns: ['stat_date', 'amount'], table_max_rows: 2 }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
@@ -32,7 +42,18 @@ const modelServer = createServer((req, res) => {
   req.on('end', () => {
     const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     requests.push({ payload, authorization: req.headers.authorization });
-    res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' });
+    const responseHeaders = { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' };
+    if (responseMode === 'always-503' || (responseMode === 'retry-503' && requests.length < 3)) {
+      res.writeHead(503, responseHeaders);
+      res.end(JSON.stringify({ error: { message: 'temporary unavailable' } }));
+      return;
+    }
+    if (responseMode === 'unauthorized') {
+      res.writeHead(401, responseHeaders);
+      res.end(JSON.stringify({ error: { message: 'unauthorized' } }));
+      return;
+    }
+    res.writeHead(200, responseHeaders);
     if (payload.tool_choice === 'none') {
       res.end(JSON.stringify({ choices: [{ message: { content: '已按同一查询结果生成全部产物。' } }] }));
       return;
@@ -47,6 +68,13 @@ const modelServer = createServer((req, res) => {
     }
     if (responseMode === 'excel-only') {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCalls[1]] } }] }));
+      return;
+    }
+    if (responseMode === 'retry-503') {
+      res.end(JSON.stringify({
+        id: 'resp_result_agent_retry_fixture', model: 'internal-test-model-resolved',
+        choices: [{ message: { content: null, tool_calls: [toolCalls[0]] } }],
+      }));
       return;
     }
     if (responseMode === 'semantic-gap' || responseMode === 'semantic-gap-mixed') {
@@ -84,7 +112,7 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'precision') {
       const claims = ['sum', 'average', 'minimum', 'maximum'].map(operation => ({ operation, column: 'amount' }));
       const calls = [
-        ['pa', 'create_analysis', { claims }],
+        ['pa', 'create_analysis', { claims, analysis_markdown: '# 高精度汇总\n\n已按原始精度完成聚合。' }],
         ['pd', 'create_document', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pp', 'create_pdf', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pc', 'create_chart', { type: 'bar', label_column: 'stat_date', value_column: 'amount' }],
@@ -94,7 +122,14 @@ const modelServer = createServer((req, res) => {
       return;
     }
     if (responseMode === 'invalid-decimal') {
-      const call = { id: 'bad', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      const input = JSON.parse(payload.messages.find(message => message.role === 'user').content);
+      const sum = input.rows.reduce((total, row) => total + Number(row.amount), 0).toFixed(2);
+      const call = { id: 'bad', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], analysis_markdown: `# 汇总\n\n合计为 ${sum}。` }) } };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'analysis-ungrounded') {
+      const call = { id: 'ungrounded', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], analysis_markdown: '# 汇总\n\n总额为 999999。' }) } };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
@@ -103,7 +138,7 @@ const modelServer = createServer((req, res) => {
         id: 'count', type: 'function',
         function: {
           name: 'create_analysis',
-          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }] }),
+          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }], analysis_markdown: '# 数据量\n\n查询结果为 1,261,699 行。' }),
         },
       };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
@@ -146,7 +181,7 @@ const delivered = await runInternalResultAgent({
   runtimeConfig,
   pluginHome,
 });
-if (!delivered.markdown.includes('## 查询口径')
+if (!delivered.markdown.includes('## 数据口径')
   || !delivered.markdown.includes('synthetic.events')
   || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
   throw new Error('analysis did not combine result and query scope');
@@ -155,14 +190,10 @@ if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel
   throw new Error('result Agent did not create every requested artifact');
 }
 for (const expected of [
-  '2026-03-02 为 18.75',
-  '金额（区间变化（2026-03-01 → 2026-03-02））',
-  '上升 6.25（50.00%）',
-  '金额（最小值）**：2026-03-01 为 12.50',
-  '金额（最大值）**：2026-03-02 为 18.75',
-  '金额（最大单期变化（2026-03-01 → 2026-03-02））',
-  '## 分析建议',
-  '不能单独证明因果关系',
+  '# 金额趋势概览',
+  '由 12.50 上升至 18.75，增加 6.25（50.00%）',
+  '## 关注点',
+  '不能证明因果关系',
   '## 数据明细',
   '| 日期 | 金额 |',
   '| 2026-03-01 | 12.5 |',
@@ -175,7 +206,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -186,6 +217,51 @@ if (requests.length !== 1 || requests.some(entry => entry.authorization !== 'Bea
   throw new Error('result Agent model loop or authentication is incorrect');
 }
 const firstRequest = requests[0].payload;
+
+responseMode = 'retry-503';
+requests = [];
+const retried = await runInternalResultAgent({
+  result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (requests.length !== 3
+  || retried.audit?.modelAttemptCount !== 3
+  || retried.audit?.modelRetriesUsed !== 2
+  || retried.audit?.httpStatus !== 200) {
+  throw new Error('transient model failures did not recover with bounded retries');
+}
+
+responseMode = 'unauthorized';
+requests = [];
+let unauthorizedError;
+try {
+  await runInternalResultAgent({
+    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+} catch (error) { unauthorizedError = error; }
+if (unauthorizedError?.message !== 'result_agent_http_401'
+  || requests.length !== 1
+  || unauthorizedError?.resultAgentAudit?.modelAttemptCount !== 1
+  || unauthorizedError?.resultAgentAudit?.modelRetriesUsed !== 0) {
+  throw new Error('non-retryable model authentication failure was retried');
+}
+
+responseMode = 'always-503';
+requests = [];
+let exhaustedError;
+try {
+  await runInternalResultAgent({
+    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+} catch (error) { exhaustedError = error; }
+if (exhaustedError?.message !== 'result_agent_http_503'
+  || requests.length !== 3
+  || exhaustedError?.resultAgentAudit?.modelAttemptCount !== 3
+  || exhaustedError?.resultAgentAudit?.modelRetriesUsed !== 2) {
+  throw new Error('transient model failure retry budget was not bounded');
+}
+
+responseMode = 'tools';
+requests = [];
 if (firstRequest.max_tokens !== 2048
   || firstRequest.chat_template_kwargs?.enable_thinking !== false) {
   throw new Error('result Agent did not bound output tokens and disable Qwen thinking mode');
@@ -203,6 +279,7 @@ for (const name of expectedTools) {
 const analysisTool = firstRequest.tools.find(tool => tool.function?.name === 'create_analysis');
 if (!analysisTool?.function?.parameters?.properties?.table_columns
   || !analysisTool.function.parameters.properties.table_max_rows
+  || !analysisTool.function.parameters.required.includes('analysis_markdown')
   || !firstRequest.messages.find(message => message.role === 'system')?.content?.includes('摘要不能替代明细')) {
   throw new Error('analysis tool did not expose or require inline row-detail semantics');
 }
@@ -264,11 +341,10 @@ const rowCountDelivery = await runInternalResultAgent({
   question: '查询昨天数据量', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
 for (const expected of [
-  '**数据量：1,261,699 行**',
-  '## 查询口径',
+  '查询结果为 1,261,699 行',
+  '## 数据口径',
   'DLC',
   'ksher_dim.dim_kgp_va_account',
-  'COUNT(*) AS row_count',
   "ds = '20261027'",
 ]) {
   if (!rowCountDelivery.markdown.includes(expected)) {
@@ -279,8 +355,20 @@ responseMode = 'tools';
 for (const call of firstRequest.tools) {
   if (JSON.stringify(call).includes('sql')) throw new Error('result Agent tool schema leaked SQL');
 }
-if (JSON.stringify(toolCalls).includes('18.75') || JSON.stringify(toolCalls).includes('2026-03-02')) {
-  throw new Error('Agent tool arguments copied protected row values instead of binding source columns');
+const nonAnalysisCalls = toolCalls.filter(call => call.function.name !== 'create_analysis');
+if (JSON.stringify(nonAnalysisCalls).includes('18.75') || JSON.stringify(nonAnalysisCalls).includes('2026-03-02')) {
+  throw new Error('non-analysis tool arguments copied protected row values instead of binding source columns');
+}
+
+responseMode = 'analysis-ungrounded';
+let ungroundedError;
+try {
+  await runInternalResultAgent({
+    result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+} catch (error) { ungroundedError = error; }
+if (ungroundedError?.message !== 'result_agent_ungrounded_analysis') {
+  throw new Error(`ungrounded analysis must fail closed, got ${ungroundedError?.message}`);
 }
 for (const file of delivered.files) {
   if (!existsSync(file.path)) throw new Error(`missing generated ${file.type}`);
@@ -378,7 +466,6 @@ const exactClaims = [
   '- **金额（最大值）**：9,007,199,254,740,993.00',
 ];
 for (const claim of exactClaims) {
-  if (!precision.markdown.includes(claim)) throw new Error(`missing exact analysis claim: ${claim}`);
   const document = precision.files.find(file => file.type === 'document');
   if (!readFileSync(document.path, 'utf8').includes(claim)) throw new Error(`missing exact document claim: ${claim}`);
   const pdf = precision.files.find(file => file.type === 'pdf');
@@ -402,7 +489,7 @@ const decimalResult = {
 const decimalSum = await runInternalResultAgent({
   result: decimalResult, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!decimalSum.markdown.includes('金额（合计）**：0.30')) {
+if (!decimalSum.markdown.includes('合计为 0.30')) {
   throw new Error(`decimal addition lost scale or precision: ${decimalSum.markdown}`);
 }
 const negativeSum = await runInternalResultAgent({
@@ -417,7 +504,7 @@ const negativeSum = await runInternalResultAgent({
   },
   question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!negativeSum.markdown.includes('金额（合计）**：-5.00')) {
+if (!negativeSum.markdown.includes('合计为 -5.00')) {
   throw new Error(`negative decimal aggregation is incorrect: ${negativeSum.markdown}`);
 }
 for (const invalid of ['not-a-number', 9007199254740992]) {
@@ -456,7 +543,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

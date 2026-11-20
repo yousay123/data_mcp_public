@@ -19,7 +19,7 @@ let modelSawSentinel = false;
 let modelSawAuth = false;
 let modelSawLimitEvidence = false;
 let queryCount = 0;
-let failNextModelCall = false;
+let failedModelCallsRemaining = 0;
 
 const runResult = {
   status: 'success', query_id: 'q_internal', row_count: 2,
@@ -71,8 +71,8 @@ const modelServer = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
-    if (failNextModelCall) {
-      failNextModelCall = false;
+    if (failedModelCallsRemaining > 0) {
+      failedModelCallsRemaining -= 1;
       res.writeHead(503, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'synthetic provider failure' }));
       return;
@@ -96,7 +96,10 @@ const modelServer = createServer((req, res) => {
         { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
         { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
       ];
-      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
+        claims: [{ operation: 'sum', column: 'amount' }],
+        analysis_markdown: '# 合成结果\n\n合计为 30。',
+      }) } };
       const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
       res.end(JSON.stringify({
         id: 'resp_delivery_fixture', model: 'internal-test-model-resolved',
@@ -197,7 +200,7 @@ const hostDelivery = response => response?.result?._meta?.botmuxHostDelivery;
 const analysisDelivery = hostDelivery(byId.get(1));
 const analysisVisible = JSON.stringify(byId.get(1)?.result?.content ?? {});
 if (toolPayload(byId.get(1)).status !== 'delivery_requested'
-  || !analysisDelivery?.markdown?.includes('金额（合计）')
+  || !analysisDelivery?.markdown?.includes('# 合成结果')
   || !analysisDelivery.markdown.includes('30')) {
   throw new Error('analysis was not wrapped for trusted host delivery');
 }
@@ -262,7 +265,21 @@ if (toolPayload(rejected[0]).status !== 'delivery_requested'
   throw new Error('scheduled result was not safely handed to the host identity boundary');
 }
 
-failNextModelCall = true;
+failedModelCallsRemaining = 1;
+const transientAgentFailure = await runPlugin([{
+  name: 'deliver_query_result_for_user',
+  arguments: {
+    sql: 'SELECT amount FROM fixture', query_plan_id: 'transient-agent',
+    output_mode: 'analysis', question: '验证模型瞬时故障自动恢复',
+  },
+  _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_transient' } },
+}]);
+if (toolPayload(transientAgentFailure[0]).status !== 'delivery_requested'
+  || !hostDelivery(transientAgentFailure[0])?.markdown?.includes('# 合成结果')) {
+  throw new Error('transient result Agent failure did not recover automatically');
+}
+
+failedModelCallsRemaining = 3;
 const agentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -289,7 +306,7 @@ if (toolPayload(recoveredFromBoundResult[0]).status !== 'delivery_requested'
   throw new Error('result was not reusable without requery after the initial model failure');
 }
 
-failNextModelCall = true;
+failedModelCallsRemaining = 3;
 const nonFallbackAgentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -343,22 +360,26 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v5'
+  && row.prompt_template_version === 'result-agent-tool-contract-v6'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
   && row.input_row_count === 2
   && row.http_status === 200
+  && Number.isSafeInteger(row.model_attempt_count)
+  && Number.isSafeInteger(row.model_retries_used)
   && Number.isSafeInteger(row.latency_ms))) {
   throw new Error('successful result Agent call did not emit the complete privacy-safe audit trace');
 }
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v5'
+  && row.prompt_template_version === 'result-agent-tool-contract-v6'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503
+  && row.model_attempt_count === 3
+  && row.model_retries_used === 2
   && Number.isSafeInteger(row.latency_ms))) {
   throw new Error('failed result Agent call did not emit its privacy-safe request trace');
 }

@@ -20,7 +20,10 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v5';
+const DEFAULT_MODEL_MAX_ATTEMPTS = 3;
+const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 8_000;
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v6';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
   'missing_metric',
@@ -53,13 +56,39 @@ function modelConfig(runtimeConfig) {
     || !allowedHosts.has(endpoint.hostname.toLowerCase())) {
     throw new Error('result_agent_endpoint_not_allowed');
   }
-  return { endpoint, model, apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY') };
+  const boundedInteger = (name, fallback, minimum, maximum) => {
+    const raw = runtimeConfig.value(name);
+    if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+      throw new Error('result_agent_invalid_retry_config');
+    }
+    return parsed;
+  };
+  return {
+    endpoint,
+    model,
+    apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY'),
+    maxAttempts: boundedInteger('DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS', DEFAULT_MODEL_MAX_ATTEMPTS, 1, 4),
+    retryBaseDelayMs: boundedInteger('DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS', DEFAULT_MODEL_RETRY_BASE_DELAY_MS, 0, 2_000),
+    requestTimeoutMs: boundedInteger('DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS', DEFAULT_MODEL_REQUEST_TIMEOUT_MS, 1_000, 20_000),
+  };
 }
 
-async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
+function modelRequestRetryable(error) {
+  if (error?.message === 'result_agent_timeout' || error?.message === 'result_agent_network_error') return true;
+  const match = /^result_agent_http_([1-5][0-9]{2})$/.exec(error?.message || '');
+  if (!match) return false;
+  const status = Number(match[1]);
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryDelay(ms) {
+  return ms > 0 ? new Promise(resolvePromise => setTimeout(resolvePromise, ms)) : Promise.resolve();
+}
+
+async function postModelAttempt(config, body, runtimeConfig, onTestExceptionUsed) {
   const startedAt = Date.now();
-  const body = JSON.stringify(payload);
-  if (Buffer.byteLength(body) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const pinned = await resolvePrivateModelAddress(config.endpoint.hostname, undefined, {
     testException: runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION'),
     onTestExceptionUsed,
@@ -85,8 +114,11 @@ async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
         text: Buffer.concat(chunks).toString('utf8'),
       }));
     });
-    req.setTimeout(60_000, () => req.destroy(new Error('result_agent_timeout')));
-    req.on('error', rejectPromise);
+    req.setTimeout(config.requestTimeoutMs, () => req.destroy(new Error('result_agent_timeout')));
+    req.on('error', error => {
+      if (error?.message === 'result_agent_timeout') rejectPromise(error);
+      else rejectPromise(new Error('result_agent_network_error'));
+    });
     req.end(body);
   });
   const responseTrace = {
@@ -121,6 +153,37 @@ async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
       httpStatus: responseTrace.httpStatus,
     },
   };
+}
+
+async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
+  const body = JSON.stringify(payload);
+  if (Buffer.byteLength(body) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
+  const startedAt = Date.now();
+  for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
+    try {
+      const response = await postModelAttempt(config, body, runtimeConfig, onTestExceptionUsed);
+      return {
+        ...response,
+        trace: {
+          ...response.trace,
+          latencyMs: Date.now() - startedAt,
+          modelAttemptCount: attempt,
+          modelRetriesUsed: attempt - 1,
+        },
+      };
+    } catch (error) {
+      const trace = {
+        ...(error?.modelTrace || {}),
+        latencyMs: Date.now() - startedAt,
+        modelAttemptCount: attempt,
+        modelRetriesUsed: attempt - 1,
+      };
+      if (error instanceof Error) error.modelTrace = trace;
+      if (!modelRequestRetryable(error) || attempt >= config.maxAttempts) throw error;
+      await retryDelay(config.retryBaseDelayMs * (2 ** (attempt - 1)));
+    }
+  }
+  throw new Error('result_agent_network_error');
 }
 
 function columnNames(result) {
@@ -448,10 +511,12 @@ function markdownTableCell(value) {
 
 function queryContextLines(envelope) {
   const context = envelope.manifest.context;
+  const metricColumns = context.metric_columns.length
+    ? context.metric_columns
+    : envelope.columns.filter(column => !context.grouping_columns.includes(column));
   const rows = [
-    ['数据源', String(context.datasource).toUpperCase()],
-    ['数据表', context.tables.join('、')],
-    ['统计口径', context.metric_expressions.join('、')],
+    ['数据范围', `${String(context.datasource).toUpperCase()} · ${context.tables.join('、')}`],
+    ...(metricColumns.length ? [['指标', metricColumns.map(displayColumnLabel).join('、')]] : []),
   ];
   if (context.time_range_predicates.length) {
     rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
@@ -460,9 +525,11 @@ function queryContextLines(envelope) {
     predicate => !context.time_range_predicates.includes(predicate),
   );
   if (otherFilters.length) rows.push(['其他过滤', otherFilters.join(' AND ')]);
-  if (context.grouping_columns.length) rows.push(['分组字段', context.grouping_columns.join('、')]);
+  if (context.grouping_columns.length) {
+    rows.push(['分组维度', context.grouping_columns.map(displayColumnLabel).join('、')]);
+  }
   return [
-    '## 查询口径',
+    '## 数据口径',
     '',
     '| 口径项 | 内容 |',
     '| --- | --- |',
@@ -606,6 +673,30 @@ function summaryLines(args, envelope) {
   return lines;
 }
 
+function numericTokens(value) {
+  return String(value || '').match(/[+-]?\d[\d,]*(?:\.\d+)?%?/g)?.map(token => (
+    token.replaceAll(',', '').replace(/^\+/, '')
+  )) || [];
+}
+
+function authoredAnalysis(args, envelope) {
+  const markdown = boundedString(args.analysis_markdown, 6_000, 'result_agent_invalid_analysis_markdown');
+  if (/<\/?(?:script|style|iframe)\b|javascript:|file:\/\//iu.test(markdown)) {
+    throw new Error('result_agent_invalid_analysis_markdown');
+  }
+  const exactClaims = computedClaims(args, envelope);
+  const allowedNumbers = new Set(numericTokens([
+    JSON.stringify(envelope.rows),
+    JSON.stringify(envelope.manifest.context),
+    exactClaims.join('\n'),
+    envelope.rows.length,
+  ].join('\n')));
+  if (numericTokens(markdown).some(token => !allowedNumbers.has(token))) {
+    throw new Error('result_agent_ungrounded_analysis');
+  }
+  return markdown;
+}
+
 function contextLines(envelope) {
   const lines = [...queryContextLines(envelope), ''];
   const notice = scopeNotice(envelope.manifest);
@@ -614,15 +705,15 @@ function contextLines(envelope) {
 }
 
 function executeAnalysis(args, envelope) {
-  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
+  assertOnlyKeys(args, new Set(['claims', 'analysis_markdown', 'table_columns', 'table_max_rows']));
   if (!Array.isArray(args.claims) || !args.claims.length) throw new Error('result_agent_invalid_claims');
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
   if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_plan');
-  const lines = summaryLines(args, envelope);
+  const lines = [authoredAnalysis(args, envelope), ''];
   lines.push(...tableLines(args, envelope, maxRows));
   return {
     type: 'analysis',
-    markdown: `# ${lines.shift()}\n\n${lines.join('\n')}\n`,
+    markdown: `${lines.join('\n')}\n`,
     contextMarkdown: contextLines(envelope).join('\n'),
   };
 }
@@ -706,8 +797,15 @@ function toolDefinitions(allowSemanticGap = false) {
     table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
+  const analysisProperties = {
+    ...documentProperties,
+    analysis_markdown: {
+      type: 'string', minLength: 1, maxLength: 6000,
+      description: 'User-facing Markdown authored from the protected rows and exact claims. Be concise, question-specific, and professional. Do not include the detail table or query scope; the tool appends them. Do not add unrequested fields or unsupported causes.',
+    },
+  };
   const tools = [
-    { type: 'function', function: { name: 'create_analysis', description: 'Create a decision-oriented inline analysis from source-bound claims. When the user asks for per-day, row-level, detail, list, or full-table output, include table_columns and table_max_rows so the inline answer contains the requested rows. For ordered series, prefer latest, change, minimum/maximum with label_column, and largest_change. The tool owns all rendered wording; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties, required: ['claims'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Author the user-facing Markdown analysis and bind every numeric statement to source-derived claims. Match the user question instead of using a generic template. When the user asks for per-day, row-level, detail, list, or full-table output, include only the requested table_columns and enough table_max_rows. Do not add convenience or derived fields the user did not request.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['claims', 'analysis_markdown'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
@@ -789,9 +887,11 @@ export async function runInternalResultAgent(options) {
           ? '如果现有结果可以回答，只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。'
           : '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
-        '工具不接受标题、段落、标签、文件名等自由文本。你只能选择列、聚合、趋势证据、图表类型和版式；全部数据事实与展示文字由工具从 rows 计算或使用固定模板。',
+        'create_analysis 必须使用 analysis_markdown 撰写面向用户的专业 Markdown 正文，根据问题选择结构和表达，不得套用固定模板。所有数值必须能从 rows、context 或 claims 精确推导，不得猜测原因。',
+        '除 create_analysis 外，产物工具不接受标题、段落、标签、文件名等自由文本；表格、图表和文件的数据必须从同一份 rows 绑定生成。',
         '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
         '用户要求“按日”、“逐行”、“明细”、“列表”或“完整表格”时，create_analysis 必须选择必要的 table_columns，table_max_rows 必须覆盖用户要求的行数；摘要不能替代明细。',
+        '只返回用户明确要求或计算指标必需的列；不得自行增加工作日/周末、排名、状态标签或其他便利派生字段。',
         '必须保留口径、时间范围、单位、过滤条件、截断和质量提示；不得输出 SQL、身份、凭据或本机路径。',
         ...(allowSemanticGap ? [
           '这是基于已绑定结果的追问。如果现有 rows、schema 与 context 无法回答且必须重新查询数据库，只调用 report_semantic_gap 一次，不调用任何产物工具；不得猜测、自动补查或扩大口径。',

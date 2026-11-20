@@ -49,7 +49,7 @@ const modelServer = createServer((req, res) => {
     const envelope = JSON.parse(payload.messages.find(message => message.role === 'user').content);
     modelRows = envelope.rows;
     const calls = [
-      ['analysis', 'create_analysis', { claims }],
+      ['analysis', 'create_analysis', { claims, analysis_markdown: '# 精确结果\n\n已保留原始数值精度。' }],
       ['excel', 'create_excel', { sheets: [{ columns: ['amount', 'event_id'] }] }],
       ['pdf', 'create_pdf', { claims, table_columns: ['amount', 'event_id'] }],
       ['chart', 'create_chart', { type: 'bar', label_column: 'event_id', value_column: 'amount' }],

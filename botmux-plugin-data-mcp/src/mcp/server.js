@@ -731,6 +731,8 @@ function resultAgentAuditDetail(trace, result) {
     inputRowCount: detail.inputRowCount,
     latencyMs: detail.latencyMs,
     httpStatus: detail.httpStatus,
+    modelAttemptCount: detail.modelAttemptCount,
+    modelRetriesUsed: detail.modelRetriesUsed,
   };
 }
 
@@ -742,9 +744,13 @@ function resultAgentAuditStatus(error) {
     'result_agent_payload_too_large',
     'result_agent_invalid_json',
     'result_agent_invalid_response',
+    'result_agent_invalid_retry_config',
+    'result_agent_network_error',
     'result_agent_context_invalid',
     'result_agent_schema_missing',
     'result_agent_invalid_rows',
+    'result_agent_invalid_analysis_markdown',
+    'result_agent_ungrounded_analysis',
     'result_agent_timeout',
     'result_agent_ipc_payload_too_large',
     'result_agent_ipc_invalid_response',

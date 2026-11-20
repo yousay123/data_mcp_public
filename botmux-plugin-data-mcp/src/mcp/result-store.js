@@ -273,6 +273,12 @@ export class ResultStore {
     if (Number.isSafeInteger(detail?.httpStatus) && detail.httpStatus >= 100 && detail.httpStatus <= 599) {
       safeDetail.http_status = detail.httpStatus;
     }
+    if (Number.isSafeInteger(detail?.modelAttemptCount) && detail.modelAttemptCount >= 1 && detail.modelAttemptCount <= 4) {
+      safeDetail.model_attempt_count = detail.modelAttemptCount;
+    }
+    if (Number.isSafeInteger(detail?.modelRetriesUsed) && detail.modelRetriesUsed >= 0 && detail.modelRetriesUsed <= 3) {
+      safeDetail.model_retries_used = detail.modelRetriesUsed;
+    }
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),

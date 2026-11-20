@@ -95,7 +95,11 @@ When the user names a table directly:
    a DLC query failure.
 4. Check partitions and row scale before large reads.
 5. Apply explicit date, region, and business filters.
-6. Prefer small previews before exports.
+6. Project only the dimensions and metrics the user explicitly requested, plus
+   columns strictly required to compute them. Do not add convenience or derived
+   fields such as `day_type`, weekday/weekend labels, rankings, status labels,
+   or diagnostic columns unless the user asks for them.
+7. Prefer small previews before exports.
 
 ## Result artifacts
 
@@ -117,11 +121,12 @@ When the user names a table directly:
    quoted-message tools, so direct delivery is limited to synthetic test data
    until host-side filtering or the protected result-page flow is restored.
 5. All artifacts from one request must bind values to the same protected rows
-   and schema. The Agent chooses columns, aggregations, chart type, and layout,
-   but tool arguments accept no free-text titles, paragraphs, labels,
-   annotations, sheet names, filenames, or rewritten raw values. Controlled
-   templates render all wording, and source-bound numeric claims use
-   arbitrary-precision decimal computation.
+   and schema. The internal result model authors the user-facing analysis
+   Markdown through `create_analysis`; Data MCP validates that its numeric
+   statements are grounded in rows, canonical context, or exact claims. Other
+   artifact tools remain source-bound and do not accept free-text titles,
+   annotations, sheet names, filenames, or rewritten raw values. Source-bound
+   numeric claims use arbitrary-precision decimal computation.
 6. When the user asks for one or more files, use `requested_outputs` in
    dual-model mode. In single-model mode, use the calling model's own artifact
    skill/tool after `run_query_for_user`.

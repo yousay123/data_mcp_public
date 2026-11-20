@@ -160,6 +160,19 @@ Environment contract:
 - `DATA_MCP_RESULT_MODEL`
   - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`
+  - Optional internal endpoint credential. Keep it only in the host-only file
+    selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
+    process environment.
+- `DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS`
+  - Total Qwen request attempts, default `3`, allowed `1` to `4`.
+- `DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS`
+  - Exponential retry base delay, default `250` ms, allowed `0` to `2000` ms.
+- `DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS`
+  - Per-attempt timeout, default `8000` ms, allowed `1000` to `20000` ms. The
+    isolated result-agent process still has a 30-second overall deadline.
+- `DATA_MCP_RESULT_BINDING_HMAC_KEY`
+  - Required, host-only secret of at least 32 characters for interactive result
+    bindings. Missing keys fail closed. Keep it in the same host-only env file.
 
 结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
 55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
@@ -170,12 +183,9 @@ Environment contract:
 每个单元格都是有界标量，且失败属于模型未配置、超时或 5xx 时，插件才会通过既有
 可信飞书回复通道确定性展示原始查询表格；不做口径推断。模型 endpoint/重定向、
 上下文完整性、进程隔离、附件产物等安全边界失败仍然 fail closed。
-  - Optional internal endpoint credential. Keep it only in the host-only file
-    selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
-    process environment.
-- `DATA_MCP_RESULT_BINDING_HMAC_KEY`
-  - Required, host-only secret of at least 32 characters for interactive result
-    bindings. Missing keys fail closed. Keep it in the same host-only env file.
+Qwen 请求仅在传输失败、单次请求超时、HTTP 408/425/429 和 5xx 时重试；鉴权失败、
+参数错误、非法 JSON、模型协议错误与结果校验错误都会立即失败。审计记录包含最终请求
+次数和已用重试次数，但不记录凭据或响应正文。
 - `DATA_MCP_TEST_PROFILE_APP_ID` / `DATA_MCP_TEST_PROFILE_ENV_FILE`
   - Optional test-only selector. When the host-signed per-call
     `requestLarkAppId` exactly matches the configured app id, the plugin loads
@@ -232,10 +242,13 @@ plugin should migrate from the process environment to that value.
 requested output types. It reuses the caller-bound stored rows/schema/context
 without rerunning the query. The internal result Agent must call the matching
 analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
-stored result. Artifact tools accept no model-authored titles, paragraphs,
-labels, annotations, sheet names, or filenames. The model selects only columns,
-source-bound summary/trend operations, chart type, and layout; controlled templates render every word,
-and arbitrary-precision decimal arithmetic computes every numerical claim.
+stored result. `create_analysis` accepts question-specific model-authored
+Markdown, rejects ungrounded numeric statements, and appends source-bound detail
+and query scope. File and chart tools accept no model-authored titles,
+paragraphs, labels, annotations, sheet names, filenames, or rewritten values;
+the model selects only columns, source-bound summary/trend operations, chart
+type, and layout. Arbitrary-precision decimal arithmetic computes every
+numerical claim.
 The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
 so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per
 trusted turn id, only one follow-up call is accepted. Agent text and files are replied

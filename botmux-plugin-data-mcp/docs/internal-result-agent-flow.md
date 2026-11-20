@@ -17,13 +17,15 @@ The dual-model delivery path has one owner for each responsibility:
    `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or
    `create_document` tools.
 6. Artifact tools bind values to the same protected rows and schema. The Agent
-   chooses columns, aggregations, chart type, and layout but cannot supply raw
-   values or any free-text title, paragraph, label, annotation, sheet name, or
-   filename. Controlled templates render every word. Numeric claims declare a
-   source column and a summary or ordered-series operation (including latest,
-   interval change, labelled extrema, and largest adjacent change) and are
-   calculated with arbitrary-precision decimal arithmetic, preserving the
-   source Decimal scale and deterministic average rounding.
+   authors question-specific Markdown only through `create_analysis`; the tool
+   rejects unsupported numeric statements and appends the source-bound detail
+   table and compact query scope. Other artifact tools cannot accept raw values
+   or free-text titles, paragraphs, labels, annotations, sheet names, or
+   filenames. Numeric claims declare a source column and a summary or
+   ordered-series operation (including latest, interval change, labelled
+   extrema, and largest adjacent change) and are calculated with
+   arbitrary-precision decimal arithmetic, preserving the source Decimal scale
+   and deterministic average rounding.
 7. Charts are rendered inline as Feishu-native Vega-Lite card content. The
    Agent process stages only requested file artifacts, the trusted delivery
    layer verifies caller/session/app binding, and Botmux sends the result to the
