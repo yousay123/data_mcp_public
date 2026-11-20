@@ -279,7 +279,7 @@ if (toolPayload(transientAgentFailure[0]).status !== 'delivery_requested'
   throw new Error('transient result Agent failure did not recover automatically');
 }
 
-failedModelCallsRemaining = 3;
+failedModelCallsRemaining = 2;
 const agentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -306,7 +306,7 @@ if (toolPayload(recoveredFromBoundResult[0]).status !== 'delivery_requested'
   throw new Error('result was not reusable without requery after the initial model failure');
 }
 
-failedModelCallsRemaining = 3;
+failedModelCallsRemaining = 2;
 const nonFallbackAgentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -378,8 +378,8 @@ if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503
-  && row.model_attempt_count === 3
-  && row.model_retries_used === 2
+  && row.model_attempt_count === 2
+  && row.model_retries_used === 1
   && Number.isSafeInteger(row.latency_ms))) {
   throw new Error('failed result Agent call did not emit its privacy-safe request trace');
 }

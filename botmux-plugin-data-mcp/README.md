@@ -164,12 +164,12 @@ Environment contract:
     selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; the plugin rejects it in the
     process environment.
 - `DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS`
-  - Total Qwen request attempts, default `3`, allowed `1` to `4`.
+  - Total Qwen request attempts, default `2`, allowed `1` to `4`.
 - `DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS`
   - Exponential retry base delay, default `250` ms, allowed `0` to `2000` ms.
 - `DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS`
-  - Per-attempt timeout, default `8000` ms, allowed `1000` to `20000` ms. The
-    isolated result-agent process still has a 30-second overall deadline.
+  - Per-attempt timeout, default `25000` ms, allowed `1000` to `30000` ms. The
+    isolated result-agent process has a 55-second overall deadline.
 - `DATA_MCP_RESULT_BINDING_HMAC_KEY`
   - Required, host-only secret of at least 32 characters for interactive result
     bindings. Missing keys fail closed. Keep it in the same host-only env file.

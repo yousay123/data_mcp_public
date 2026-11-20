@@ -43,7 +43,7 @@ const modelServer = createServer((req, res) => {
     const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     requests.push({ payload, authorization: req.headers.authorization });
     const responseHeaders = { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' };
-    if (responseMode === 'always-503' || (responseMode === 'retry-503' && requests.length < 3)) {
+    if (responseMode === 'always-503' || (responseMode === 'retry-503' && requests.length < 2)) {
       res.writeHead(503, responseHeaders);
       res.end(JSON.stringify({ error: { message: 'temporary unavailable' } }));
       return;
@@ -223,9 +223,9 @@ requests = [];
 const retried = await runInternalResultAgent({
   result, question: '生成分析', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (requests.length !== 3
-  || retried.audit?.modelAttemptCount !== 3
-  || retried.audit?.modelRetriesUsed !== 2
+if (requests.length !== 2
+  || retried.audit?.modelAttemptCount !== 2
+  || retried.audit?.modelRetriesUsed !== 1
   || retried.audit?.httpStatus !== 200) {
   throw new Error('transient model failures did not recover with bounded retries');
 }
@@ -254,9 +254,9 @@ try {
   });
 } catch (error) { exhaustedError = error; }
 if (exhaustedError?.message !== 'result_agent_http_503'
-  || requests.length !== 3
-  || exhaustedError?.resultAgentAudit?.modelAttemptCount !== 3
-  || exhaustedError?.resultAgentAudit?.modelRetriesUsed !== 2) {
+  || requests.length !== 2
+  || exhaustedError?.resultAgentAudit?.modelAttemptCount !== 2
+  || exhaustedError?.resultAgentAudit?.modelRetriesUsed !== 1) {
   throw new Error('transient model failure retry budget was not bounded');
 }
 

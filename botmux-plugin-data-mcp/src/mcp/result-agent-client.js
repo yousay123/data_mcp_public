@@ -4,8 +4,10 @@ import { fileURLToPath } from 'node:url';
 const MAX_IPC_BYTES = 6 * 1024 * 1024;
 // Keep the inner model deadline below the host tool-call deadline. This makes
 // failures observable here instead of leaving the caller with an ambiguous
-// 60-second timeout while the isolated child is still running.
-const AGENT_TIMEOUT_MS = 30_000;
+// 60-second timeout while the isolated child is still running. The result
+// model historically needs up to roughly 23 seconds, so preserve enough room
+// for one full attempt plus one bounded retry.
+const AGENT_TIMEOUT_MS = 55_000;
 const workerPath = fileURLToPath(new URL('../result-agent/worker.js', import.meta.url));
 const CONFIG_KEYS = [
   'DATA_MCP_RESULT_MODEL_ENDPOINT',

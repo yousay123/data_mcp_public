@@ -20,9 +20,9 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const DEFAULT_MODEL_MAX_ATTEMPTS = 3;
+const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
-const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 8_000;
+const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 25_000;
 const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v6';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
@@ -71,7 +71,7 @@ function modelConfig(runtimeConfig) {
     apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY'),
     maxAttempts: boundedInteger('DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS', DEFAULT_MODEL_MAX_ATTEMPTS, 1, 4),
     retryBaseDelayMs: boundedInteger('DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS', DEFAULT_MODEL_RETRY_BASE_DELAY_MS, 0, 2_000),
-    requestTimeoutMs: boundedInteger('DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS', DEFAULT_MODEL_REQUEST_TIMEOUT_MS, 1_000, 20_000),
+    requestTimeoutMs: boundedInteger('DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS', DEFAULT_MODEL_REQUEST_TIMEOUT_MS, 1_000, 30_000),
   };
 }
 
