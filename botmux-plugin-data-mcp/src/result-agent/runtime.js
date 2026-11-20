@@ -20,7 +20,7 @@ const OUTPUT_BY_TOOL = Object.freeze(Object.fromEntries(
 const MAX_MODEL_PAYLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_ARTIFACTS = 6;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v4';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v5';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
   'missing_metric',
@@ -763,6 +763,10 @@ function normalizedOutputs(requestedOutputs) {
   return outputs;
 }
 
+function inlineDetailRequested(question) {
+  return /按日|逐日|每天|逐行|明细|列表|完整(?:数据|表格)?|全部(?:数据|行)?/u.test(String(question || ''));
+}
+
 export async function runInternalResultAgent(options) {
   const outputs = normalizedOutputs(options.requestedOutputs);
   const allowSemanticGap = options.allowSemanticGap === true;
@@ -848,6 +852,21 @@ export async function runInternalResultAgent(options) {
     }
     for (const output of outputs) {
       if (calls.filter(call => call.output === output).length !== 1) throw new Error('result_agent_tool_call_mismatch');
+    }
+    if (outputs.includes('analysis') && inlineDetailRequested(options.question)) {
+      const analysisCall = calls.find(call => call.name === 'create_analysis');
+      if (!analysisCall) throw new Error('result_agent_tool_call_mismatch');
+      const requiredRows = Math.min(envelope.rows.length, 200);
+      analysisCall.args = {
+        ...analysisCall.args,
+        table_columns: Array.isArray(analysisCall.args.table_columns) && analysisCall.args.table_columns.length
+          ? analysisCall.args.table_columns
+          : [...envelope.columns],
+        table_max_rows: Math.max(
+          Number.isSafeInteger(analysisCall.args.table_max_rows) ? analysisCall.args.table_max_rows : 0,
+          requiredRows,
+        ),
+      };
     }
   } catch (error) {
     throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });

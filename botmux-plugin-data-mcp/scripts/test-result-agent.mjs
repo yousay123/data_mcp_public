@@ -19,7 +19,7 @@ const toolCalls = [
     { operation: 'minimum', column: 'amount', label_column: 'stat_date' },
     { operation: 'maximum', column: 'amount', label_column: 'stat_date' },
     { operation: 'largest_change', column: 'amount', label_column: 'stat_date' },
-  ], table_columns: ['stat_date', 'amount'], table_max_rows: 2 }],
+  ] }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
@@ -141,7 +141,7 @@ const result = {
 
 const delivered = await runInternalResultAgent({
   result,
-  question: '生成分析、Excel、PDF、图表和文档',
+  question: '按日返回完整明细，并生成分析、Excel、PDF、图表和文档',
   requestedOutputs: ['analysis', 'excel', 'pdf', 'chart', 'document'],
   runtimeConfig,
   pluginHome,
@@ -175,7 +175,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -456,7 +456,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
