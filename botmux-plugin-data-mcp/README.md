@@ -250,9 +250,10 @@ plugin should migrate from the process environment to that value.
 requested output types. It reuses the caller-bound stored rows/schema/context
 without rerunning the query. The internal result Agent must call the matching
 analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
-stored result. `create_analysis` accepts question-specific model-authored
-Markdown, rejects ungrounded numeric statements, and appends source-bound detail
-and query scope. File and chart tools accept no model-authored titles,
+stored result. `create_analysis` accepts typed claim, insight, and layout
+selections; the host computes every displayed fact and analytical conclusion
+from protected rows, then appends source-bound detail and a complete query-scope
+table. File and chart tools accept no model-authored titles,
 paragraphs, labels, annotations, sheet names, filenames, or rewritten values;
 the model selects only columns, source-bound summary/trend operations, chart
 type, and layout. Arbitrary-precision decimal arithmetic computes every

@@ -26,6 +26,13 @@ const analysisMarkdown = [
   '{{claim_2}}',
   '{{claim_3}}',
   '{{claim_6}}',
+  '',
+  '{{section_key_findings}}',
+  '',
+  '{{insight_1}}',
+  '{{insight_2}}',
+  '{{insight_3}}',
+  '{{insight_4}}',
 ].join('\n');
 
 const toolCalls = [
@@ -36,6 +43,11 @@ const toolCalls = [
     { operation: 'minimum', column: 'amount', label_column: 'stat_date' },
     { operation: 'maximum', column: 'amount', label_column: 'stat_date' },
     { operation: 'largest_change', column: 'amount', label_column: 'stat_date' },
+  ], insights: [
+    { kind: 'period_change', column: 'amount', label_column: 'stat_date' },
+    { kind: 'latest_vs_average', column: 'amount', label_column: 'stat_date' },
+    { kind: 'range', column: 'amount', label_column: 'stat_date' },
+    { kind: 'largest_change', column: 'amount', label_column: 'stat_date' },
   ], analysis_markdown: analysisMarkdown, table_columns: ['stat_date', 'amount'], table_max_rows: 2 }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
@@ -175,6 +187,77 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
+    if (responseMode === 'temporal-insights' || responseMode === 'rounding-insight') {
+      const insights = responseMode === 'temporal-insights'
+        ? [
+            { kind: 'period_change', column: 'amount', label_column: 'stat_date' },
+            { kind: 'latest_vs_average', column: 'amount', label_column: 'stat_date' },
+            { kind: 'largest_change', column: 'amount', label_column: 'stat_date' },
+          ]
+        : [{ kind: 'latest_vs_average', column: 'amount', label_column: 'stat_date' }];
+      const call = {
+        id: 'insights', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            claims: [{ operation: 'count' }],
+            insights,
+            analysis_markdown: [
+              '{{title_analysis}}', '{{section_overview}}', '{{claim_1}}',
+              '{{section_key_findings}}',
+              ...insights.map((_, index) => `{{insight_${index + 1}}}`),
+            ].join('\n'),
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'range-label-injection') {
+      const call = {
+        id: 'range-injection', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            claims: [{ operation: 'count' }],
+            insights: [{ kind: 'range', column: 'amount', label_column: 'note' }],
+            analysis_markdown: '{{title_analysis}}\n{{section_overview}}\n{{claim_1}}\n{{section_key_findings}}\n{{insight_1}}',
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'invalid-insight-plan') {
+      const call = {
+        id: 'invalid-insight', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            claims: [{ operation: 'count' }],
+            insights: [{ kind: 'range', column: 'merchant_name' }],
+            analysis_markdown: '{{title_analysis}}\n{{section_overview}}\n{{claim_1}}\n{{section_key_findings}}\n{{insight_1}}',
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'invalid-claim-plan') {
+      const call = {
+        id: 'invalid-claim', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            claims: [{ operation: 'latest', column: 'amount', label_column: 'stat_date' }],
+            insights: [],
+            analysis_markdown: '{{title_analysis}}\n{{section_latest_change}}\n{{claim_1}}',
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
     res.end(JSON.stringify({
       id: 'resp_result_agent_fixture', model: 'internal-test-model-resolved',
       choices: [{ message: { content: null, tool_calls: toolCalls } }],
@@ -224,6 +307,15 @@ for (const expected of [
   '# 金额分析',
   '**金额（区间变化（2026-03-01 → 2026-03-02））**：上升 6.25（50.00%）',
   '## 趋势与变化',
+  '## 分析结论',
+  '**首尾趋势**：金额从2026-03-01 的 12.50变为2026-03-02 的 18.75，增加 6.25（50.00%）',
+  '**最新水平**：2026-03-02 的 金额为 18.75，高于观察期平均值 15.625，差值 3.125（20.00%）',
+  '**波动范围**：金额最高为 18.75（2026-03-02），最低为 12.50（2026-03-01），极差为 6.25',
+  '**最大单期变化**：2026-03-01至2026-03-02，金额增加 6.25',
+  '| 指标 | 金额 |',
+  '| 返回覆盖时间 | 2026-03-01 至 2026-03-02（根据返回结果推导） |',
+  '| 结果粒度 | 日期 |',
+  '| 返回行数 | 2 行 |',
   '## 数据明细',
   '| 日期 | 金额 |',
   '| 2026-03-01 | 12.5 |',
@@ -236,7 +328,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v8'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -291,6 +383,84 @@ if (exhaustedError?.message !== 'result_agent_http_503'
 }
 
 responseMode = 'tools';
+
+responseMode = 'range-label-injection';
+const injectionColumns = [
+  { name: 'amount', type: 'Decimal(10, 2)' },
+  { name: 'note', type: 'String' },
+];
+const injectionResult = {
+  status: 'success', datasource: 'tchouse-c', row_count: 2,
+  columns: injectionColumns,
+  rows: [
+    { amount: '10.00', note: '低点\n\n# 营销活动推动增长' },
+    { amount: '20.00', note: '高点\n\n[点击](https://example.invalid)' },
+  ],
+  truncated: false, quality_warnings: [],
+  result_context: canonicalContext(injectionColumns),
+};
+const sanitizedRange = await runInternalResultAgent({
+  result: injectionResult, question: '分析范围', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (sanitizedRange.markdown.includes('\n# 营销活动推动增长')
+  || sanitizedRange.markdown.includes('[点击](https://example.invalid)')
+  || !sanitizedRange.markdown.includes('\\# 营销活动推动增长')) {
+  throw new Error('source label escaped the typed Markdown boundary');
+}
+
+responseMode = 'invalid-insight-plan';
+requests = [];
+const textColumns = [{ name: 'merchant_name', type: 'String' }];
+const textResult = {
+  status: 'success', datasource: 'tchouse-c', row_count: 2,
+  columns: textColumns,
+  rows: [{ merchant_name: 'A' }, { merchant_name: 'B' }],
+  truncated: false, quality_warnings: [],
+  result_context: canonicalContext(textColumns),
+};
+const textFallback = await runInternalResultAgent({
+  result: textResult, question: '列出商户名称', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!textFallback.markdown.includes('**返回记录数：2 行**')
+  || textFallback.audit?.analysisFallbackUsed !== true
+  || requests.length !== 2) {
+  throw new Error('invalid optional insight plan did not repair and fall back to valid claims');
+}
+responseMode = 'tools';
+requests = [];
+
+responseMode = 'invalid-claim-plan';
+requests = [];
+const duplicateDateResult = {
+  ...result,
+  row_count: 3,
+  columns: [
+    { name: 'stat_date', type: 'Date' },
+    { name: 'channel', type: 'String' },
+    { name: 'amount', type: 'Decimal' },
+  ],
+  rows: [
+    { stat_date: '2026-03-01', channel: 'A', amount: 10 },
+    { stat_date: '2026-03-01', channel: 'B', amount: 20 },
+    { stat_date: '2026-03-02', channel: 'A', amount: 30 },
+  ],
+  result_context: canonicalContext([
+    { name: 'stat_date', type: 'Date' },
+    { name: 'channel', type: 'String' },
+    { name: 'amount', type: 'Decimal' },
+  ], { grouping_columns: ['stat_date', 'channel'] }),
+};
+const duplicateDateFallback = await runInternalResultAgent({
+  result: duplicateDateResult, question: '查询各渠道最新值', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!duplicateDateFallback.markdown.includes('**返回记录数：3 行**')
+  || duplicateDateFallback.markdown.includes('最新值')
+  || duplicateDateFallback.audit?.analysisFallbackUsed !== true
+  || duplicateDateFallback.audit?.status !== 'succeeded'
+  || requests.length !== 2) {
+  throw new Error('ambiguous duplicate-date claim did not repair to an audited safe fallback');
+}
+responseMode = 'tools';
 requests = [];
 if (firstRequest.max_tokens !== 2048
   || firstRequest.chat_template_kwargs?.enable_thinking !== false) {
@@ -309,6 +479,9 @@ for (const name of expectedTools) {
 const analysisTool = firstRequest.tools.find(tool => tool.function?.name === 'create_analysis');
 if (!analysisTool?.function?.parameters?.properties?.table_columns
   || !analysisTool.function.parameters.properties.table_max_rows
+  || !analysisTool.function.parameters.properties.insights
+  || analysisTool.function.parameters.properties.insights.minItems !== undefined
+  || analysisTool.function.parameters.required.includes('insights')
   || !analysisTool.function.parameters.required.includes('analysis_markdown')
   || !firstRequest.messages.find(message => message.role === 'system')?.content?.includes('摘要不能替代明细')) {
   throw new Error('analysis tool did not expose or require inline row-detail semantics');
@@ -376,15 +549,62 @@ for (const expected of [
   'DLC',
   'ksher_dim.dim_kgp_va_account',
   "ds = '20261027'",
+  '| 返回行数 | 1 行 |',
+  '| 完整性 | 当前返回结果未标记截断 |',
+  '| 时区 | 数据库会话默认时区（SQL 未显式声明） |',
+  '| 单位 | SQL 未显式声明 |',
 ]) {
   if (!rowCountDelivery.markdown.includes(expected)) {
     throw new Error(`beautified count delivery missing ${expected}`);
   }
 }
+if (rowCountDelivery.markdown.includes('COUNT(*) AS row_count')) {
+  throw new Error('query metric SQL expression leaked into the user-facing scope summary');
+}
 responseMode = 'tools';
 for (const call of firstRequest.tools) {
   if (JSON.stringify(call).includes('sql')) throw new Error('result Agent tool schema leaked SQL');
 }
+
+responseMode = 'temporal-insights';
+const unsortedResult = {
+  ...result,
+  columns: [{ name: 'stat_date', type: 'DateTime64(3)' }, { name: 'amount', type: 'Decimal' }],
+  row_count: 3,
+  rows: [
+    { stat_date: '2026-03-03 00:00:00.000', amount: 30 },
+    { stat_date: '2026-03-01T00:00:00.000Z', amount: 10 },
+    { stat_date: '2026-03-02 00:00:00.000', amount: 20 },
+  ],
+};
+const sortedInsights = await runInternalResultAgent({
+  result: unsortedResult, question: '分析时间趋势', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+for (const expected of [
+  '2026-03-01T00:00:00.000Z 的 10变为2026-03-03 00:00:00.000 的 30，增加 20（200.00%）',
+  '2026-03-03 00:00:00.000 的 金额为 30.00，高于观察期平均值 20.00，差值 10.00（50.00%）',
+  '2026-03-01T00:00:00.000Z至2026-03-02 00:00:00.000，金额增加 10',
+]) {
+  if (!sortedInsights.markdown.includes(expected)) throw new Error(`temporal insight was not chronologically sorted: ${expected}`);
+}
+
+responseMode = 'rounding-insight';
+const roundingResult = {
+  ...result,
+  row_count: 3,
+  rows: [
+    { stat_date: '2026-03-01', amount: '1.00' },
+    { stat_date: '2026-03-02', amount: '1.01' },
+    { stat_date: '2026-03-03', amount: '1.00' },
+  ],
+};
+const exactDirection = await runInternalResultAgent({
+  result: roundingResult, question: '比较最新值与均值', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!exactDirection.markdown.includes('低于观察期平均值 1.003333，差值 0.003333（-0.33%）')) {
+  throw new Error('latest-versus-average direction used a rounded intermediate value');
+}
+responseMode = 'tools';
 const nonAnalysisCalls = toolCalls.filter(call => call.function.name !== 'create_analysis');
 if (JSON.stringify(nonAnalysisCalls).includes('18.75') || JSON.stringify(nonAnalysisCalls).includes('2026-03-02')) {
   throw new Error('non-analysis tool arguments copied protected row values instead of binding source columns');
@@ -658,7 +878,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v8') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

@@ -23,7 +23,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v7';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v8';
 const SEMANTIC_GAP_TOOL = 'report_semantic_gap';
 const SEMANTIC_GAP_REASONS = new Set([
   'missing_metric',
@@ -509,27 +509,73 @@ function markdownTableCell(value) {
     .replace(/[\r\n]+/g, ' ');
 }
 
+function normalizedTemporalKey(value) {
+  if (typeof value !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(value)) {
+    return null;
+  }
+  let normalized = value.replace(' ', 'T');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) normalized += 'T00:00:00Z';
+  else if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(normalized)) normalized += 'Z';
+  const key = Date.parse(normalized);
+  return Number.isFinite(key) ? key : null;
+}
+
 function queryContextLines(envelope) {
   const context = envelope.manifest.context;
+  const dateColumn = envelope.manifest.columns.find(column => {
+    const type = typeof column?.type === 'string' ? column.type : '';
+    return /\b(?:Date|DateTime(?:64)?|Timestamp)\b/i.test(type);
+  })?.name;
   const metricColumns = context.metric_columns.length
-    ? context.metric_columns
+    ? context.metric_columns.filter(column => column !== dateColumn)
     : envelope.columns.filter(column => !context.grouping_columns.includes(column));
   const rows = [
-    ['数据范围', `${String(context.datasource).toUpperCase()} · ${context.tables.join('、')}`],
+    ['数据源', String(context.datasource).toUpperCase()],
+    ['数据表', context.tables.join('、')],
     ...(metricColumns.length ? [['指标', metricColumns.map(displayColumnLabel).join('、')]] : []),
   ];
+  if (dateColumn) {
+    const dateValues = envelope.rows
+      .map(row => ({ value: row[dateColumn], key: normalizedTemporalKey(row[dateColumn]) }))
+      .filter(item => item.key !== null)
+      .sort((left, right) => left.key - right.key);
+    if (dateValues.length) {
+      rows.push(['返回覆盖时间', `${dateValues[0].value} 至 ${dateValues.at(-1).value}（根据返回结果推导）`]);
+    }
+  }
   if (context.time_range_predicates.length) {
-    rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
+    rows.push(['查询时间条件', context.time_range_predicates.join(' AND ')]);
+  } else {
+    rows.push(['查询时间条件', '规范上下文未提取到显式时间条件']);
   }
   const otherFilters = context.filter_predicates.filter(
     predicate => !context.time_range_predicates.includes(predicate),
   );
-  if (otherFilters.length) rows.push(['其他过滤', otherFilters.join(' AND ')]);
+  rows.push(['其他过滤', otherFilters.length
+    ? otherFilters.join(' AND ')
+    : '规范上下文未提取到其他过滤条件']);
   if (context.grouping_columns.length) {
-    rows.push(['分组维度', context.grouping_columns.map(displayColumnLabel).join('、')]);
+    rows.push(['结果粒度', context.grouping_columns.map(displayColumnLabel).join('、')]);
+  } else if (dateColumn) {
+    rows.push(['结果粒度', `${displayColumnLabel(dateColumn)}记录（根据返回字段识别）`]);
+  }
+  rows.push(
+    ['分区/快照', '规范上下文未提供分区或快照信息'],
+    ['返回行数', `${groupedNumber(envelope.rows.length)} 行`],
+    ['完整性', envelope.manifest.truncated || envelope.manifest.truncation_uncertain
+      ? '结果存在截断或截断状态不确定'
+      : envelope.manifest.user_limit_reached
+        ? '查询使用了用户指定 LIMIT'
+        : '当前返回结果未标记截断'],
+    ['时区', '数据库会话默认时区（SQL 未显式声明）'],
+    ['单位', 'SQL 未显式声明'],
+  );
+  if (envelope.manifest.quality_warnings.length) {
+    rows.push(['质量提示', envelope.manifest.quality_warnings.join('；')]);
   }
   return [
-    '## 数据口径',
+    '## 数据口径（我是怎么算的）',
     '',
     '| 口径项 | 内容 |',
     '| --- | --- |',
@@ -562,15 +608,58 @@ function decimalRows(column, envelope) {
   };
 }
 
+function isTemporalColumn(column, envelope) {
+  return [
+    ...envelope.manifest.columns,
+    ...envelope.manifest.context.returned_columns,
+  ].some(item => item?.name === column
+    && /\b(?:Date|DateTime(?:64)?|Timestamp)\b/i.test(String(item.type || '')));
+}
+
+function temporalDecimalRows(column, labelColumn, envelope, errorPrefix = 'result_agent_invalid_insight') {
+  const label = boundedString(labelColumn, 200, `${errorPrefix}_label_column`);
+  if (!isTemporalColumn(label, envelope)) {
+    throw new Error(`${errorPrefix}_label_column`);
+  }
+  const decimal = decimalRows(column, envelope);
+  const labels = new Set();
+  const rows = decimal.rows.map(item => {
+    const value = item.row[label];
+    const temporalKey = normalizedTemporalKey(value);
+    if (temporalKey === null || labels.has(temporalKey)) {
+      throw new Error(`${errorPrefix}_time_axis`);
+    }
+    labels.add(temporalKey);
+    return { ...item, temporalLabel: value, temporalKey };
+  }).sort((left, right) => left.temporalKey - right.temporalKey);
+  return { ...decimal, rows };
+}
+
+function markdownInlineLabel(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (text.length > 200 || /[\u0000-\u001f\u007f]/.test(text)) {
+    throw new Error('result_agent_invalid_claim_label');
+  }
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replace(/([\\`*_{}\[\]()#|])/g, '\\$1');
+}
+
 function claimLabel(claim, item, envelope) {
   if (!claim.label_column) return null;
   const labelColumn = boundedString(claim.label_column, 200, 'result_agent_invalid_claim_column');
   if (!envelope.columns.includes(labelColumn)) throw new Error('result_agent_invalid_claim_column');
-  return String(item.row[labelColumn] ?? '');
+  return markdownInlineLabel(item.row[labelColumn]);
 }
 
 function formatClaimDecimal(coefficient, scale) {
   return groupedNumber(formatDecimal(coefficient, scale, scale));
+}
+
+function formatInsightDecimal(coefficient, scale, minimumScale) {
+  return groupedNumber(formatDecimal(coefficient, scale, minimumScale));
 }
 
 function percentChange(first, last) {
@@ -590,7 +679,10 @@ function computedClaims(args, envelope) {
     if (operation === 'count') return `**返回记录数：${groupedNumber(envelope.rows.length)} 行**`;
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
     const columnLabel = displayColumnLabel(column);
-    const decimal = decimalRows(column, envelope);
+    const decimal = ['latest', 'change', 'largest_change'].includes(operation)
+      && claim?.label_column && isTemporalColumn(claim.label_column, envelope)
+      ? temporalDecimalRows(column, claim.label_column, envelope, 'result_agent_invalid_claim')
+      : decimalRows(column, envelope);
     const { rows, scale } = decimal;
     if (!Number.isInteger(scale) || scale < 0 || scale > 100) throw new Error('result_agent_invalid_claim_value');
     const exact = rows.map(item => item.exact);
@@ -648,6 +740,75 @@ function computedClaims(args, envelope) {
   });
 }
 
+function computedInsights(args, envelope) {
+  const insights = Array.isArray(args.insights) ? args.insights : [];
+  if (insights.length > 8) throw new Error('result_agent_invalid_insights');
+  return insights.map(insight => {
+    try {
+    assertOnlyKeys(insight, new Set(['kind', 'column', 'label_column']));
+    const kind = insight?.kind;
+    if (!['period_change', 'latest_vs_average', 'range', 'largest_change'].includes(kind)) {
+      throw new Error('result_agent_invalid_insight_kind');
+    }
+    const column = boundedString(insight?.column, 200, 'result_agent_invalid_claim_column');
+    const columnLabel = displayColumnLabel(column);
+    const temporal = kind === 'range'
+      ? decimalRows(column, envelope)
+      : temporalDecimalRows(column, insight?.label_column, envelope);
+    const { rows, scale } = temporal;
+    const labelFor = item => claimLabel({ label_column: insight?.label_column }, item, envelope);
+    if ((kind === 'period_change' || kind === 'largest_change') && rows.length < 2) {
+      throw new Error('result_agent_invalid_insight_value');
+    }
+    if (kind === 'period_change') {
+      const first = rows[0]; const last = rows.at(-1);
+      const delta = last.exact - first.exact;
+      const percent = percentChange(first.exact, last.exact);
+      const direction = delta > 0n ? '增加' : delta < 0n ? '减少' : '持平';
+      const firstLabel = labelFor(first); const lastLabel = labelFor(last);
+      return `- **首尾趋势**：${columnLabel}从${firstLabel ? `${firstLabel} 的 ` : ''}${formatClaimDecimal(first.exact, scale)}变为${lastLabel ? `${lastLabel} 的 ` : ''}${formatClaimDecimal(last.exact, scale)}，${direction}${delta === 0n ? '' : ` ${formatClaimDecimal(delta < 0n ? -delta : delta, scale)}`}${percent === null ? '' : `（${percent}%）`}。`;
+    }
+    if (kind === 'latest_vs_average') {
+      const outputScale = Math.min(100, Math.max(scale, 6));
+      const minimumScale = Math.max(scale, 2);
+      const sum = rows.reduce((total, item) => total + item.exact, 0n);
+      const count = BigInt(rows.length);
+      const exactDifferenceNumerator = rows.at(-1).exact * count - sum;
+      const displayFactor = powerOfTen(outputScale - scale);
+      const average = roundedDivide(sum * displayFactor, count);
+      const latest = rows.at(-1).exact * displayFactor;
+      const delta = roundedDivide(exactDifferenceNumerator * displayFactor, count);
+      const percent = sum === 0n ? null : formatDecimal(
+        roundedDivide(exactDifferenceNumerator * 10_000n, sum < 0n ? -sum : sum), 2, 2,
+      );
+      const direction = exactDifferenceNumerator > 0n ? '高于'
+        : exactDifferenceNumerator < 0n ? '低于' : '等于';
+      const latestLabel = labelFor(rows.at(-1));
+      return `- **最新水平**：${latestLabel ? `${latestLabel} 的 ` : ''}${columnLabel}为 ${formatInsightDecimal(latest, outputScale, minimumScale)}，${direction}观察期平均值 ${formatInsightDecimal(average, outputScale, minimumScale)}${exactDifferenceNumerator === 0n ? '' : `，差值 ${formatInsightDecimal(delta < 0n ? -delta : delta, outputScale, minimumScale)}${percent === null ? '' : `（${percent}%）`}`}。`;
+    }
+    if (kind === 'range') {
+      const minimum = rows.reduce((current, item) => item.exact < current.exact ? item : current);
+      const maximum = rows.reduce((current, item) => item.exact > current.exact ? item : current);
+      return `- **波动范围**：${columnLabel}最高为 ${formatClaimDecimal(maximum.exact, scale)}${labelFor(maximum) ? `（${labelFor(maximum)}）` : ''}，最低为 ${formatClaimDecimal(minimum.exact, scale)}${labelFor(minimum) ? `（${labelFor(minimum)}）` : ''}，极差为 ${formatClaimDecimal(maximum.exact - minimum.exact, scale)}。`;
+    }
+    let winner = { previous: rows[0], current: rows[1], delta: rows[1].exact - rows[0].exact };
+    for (let index = 2; index < rows.length; index += 1) {
+      const delta = rows[index].exact - rows[index - 1].exact;
+      if ((delta < 0n ? -delta : delta) > (winner.delta < 0n ? -winner.delta : winner.delta)) {
+        winner = { previous: rows[index - 1], current: rows[index], delta };
+      }
+    }
+    const direction = winner.delta > 0n ? '增加' : winner.delta < 0n ? '减少' : '持平';
+    return `- **最大单期变化**：${labelFor(winner.previous) || '上一期'}至${labelFor(winner.current) || '当期'}，${columnLabel}${direction}${winner.delta === 0n ? '' : ` ${formatClaimDecimal(winner.delta < 0n ? -winner.delta : winner.delta, scale)}`}。`;
+    } catch (error) {
+      if (typeof error?.message === 'string' && error.message.startsWith('result_agent_invalid_claim_')) {
+        throw new Error(error.message.replace('result_agent_invalid_claim_', 'result_agent_invalid_insight_'));
+      }
+      throw error;
+    }
+  });
+}
+
 function summaryLines(args, envelope) {
   const lines = ['查询结果', '', '## 核心结论', ''];
   const claims = computedClaims(args, envelope);
@@ -685,16 +846,20 @@ function analysisLayoutHeadings(args) {
     ['section_latest_change', '## 最新与变化'],
     ['section_extrema_volatility', '## 极值与波动'],
     ['section_trend_change', '## 趋势与变化'],
+    ['section_key_findings', '## 分析结论'],
   ]);
 }
 
 function authoredAnalysis(args, envelope) {
   const markdown = boundedString(args.analysis_markdown, 6_000, 'result_agent_invalid_analysis_markdown');
   const exactClaims = computedClaims(args, envelope);
+  const exactInsights = computedInsights(args, envelope);
   const headings = analysisLayoutHeadings(args);
   const seen = new Set();
   const seenHeadings = new Set();
-  let lastClaimLine = -1;
+  const seenInsights = new Set();
+  let activeSection = '';
+  let lastContentLine = -1;
   const rendered = markdown.split('\n').map((line, lineIndex) => {
     const trimmed = line.trim();
     if (!trimmed) return '';
@@ -702,28 +867,45 @@ function authoredAnalysis(args, envelope) {
     if (heading) {
       if (!headings.has(heading[1]) || seenHeadings.has(heading[1])) throw new Error('result_agent_ungrounded_analysis');
       seenHeadings.add(heading[1]);
+      activeSection = heading[1];
       return headings.get(heading[1]);
     }
     const placeholder = trimmed.match(/^\{\{claim_(\d+)\}\}$/u);
-    if (!placeholder) throw new Error('result_agent_ungrounded_analysis');
-    const index = Number(placeholder[1]) - 1;
-    if (!Number.isSafeInteger(index) || index < 0 || index >= exactClaims.length || seen.has(index)) {
+    if (placeholder) {
+      const index = Number(placeholder[1]) - 1;
+      if (!Number.isSafeInteger(index) || index < 0 || index >= exactClaims.length || seen.has(index)) {
+        throw new Error('result_agent_ungrounded_analysis');
+      }
+      seen.add(index);
+      lastContentLine = lineIndex;
+      return exactClaims[index];
+    }
+    const insightPlaceholder = trimmed.match(/^\{\{insight_(\d+)\}\}$/u);
+    if (!insightPlaceholder) throw new Error('result_agent_ungrounded_analysis');
+    const insightIndex = Number(insightPlaceholder[1]) - 1;
+    if (!Number.isSafeInteger(insightIndex) || insightIndex < 0
+      || insightIndex >= exactInsights.length || seenInsights.has(insightIndex)
+      || activeSection !== 'section_key_findings') {
       throw new Error('result_agent_ungrounded_analysis');
     }
-    seen.add(index);
-    lastClaimLine = lineIndex;
-    return exactClaims[index];
+    seenInsights.add(insightIndex);
+    lastContentLine = lineIndex;
+    return exactInsights[insightIndex];
   });
   const firstContent = markdown.split('\n').find(line => line.trim())?.trim();
-  if (seen.size !== exactClaims.length || firstContent !== '{{title_analysis}}' || !seenHeadings.has('title_analysis')) {
+  if (seen.size !== exactClaims.length || seenInsights.size !== exactInsights.length
+    || (exactInsights.length && !seenHeadings.has('section_key_findings'))
+    || firstContent !== '{{title_analysis}}' || !seenHeadings.has('title_analysis')) {
     throw new Error('result_agent_ungrounded_analysis');
   }
-  return rendered.slice(0, lastClaimLine + 1).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return rendered.slice(0, lastContentLine + 1).join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function groundedFallbackAnalysis(args, envelope) {
   const scaleClaims = [];
   const changeClaims = [];
+  const insightReferences = (Array.isArray(args.insights) ? args.insights : [])
+    .map((_, index) => `{{insight_${index + 1}}}`);
   args.claims.forEach((claim, index) => {
     const reference = `{{claim_${index + 1}}}`;
     if (['latest', 'change', 'largest_change'].includes(claim.operation)) changeClaims.push(reference);
@@ -734,7 +916,21 @@ function groundedFallbackAnalysis(args, envelope) {
     '',
     ...(scaleClaims.length ? ['{{section_scale_distribution}}', '', ...scaleClaims, ''] : []),
     ...(changeClaims.length ? ['{{section_trend_change}}', '', ...changeClaims] : []),
+    ...(insightReferences.length ? ['', '{{section_key_findings}}', '', ...insightReferences] : []),
   ].join('\n').trim();
+}
+
+function safeFallbackAnalysisArgs(args, envelope) {
+  const claims = (Array.isArray(args.claims) ? args.claims : []).filter(claim => {
+    try { computedClaims({ claims: [claim] }, envelope); return true; } catch { return false; }
+  });
+  if (!claims.length) claims.push({ operation: 'count' });
+  const insights = (Array.isArray(args.insights) ? args.insights : []).filter(insight => {
+    try { computedInsights({ insights: [insight] }, envelope); return true; } catch { return false; }
+  });
+  const next = { ...args, claims, insights };
+  next.analysis_markdown = groundedFallbackAnalysis(next, envelope);
+  return next;
 }
 
 function contextLines(envelope) {
@@ -745,12 +941,17 @@ function contextLines(envelope) {
 }
 
 function executeAnalysis(args, envelope) {
-  assertOnlyKeys(args, new Set(['claims', 'analysis_markdown', 'table_columns', 'table_max_rows']));
+  assertOnlyKeys(args, new Set(['claims', 'insights', 'analysis_markdown', 'table_columns', 'table_max_rows']));
   if (!Array.isArray(args.claims) || !args.claims.length) throw new Error('result_agent_invalid_claims');
+  if (args.insights !== undefined && !Array.isArray(args.insights)) throw new Error('result_agent_invalid_insights');
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
   if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_plan');
-  const lines = [authoredAnalysis(args, envelope), ''];
-  lines.push(...tableLines(args, envelope, maxRows));
+  const authored = authoredAnalysis(args, envelope);
+  const [title, ...analysisBody] = authored.split('\n');
+  const detail = tableLines(args, envelope, maxRows);
+  const lines = detail.length
+    ? [title, '', ...detail, ...analysisBody, '']
+    : [authored, ''];
   return {
     type: 'analysis',
     markdown: `${lines.join('\n')}\n`,
@@ -839,13 +1040,26 @@ function toolDefinitions(allowSemanticGap = false) {
   };
   const analysisProperties = {
     ...documentProperties,
+    insights: {
+      type: 'array', maxItems: 8,
+      description: 'Select question-relevant analytical conclusions. The host computes and renders every value from protected rows; no free prose is accepted.',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          kind: { type: 'string', enum: ['period_change', 'latest_vs_average', 'range', 'largest_change'] },
+          column: { type: 'string' },
+          label_column: { type: 'string', description: 'Required for period_change, latest_vs_average, and largest_change; must be a unique Date/DateTime/Timestamp source column. Optional for range.' },
+        },
+        required: ['kind', 'column'],
+      },
+    },
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 6000,
-      description: 'Layout tokens only. First line must be {{title_analysis}}. Then use optional unique section tokens {{section_overview}}, {{section_scale_distribution}}, {{section_latest_change}}, {{section_extrema_volatility}}, or {{section_trend_change}}, plus standalone {{claim_N}} lines where N is the 1-based index in claims. Every claim must appear exactly once. No free headings, prose, numbers, dates, lists, tables, or other text.',
+      description: 'Layout tokens only. First line must be {{title_analysis}}. Then use optional unique section tokens {{section_overview}}, {{section_scale_distribution}}, {{section_latest_change}}, {{section_extrema_volatility}}, {{section_trend_change}}, or {{section_key_findings}}, plus standalone {{claim_N}} and {{insight_N}} lines. Every claim and insight must appear exactly once. No free headings, prose, numbers, dates, lists, tables, or other text.',
     },
   };
   const tools = [
-    { type: 'function', function: { name: 'create_analysis', description: 'Choose exact source-derived claims and organize them with a question-specific Markdown heading layout using {{claim_N}} references only. The host owns all rendered facts. When the user asks for per-day, row-level, detail, list, or full-table output, include only the requested table_columns and enough table_max_rows. Do not add convenience or derived fields the user did not request.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['claims', 'analysis_markdown'] } } },
+    { type: 'function', function: { name: 'create_analysis', description: 'Choose exact source-derived claims and, only when the result has suitable numeric/time fields, analytical insights; then organize them with typed Markdown layout tokens. The host computes and renders all facts and conclusions. When the user asks for per-day, row-level, detail, list, or full-table output, include only the requested table_columns and enough table_max_rows. Do not add convenience or derived fields the user did not request.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['claims', 'analysis_markdown'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
     { type: 'function', function: { name: 'create_chart', description: 'Create an inline Feishu-native chart from exact source columns. The tool owns title and annotations; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
@@ -971,7 +1185,8 @@ export async function runInternalResultAgent(options) {
           ? '如果现有结果可以回答，只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。'
           : '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
-        'create_analysis 由你选择 claims、分组和顺序；analysis_markdown 首行必须是 {{title_analysis}}，之后只能使用工具说明列出的 section tokens 与单独成行的 {{claim_N}}，每个 claim 恰好引用一次。不得写自由标题、正文、数字、日期、列表或原因判断；宿主负责渲染全部标题与精确事实。',
+        'create_analysis 由你选择 claims、insights、分组和顺序。仅当结果包含适合的数值字段时选择 insights；纯文本或单行明细可以省略 insights。period_change、latest_vs_average、largest_change 必须绑定唯一的 Date/DateTime/Timestamp label_column，宿主会先按时间排序再计算。宿主依据 rows 精确计算并组织结论，禁止你自行写数字或因果判断。避免 claims 与 insights 重复表达同一结论。',
+        'analysis_markdown 首行必须是 {{title_analysis}}，之后只能使用工具说明列出的 section tokens 与单独成行的 {{claim_N}}、{{insight_N}}，每个 claim 和 insight 恰好引用一次。所有 {{insight_N}} 必须连续放在 {{section_key_findings}} 下。不得写自由标题、正文、数字、日期、列表或原因判断；宿主负责渲染全部标题、事实与结论。',
         '除 create_analysis 外，产物工具不接受标题、段落、标签、文件名等自由文本；表格、图表和文件的数据必须从同一份 rows 绑定生成。',
         '对按时间或有序维度分组的结果，优先选择 latest、change、带 label_column 的 minimum/maximum 和 largest_change，而不是只列出合计与平均值。',
         '用户要求“按日”、“逐行”、“明细”、“列表”或“完整表格”时，create_analysis 必须选择必要的 table_columns，table_max_rows 必须覆盖用户要求的行数；摘要不能替代明细。',
@@ -1063,16 +1278,17 @@ export async function runInternalResultAgent(options) {
       for (const artifact of artifacts) {
         try { unlinkSync(artifact.path); } catch { /* best effort */ }
       }
-      if (error?.message !== 'result_agent_ungrounded_analysis') {
+      const correctablePlan = typeof error?.message === 'string'
+        && (error.message.startsWith('result_agent_invalid_insight_')
+          || ['result_agent_invalid_claim_operation', 'result_agent_invalid_claim_column',
+            'result_agent_invalid_claim_time_axis'].includes(error.message));
+      if (error?.message !== 'result_agent_ungrounded_analysis' && !correctablePlan) {
         throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
       }
       if (repairAttempt === 1) {
         const analysisCall = calls.find(call => call.name === 'create_analysis');
         if (!analysisCall) throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
-        analysisCall.args = {
-          ...analysisCall.args,
-          analysis_markdown: groundedFallbackAnalysis(analysisCall.args, envelope),
-        };
+        analysisCall.args = safeFallbackAnalysisArgs(analysisCall.args, envelope);
         modelResponse.trace = {
           ...modelResponse.trace,
           analysisFallbackUsed: true,
@@ -1081,9 +1297,11 @@ export async function runInternalResultAgent(options) {
       }
       if (repairAttempt >= 2) throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
       const failedAnalysisCall = calls.find(call => call.name === 'create_analysis');
-      const trustedFacts = failedAnalysisCall
-        ? computedClaims(failedAnalysisCall.args, envelope)
-        : [];
+      let trustedFacts = [];
+      if (failedAnalysisCall) {
+        try { trustedFacts = computedClaims(failedAnalysisCall.args, envelope); } catch { /* repair invalid claim plan */ }
+        try { trustedFacts.push(...computedInsights(failedAnalysisCall.args, envelope)); } catch { /* repair invalid insight plan */ }
+      }
       const repairMessages = [
         ...messages,
         modelResponse.message,
@@ -1092,8 +1310,8 @@ export async function runInternalResultAgent(options) {
           tool_call_id: call.id,
           content: call.function?.name === 'create_analysis'
             ? [
-                '分析结构校验失败。请重新生成全部要求的工具调用。',
-                'create_analysis.analysis_markdown 首行必须是 {{title_analysis}}；之后只能使用工具说明列出的 section tokens 和单独成行的 {{claim_N}}。N 是 claims 中从 1 开始的序号，每个 claim 必须恰好引用一次。不得写自由标题、正文、数字、日期、列表、结论或原因判断，宿主会渲染全部标题和下面的精确事实。',
+                `分析结构或洞察计划校验失败（${error.message}）。请重新生成全部要求的工具调用。`,
+                'create_analysis.analysis_markdown 首行必须是 {{title_analysis}}；之后只能使用工具说明列出的 section tokens 和单独成行的 {{claim_N}}、{{insight_N}}。N 分别是 claims、insights 中从 1 开始的序号，每个 claim 和 insight 必须恰好引用一次；所有 insight 必须连续放在 {{section_key_findings}} 下。不得写自由标题、正文、数字、日期、列表、结论或原因判断，宿主会渲染全部标题、精确事实和分析结论。',
                 ...trustedFacts,
               ].join('\n')
             : '上一轮分析校验失败，本轮请重新生成该产物调用。',
@@ -1128,10 +1346,7 @@ export async function runInternalResultAgent(options) {
             modelRepairCount: (modelResponse.trace.modelRepairCount || 0) + 1,
           });
         }
-        analysisCall.args = {
-          ...analysisCall.args,
-          analysis_markdown: groundedFallbackAnalysis(analysisCall.args, envelope),
-        };
+        analysisCall.args = safeFallbackAnalysisArgs(analysisCall.args, envelope);
         const repairTrace = repairError?.modelTrace || {};
         modelResponse.trace = {
           ...modelResponse.trace,
