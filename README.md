@@ -51,6 +51,57 @@ host-only 路径（默认 `~/.config/ksher-agent-data-mcp/env`），不要把凭
 导出 sidecar 的字段、原子发布顺序与信任边界见
 [`docs/export-receipt.md`](docs/export-receipt.md)。
 
+### 可配置数据源与腾讯云 DLC
+
+`DATA_MCP_ENABLED_DATASOURCES` 是逗号分隔的数据源注册表。默认仅启用
+`tchouse-c`；当前还实现了 `dlc` 适配器。新增 TCHouse-D、MySQL 等数据源时，
+应增加独立的身份解析、元数据、SQL 方言和执行适配器，不能复用另一个数据源的
+权限判断。
+
+公开查询工具未传 `datasource` 时固定路由到 `tchouse-c`，不按注册表顺序选择，
+也不会在 TChouse-C 失败后自动切换到 DLC。只有当前请求明确指定 `dlc` 时才进入
+DLC 链路；若部署未启用 TChouse-C，省略数据源会直接返回
+`unsupported_datasource`，避免静默串线。
+
+单次查询计划仍只允许外部消费一次。该次执行内部对能够证明“查询尚未发出”的
+失败（目前为凭证后端暂不可用、查询并发槽位已满）最多重试 3 次，默认退避为
+0.25、0.5、1 秒。超时、网络中断及数据源返回错误可能发生在查询已经提交之后，
+因此不会自动重放。可通过 `QUERY_RETRY_MAX_RETRIES`（上限 3）和
+`QUERY_RETRY_BASE_DELAY_SECONDS` 调整或关闭安全重试。
+
+DLC 入口只接受 BotMux 注入的可信身份，并从 host-only 文件按 `union_id` 取 CAM UIN。
+映射文件可由人工维护的飞书多维表格导出，
+但运行时只读取本机私有快照，不向模型暴露 CAM UIN。每条记录必须显式标记
+`enabled=true`（或 `status="启用"`），空白/停用记录拒绝使用；同一 `union_id` 对应多个
+UIN、或同一 UIN 对应多个 `union_id` 时服务启动失败。解析后再查询该主体的 DLC 数据权限和
+引擎权限；模型不能提交或覆盖 CAM UIN。执行前会按当前权限重新检查 SQL 涉及的表。
+
+腾讯云鉴权可选隔离更强的本机 `signer`（长期密钥不进入 Data MCP），或
+`skill_tc_call` 复用配置的 WeData Skill `scripts/tc_call.py`，并沿用该 Skill 已有的
+凭据选择（现有签名通道或环境变量回退），Data MCP 不再实现或配置另一套签名逻辑。
+部署机把 Skill 凭据放在交互式 zsh 配置中时，可使用
+`DATA_MCP_DLC_TC_CALL_ENV_MODE=zsh_interactive`；Data MCP 只启动 Skill 脚本，不读取、
+保存或回传云密钥。
+SQL 请求载荷通过权限为 600 的临时文件交给 Skill 脚本，不进入进程命令行、MCP 参数或
+模型上下文。首版 DLC 适配限定 `ap-hongkong`、只读 SELECT、显式数据库/引擎配置。WeData
+ProjectId 不参与 DLC 查询；`DATA_MCP_DLC_PROJECT_ID` 仅为可选审计标签。若主体带有
+尚未安全支持的行级过滤或数据脱敏策略，服务会 fail-closed，不会用签名代理的服务
+身份绕过细粒度策略。
+
+执行器会先通过 `DescribeDataEngines` 解析配置引擎的真实类型，再按 Spark/Presto 分别
+提交 `SparkSQLTask`/`SQLTask`。只读 SQL 统一走
+`CreateTasks → DescribeTasks → DescribeTaskResult`，未知引擎类型或找不到精确引擎名称时
+失败关闭，不根据引擎名称猜测任务类型。
+
+权限解析使用统一的总时限和有界重试：默认权限预算 20 秒、一次 DLC 执行调用（含权限
+复核）总预算 45 秒、单次腾讯云调用 6 秒、最多 2 次，仅对明确标记为可重试的传输/限流
+错误重试。可分别通过
+`DATA_MCP_DLC_PERMISSION_TIMEOUT_SECONDS`、`DATA_MCP_DLC_API_CALL_TIMEOUT_SECONDS` 和
+`DATA_MCP_DLC_API_MAX_ATTEMPTS` 调整；执行总预算可通过
+`DATA_MCP_DLC_OPERATION_TIMEOUT_SECONDS` 调整。预算到期后失败关闭。服务端审计
+记录失败 action、安全错误码、是否可重试和耗时，但公开工具响应仍只返回统一错误，避免
+把权限后端细节暴露给调用模型。
+
 ## Amber 受信调用入口
 
 Amber 可通过独立的 loopback HTTP 进程调用只读 `/amber/query`，不复用内部

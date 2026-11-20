@@ -153,6 +153,7 @@ writeFileSync(
 await Promise.all([
   bundleNode(join(sourceRoot, 'cli', 'index.js'), join(outputRoot, 'cli', 'index.js')),
   bundleNode(join(sourceRoot, 'mcp', 'server.js'), join(outputRoot, 'mcp', 'server.js')),
+  bundleNode(join(sourceRoot, 'result-agent', 'worker.js'), join(outputRoot, 'result-agent', 'worker.js')),
   bundleNode(join(sourceRoot, 'service', 'index.js'), join(outputRoot, 'service', 'index.js')),
   bundleNode(join(sourceRoot, 'service', 'api-runner.js'), join(outputRoot, 'service', 'api-runner.js')),
   bundleNode(join(sourceRoot, 'service', 'api-runner-entry.js'), join(outputRoot, 'service', 'api-runner-entry.js')),
