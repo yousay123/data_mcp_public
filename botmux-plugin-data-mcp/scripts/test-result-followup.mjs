@@ -700,9 +700,9 @@ if (toolPayload(publicDenied).status !== 'delivered') {
 await publicEndpoint.close();
 const publicFailureCard = latestBotmuxContent();
 if (!publicFailureCard.includes('result_model_network_not_private')
-  || !publicFailureCard.includes('synthetic-public-plan')
-  || publicFailureCard.includes(rowSentinel)) {
-  throw new Error('non-private model endpoint failure card was unsafe or incomplete');
+  || !publicFailureCard.includes('可信原始结果')
+  || !publicFailureCard.includes(rowSentinel)) {
+  throw new Error('non-private model endpoint did not fail closed while preserving the authorized query result');
 }
 
 let redirectHits = 0;
@@ -734,9 +734,9 @@ if (toolPayload(redirectDenied).status !== 'delivered'
 await redirected.close();
 const redirectFailureCard = latestBotmuxContent();
 if (!redirectFailureCard.includes('result_agent_http_302')
-  || !redirectFailureCard.includes('synthetic-redirect-plan')
-  || redirectFailureCard.includes(rowSentinel)) {
-  throw new Error('model redirect failure card was unsafe or incomplete');
+  || !redirectFailureCard.includes('可信原始结果')
+  || !redirectFailureCard.includes(rowSentinel)) {
+  throw new Error('model redirect did not fail closed while preserving the authorized query result');
 }
 redirect.close();
 

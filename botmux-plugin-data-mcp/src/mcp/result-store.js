@@ -256,6 +256,9 @@ export class ResultStore {
         safeDetail[target] = detail[source];
       }
     }
+    if (typeof detail?.analysisRedactionUsed === 'boolean') {
+      safeDetail.analysis_redaction_used = detail.analysisRedactionUsed;
+    }
     if (Number.isSafeInteger(detail?.inputRowCount) && detail.inputRowCount >= 0) {
       safeDetail.input_row_count = detail.inputRowCount;
     }
@@ -264,6 +267,15 @@ export class ResultStore {
     }
     if (Number.isSafeInteger(detail?.httpStatus) && detail.httpStatus >= 100 && detail.httpStatus <= 599) {
       safeDetail.http_status = detail.httpStatus;
+    }
+    for (const [source, target] of [
+      ['modelAttemptCount', 'model_attempt_count'],
+      ['modelRetriesUsed', 'model_retries_used'],
+      ['modelRepairCount', 'model_repair_count'],
+    ]) {
+      if (Number.isSafeInteger(detail?.[source]) && detail[source] >= 0) {
+        safeDetail[target] = detail[source];
+      }
     }
     const event = {
       at: new Date(now).toISOString(),

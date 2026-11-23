@@ -116,13 +116,137 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
+    if (responseMode === 'generic-calculation') {
+      const call = {
+        id: 'generic-calculation', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            analysis_markdown: '# 通用计算\n\n相加 {{calc_0}}，相减 {{calc_1}}，相乘 {{calc_2}}，相除 {{calc_3}}，变化率 {{calc_4}}%。',
+            calculations: [
+              {
+                operation: 'add', label: '相加',
+                operands: [
+                  { row_index: 0, column: 'amount' },
+                  { row_index: 1, column: 'amount' },
+                ],
+              },
+              {
+                operation: 'subtract', label: '金额增量',
+                operands: [
+                  { row_index: 1, column: 'amount' },
+                  { row_index: 0, column: 'amount' },
+                ],
+              },
+              {
+                operation: 'multiply', label: '相乘',
+                operands: [
+                  { row_index: 0, column: 'amount' },
+                  { row_index: 1, column: 'amount' },
+                ],
+              },
+              {
+                operation: 'divide', label: '相除', precision: 2,
+                operands: [
+                  { row_index: 1, column: 'amount' },
+                  { row_index: 0, column: 'amount' },
+                ],
+              },
+              {
+                operation: 'percent_change', label: '金额变化率', precision: 2,
+                operands: [
+                  { row_index: 0, column: 'amount' },
+                  { row_index: 1, column: 'amount' },
+                ],
+              },
+            ],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'summary-detail') {
+      const call = {
+        id: 'summary-detail', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            analysis_markdown: '# 注册商户趋势\n\n本次累计为 {{claim_0}}。\n\n每日明细如下。',
+            claims: [{ operation: 'sum', column: 'amount' }],
+            table_columns: ['stat_date', 'amount'],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'stubborn-ungrounded') {
+      const call = {
+        id: 'stubborn-ungrounded', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            analysis_markdown: [
+              '# 趋势判断',
+              '',
+              '{{fact_0}}',
+              '',
+              '{{calc_0}}',
+              '',
+              '旧期 18.75，新期 12.5，查询结果已经达到 999999。',
+              '两行结果意味着查询金额为 2。',
+              '预计影响九十九万。',
+              'Unicode 估算为 ١٢٣٤٥。',
+              '增长百分之五。',
+              '达到四分之一。',
+              '金额为壹佰万元。',
+              '已有过半商户完成。',
+              'Roman 估算为 Ⅻ 万。',
+              '# 999999. 总金额已达',
+            ].join('\n'),
+            facts: [{ row_index: 1, column: 'amount', label: '模型宣称 999999' }],
+            calculations: [{
+              operation: 'add', label: '虚构总额 999999',
+              operands: [
+                { row_index: 0, column: 'amount' },
+                { row_index: 1, column: 'amount' },
+              ],
+            }],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'redacted-fact-with-partial-table') {
+      const call = {
+        id: 'redacted-fact-with-partial-table', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            analysis_markdown: '# 关键金额\n\n关键金额 {{fact_0}}，错误估计 999999。',
+            facts: [{ row_index: 1, column: 'amount', label: '关键金额' }],
+            table_columns: ['stat_date'],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
     if (responseMode === 'repair-once') {
       repairResponses += 1;
       const args = repairResponses === 1
         ? { analysis_markdown: '# 趋势判断\n\n较前期增长 33.3%，建议继续观察。' }
         : {
-            analysis_markdown: '# 趋势判断\n\n{{fact_0}}\n\n建议结合业务活动继续观察。',
-            facts: [{ row_index: 1, column: 'amount', label: '最新金额' }],
+            analysis_markdown: '# 趋势判断\n\n较前期增长 {{calc_0}}%，建议结合业务活动继续观察。',
+            calculations: [{
+              operation: 'percent_change', precision: 2,
+              operands: [
+                { row_index: 0, column: 'amount' },
+                { row_index: 1, column: 'amount' },
+              ],
+            }],
           };
       const call = {
         id: `repair-${repairResponses}`,
@@ -185,7 +309,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -271,9 +395,35 @@ const stringDelivery = await runInternalResultAgent({
   result: stringResult,
   question: '只返回当前账号', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (!stringDelivery.markdown.includes('**当前账号**：trusted_user_01')
+if (!stringDelivery.markdown.includes('**account**：trusted_user_01')
   || stringDelivery.markdown.includes('返回记录数')) {
   throw new Error('generic string fact was not rendered from the protected row');
+}
+
+responseMode = 'generic-calculation';
+const calculationDelivery = await runInternalResultAgent({
+  result,
+  question: '分析两天金额变化', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+for (const expected of ['相加 31.25', '相减 6.25', '相乘 234.375', '相除 1.50', '变化率 50.00%']) {
+  if (!calculationDelivery.markdown.includes(expected)) {
+    throw new Error(`generic row-bound calculation missing ${expected}: ${calculationDelivery.markdown}`);
+  }
+}
+if (calculationDelivery.markdown.includes('NaN') || calculationDelivery.markdown.includes('Infinity')) {
+  throw new Error(`generic row-bound calculations were not rendered exactly: ${calculationDelivery.markdown}`);
+}
+
+responseMode = 'summary-detail';
+const summaryDetailDelivery = await runInternalResultAgent({
+  result,
+  question: '查询近七天注册商户数，返回总数和每日明细',
+  requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+for (const expected of ['本次累计为 31.25', '2026-03-01', '12.5', '2026-03-02', '18.75']) {
+  if (!summaryDetailDelivery.markdown.includes(expected)) {
+    throw new Error(`trusted summary/detail delivery missing ${expected}`);
+  }
 }
 
 responseMode = 'repair-once';
@@ -289,9 +439,50 @@ const repairedDelivery = await runInternalResultAgent({
 if (requests.length !== 2
   || repairedDelivery.audit?.modelRepairCount !== 1
   || repairedDelivery.audit?.modelAttemptCount !== 2
-  || !repairedDelivery.markdown.includes('**最新金额**：18.75')
+  || !repairedDelivery.markdown.includes('较前期增长 50.00%')
   || repairedDelivery.markdown.includes('33.3%')) {
-  throw new Error('analysis repair did not replace an ungrounded number with a source-bound fact');
+  throw new Error('analysis repair did not replace an ungrounded number with a host-computed calculation');
+}
+
+responseMode = 'stubborn-ungrounded';
+requests = [];
+const redactedDelivery = await runInternalResultAgent({
+  result,
+  question: '分析变化并给出建议',
+  requestedOutputs: ['analysis'],
+  runtimeConfig,
+  pluginHome,
+});
+if (requests.length !== 3
+  || redactedDelivery.audit?.modelRepairCount !== 2
+  || redactedDelivery.audit?.analysisRedactionUsed !== true
+  || !redactedDelivery.markdown.includes('**amount**：18.75')
+  || !redactedDelivery.markdown.includes('**相加结果**：31.25')
+  || [
+    '999999', '查询金额为 2', '九十九万', '١٢٣٤٥', '百分之五', '四分之一',
+    '壹佰万元', '过半', 'Ⅻ 万', '模型宣称', '虚构总额',
+  ]
+    .some(value => redactedDelivery.markdown.includes(value))) {
+  throw new Error(`final analysis repair did not redact only the ungrounded numeric literal: ${JSON.stringify({
+    requests: requests.length,
+    audit: redactedDelivery.audit,
+    markdown: redactedDelivery.markdown,
+  })}`);
+}
+
+responseMode = 'redacted-fact-with-partial-table';
+requests = [];
+const partialTableDelivery = await runInternalResultAgent({
+  result,
+  question: '返回关键金额和日期明细',
+  requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (requests.length !== 3
+  || partialTableDelivery.audit?.analysisRedactionUsed !== true
+  || !partialTableDelivery.markdown.includes('**amount**：18.75')
+  || !partialTableDelivery.markdown.includes('2026-03-02')
+  || partialTableDelivery.markdown.includes('999999')) {
+  throw new Error('redaction lost a trusted fact that was absent from the selected detail table');
 }
 
 responseMode = 'string-fact';
@@ -476,7 +667,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

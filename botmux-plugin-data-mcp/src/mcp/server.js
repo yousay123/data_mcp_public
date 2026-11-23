@@ -726,6 +726,12 @@ function resultAgentAuditDetail(trace, result) {
     inputRowCount: detail.inputRowCount,
     latencyMs: detail.latencyMs,
     httpStatus: detail.httpStatus,
+    modelAttemptCount: detail.modelAttemptCount,
+    modelRetriesUsed: detail.modelRetriesUsed,
+    modelRepairCount: Number.isSafeInteger(detail.modelRepairCount)
+      ? detail.modelRepairCount
+      : Number.isSafeInteger(detail.modelAttemptCount) ? 0 : undefined,
+    analysisRedactionUsed: detail.analysisRedactionUsed,
   };
 }
 
@@ -747,6 +753,15 @@ function resultAgentAuditStatus(error) {
     'result_agent_process_isolation_failed',
     'result_agent_context_missing',
     'result_model_network_not_private',
+    'result_agent_ungrounded_analysis',
+    'result_agent_evidence_required',
+    'result_agent_invalid_analysis_markdown',
+    'result_agent_invalid_calculations',
+    'result_agent_invalid_calculation_operation',
+    'result_agent_invalid_calculation_operand',
+    'result_agent_invalid_calculation_value',
+    'result_agent_invalid_calculation_precision',
+    'result_agent_invalid_calculation_label',
   ]);
   if (/^result_agent_http_[1-5][0-9]{2}$/.test(code)) return code;
   return safeCodes.has(code) ? code : 'result_agent_failed';
@@ -787,6 +802,15 @@ function markdownCell(value) {
     .replace(/[\r\n]+/g, ' ');
 }
 
+function fallbackMarkdownCell(value) {
+  if (value === null || value === undefined) return 'NULL';
+  if (!['string', 'number', 'boolean', 'bigint'].includes(typeof value)) {
+    return '[暂不支持展示的复杂值]';
+  }
+  const text = String(value);
+  return markdownCell(text.length > 100 ? `${text.slice(0, 97)}...` : text);
+}
+
 function deterministicContextLines(result) {
   const context = result?.result_context;
   if (!context || typeof context !== 'object') return [];
@@ -800,16 +824,13 @@ function deterministicContextLines(result) {
     rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
   }
   if (!rows.length) return [];
-  return [
-    '## 查询口径',
-    '',
-    '| 口径项 | 内容 |',
-    '| --- | --- |',
-    ...rows.map(([label, value]) => `| ${label} | ${markdownCell(value)} |`),
-  ];
+  const sentence = rows
+    .map(([label, value]) => `${label}为“${fallbackMarkdownCell(value)}”`)
+    .join('，');
+  return ['## 数据口径', '', `${sentence}。`];
 }
 
-function deterministicAnalysisFallback(result, args) {
+function deterministicAnalysisFallback(result, args, errorCode) {
   const outputs = requestedOutputs(args);
   if (outputs.length !== 1 || outputs[0] !== 'analysis') return null;
   const columns = (Array.isArray(result.columns) ? result.columns : [])
@@ -817,22 +838,28 @@ function deterministicAnalysisFallback(result, args) {
     .filter(column => typeof column === 'string' && column.trim())
     .map(column => column.trim());
   const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.data) ? result.data : [];
-  if (columns.length < 1 || columns.length > 20 || rows.length < 1 || rows.length > 20) return null;
-  const renderedRows = rows.map(row => {
-    if (Array.isArray(row)) return columns.map((_, index) => markdownCell(row[index]));
-    if (row && typeof row === 'object') return columns.map(column => markdownCell(row[column]));
-    throw new Error('deterministic_fallback_invalid_row');
+  if (columns.length < 1) return null;
+  const visibleColumns = columns.slice(0, 10);
+  const visibleRows = rows.slice(0, 8);
+  const renderedRows = visibleRows.map(row => {
+    if (Array.isArray(row)) return visibleColumns.map((_, index) => fallbackMarkdownCell(row[index]));
+    if (row && typeof row === 'object') return visibleColumns.map(column => fallbackMarkdownCell(row[column]));
+    return visibleColumns.map(() => '[暂不支持展示的行]');
   });
+  const status = safeDiagnosticCode(errorCode, 'result_agent_failed');
   const markdown = [
     '# 查询结果',
     '',
-    '> 结果代理暂不可用，以下为受控查询返回的原始结果，未作额外口径推断。',
+    `> 数据查询已成功，但结果模型未生成通过事实校验的分析（${status}）。以下直接展示 Data MCP 的可信原始结果。`,
     '',
     '## 数据明细',
     '',
-    `| ${columns.map(markdownCell).join(' | ')} |`,
-    `| ${columns.map(() => '---').join(' | ')} |`,
+    `| ${visibleColumns.map(markdownCell).join(' | ')} |`,
+    `| ${visibleColumns.map(() => '---').join(' | ')} |`,
     ...renderedRows.map(row => `| ${row.join(' | ')} |`),
+    ...(rows.length > visibleRows.length || columns.length > visibleColumns.length
+      ? ['', `当前消息展示前 ${visibleRows.length} 行、前 ${visibleColumns.length} 列；本次查询共 ${rows.length} 行、${columns.length} 列。`]
+      : []),
     '',
     ...deterministicContextLines(result),
   ].join('\n');
@@ -1052,7 +1079,8 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
         );
       } catch { /* best-effort non-sensitive audit */ }
     }
-    authored = deterministicResultAgentFailure(result, args, errorCode);
+    authored = deterministicAnalysisFallback(result, args, errorCode)
+      || deterministicResultAgentFailure(result, args, errorCode);
   }
   let committedVersion;
   const authoredAudit = authored.audit;

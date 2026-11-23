@@ -19,7 +19,8 @@ let modelSawSentinel = false;
 let modelSawAuth = false;
 let modelSawLimitEvidence = false;
 let queryCount = 0;
-let failNextModelCall = false;
+let modelFailuresRemaining = 0;
+let ungroundedResponsesRemaining = 0;
 
 const runResult = {
   status: 'success', query_id: 'q_internal', row_count: 2,
@@ -71,8 +72,8 @@ const modelServer = createServer((req, res) => {
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
   req.on('end', () => {
-    if (failNextModelCall) {
-      failNextModelCall = false;
+    if (modelFailuresRemaining > 0) {
+      modelFailuresRemaining -= 1;
       res.writeHead(503, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'synthetic provider failure' }));
       return;
@@ -96,7 +97,19 @@ const modelServer = createServer((req, res) => {
         { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
         { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
       ];
-      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ analysis_markdown: '# 查询结果\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      const analysisCall = ungroundedResponsesRemaining > 0
+        ? {
+            id: 'analysis', type: 'function',
+            function: {
+              name: 'create_analysis',
+              arguments: JSON.stringify({
+                analysis_markdown: '# 查询结果\n\n{{claim_0}}\n\n错误估计 999999。',
+                claims: [{ operation: 'sum', column: 'amount' }],
+              }),
+            },
+          }
+        : { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ analysis_markdown: '# 查询结果\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      if (ungroundedResponsesRemaining > 0) ungroundedResponsesRemaining -= 1;
       const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
       res.end(JSON.stringify({
         id: 'resp_delivery_fixture', model: 'internal-test-model-resolved',
@@ -275,7 +288,7 @@ if (!failedVisible.includes('direct_reply_transport_failed')
   throw new Error('transport failure did not return a fixed, redacted error');
 }
 
-failNextModelCall = true;
+modelFailuresRemaining = 2;
 const agentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -290,8 +303,37 @@ if (toolPayload(agentFailure[0]).status !== 'delivered'
   || agentFailureVisible.includes(sentinel)) {
   throw new Error('result Agent failure did not produce a safe direct reply');
 }
+const analysisFallbackCard = latestSend()?.content || '';
+if (!analysisFallbackCard.includes('result_agent_http_503')
+  || !analysisFallbackCard.includes('2026-03-01')
+  || !analysisFallbackCard.includes('可信原始结果')
+  || !analysisFallbackCard.includes('## 数据口径')) {
+  throw new Error('analysis model failure hid the successful trusted query result');
+}
 
-failNextModelCall = true;
+ungroundedResponsesRemaining = 3;
+const redactedAnalysis = await runPlugin([{
+  name: 'deliver_query_result_for_user',
+  arguments: {
+    sql: 'SELECT amount FROM fixture', query_plan_id: 'redacted-analysis',
+    output_mode: 'analysis', question: '验证未绑定数字剔除',
+  },
+  _meta: {
+    botmuxTrustedCaller: {
+      ...caller,
+      requestUserOpenId: 'ou_test_redacted',
+      requestUserUnionId: 'on_test_redacted',
+      turnId: 'om_redacted',
+    },
+  },
+}]);
+if (toolPayload(redactedAnalysis[0]).status !== 'delivered'
+  || latestSend()?.content?.includes('999999')
+  || !latestSend()?.content?.includes('amount（合计）')) {
+  throw new Error('redacted analysis did not preserve trusted evidence while removing the unbound number');
+}
+
+modelFailuresRemaining = 1;
 const nonFallbackAgentFailure = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
@@ -327,7 +369,10 @@ if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.stage === 'result_agent'
   && row.action === 'model_request'
   && row.error_code === 'result_agent_http_503'
-  && row.query_id === 'q_internal')) {
+  && row.query_id === 'q_internal'
+  && row.model_attempt_count === 2
+  && row.model_retries_used === 1
+  && row.model_repair_count === 0)) {
   throw new Error('first-turn result Agent failure did not emit actionable safe audit detail');
 }
 if (!auditRows.some(row => row.status === 'result_agent_not_configured'
@@ -345,7 +390,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v2'
+  && row.prompt_template_version === 'result-agent-tool-contract-v3'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -354,10 +399,16 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && Number.isSafeInteger(row.latency_ms))) {
   throw new Error('successful result Agent call did not emit the complete privacy-safe audit trace');
 }
+if (!auditRows.some(row => row.status === 'result_agent_succeeded'
+  && row.analysis_redaction_used === true
+  && row.model_attempt_count === 3
+  && row.model_repair_count === 2)) {
+  throw new Error('redacted result Agent success did not persist its retry and redaction audit semantics');
+}
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v2'
+  && row.prompt_template_version === 'result-agent-tool-contract-v3'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503
