@@ -755,8 +755,43 @@ function redactUngroundedNumbers(markdown, envelope, question, analysisArgs) {
   return `${restored.trim()}\n\n## 可信数据\n\n${missingEvidence.join('\n\n')}`;
 }
 
+function markdownTableCells(line) {
+  const trimmed = String(line).trim();
+  if (!trimmed.includes('|')) return null;
+  const body = trimmed.replace(/^\|/u, '').replace(/\|$/u, '');
+  const cells = body.split('|').map(cell => cell.trim());
+  return cells.length ? cells : null;
+}
+
+function stripModelAuthoredMarkdownTables(markdown) {
+  const lines = String(markdown).split('\n');
+  const retained = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = markdownTableCells(lines[index]);
+    const separator = index + 1 < lines.length ? markdownTableCells(lines[index + 1]) : null;
+    const isTable = header
+      && separator
+      && header.length === separator.length
+      && separator.every(cell => /^:?-{3,}:?$/u.test(cell));
+    if (!isTable) {
+      retained.push(lines[index]);
+      continue;
+    }
+    index += 1;
+    while (index + 1 < lines.length) {
+      const row = markdownTableCells(lines[index + 1]);
+      if (!row || row.length !== header.length) break;
+      index += 1;
+    }
+  }
+  return retained.join('\n').replace(/\n{3,}/gu, '\n\n').trim();
+}
+
 function renderAuthoredAnalysis(args, envelope, question) {
-  const markdown = boundedString(args.analysis_markdown, 8_000, 'result_agent_invalid_analysis_markdown');
+  const authoredMarkdown = boundedString(args.analysis_markdown, 8_000, 'result_agent_invalid_analysis_markdown');
+  const markdown = Array.isArray(args.table_columns) && args.table_columns.length
+    ? stripModelAuthoredMarkdownTables(authoredMarkdown)
+    : authoredMarkdown;
   validateAuthoredNarrative(markdown, envelope, question);
   const evidence = {
     fact: sourceFactEvidence(args, envelope),
@@ -1056,6 +1091,7 @@ export async function runInternalResultAgent(options) {
         'create_analysis 的 Markdown 由你自由组织，不要套最大值、最小值、平均值等固定模板。围绕用户问题提炼现象、问题、风险或机会、业务影响和可执行建议。',
         '任何需要准确展示的原始字段值都通过 facts 选择，并在 Markdown 中引用从零开始编号的 {{fact_0}}、{{fact_1}}；facts 可以引用字符串、布尔值、数字、日期、账号和权限等任意返回字段。',
         '只有确有业务意义时才选择 claims 计算聚合，并引用从零开始编号的 {{claim_0}}、{{claim_1}}。不要为了满足格式机械增加聚合字段。列表或明细结果优先选择 table_columns。',
+        '选择 table_columns 后，宿主会从可信 rows 统一渲染一次明细表；analysis_markdown 只写分析正文，不要再构造 Markdown 表格。',
         '差值、比值、变化率等派生数字使用 calculations，由宿主精确计算，并引用从零开始编号的 {{calc_0}}、{{calc_1}}；percent_change 的 operands 顺序是 [基准值, 当前值]，占位符只返回数值，正文需要自行补 %；不要在正文里自行填写派生数字。',
         '自由 Markdown 中不得直接写任何精确数字，即使数字来自 rows、用户问题或 context；原始值必须用 facts，聚合用 claims，跨行算术用 calculations。自然语言趋势、风险和建议可以自由表达。',
         '分析判断可以发散，但不得把推测写成已证实事实；可能原因应明确标注需要结合业务信息核查。',

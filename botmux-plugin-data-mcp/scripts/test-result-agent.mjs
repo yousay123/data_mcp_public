@@ -172,7 +172,18 @@ const modelServer = createServer((req, res) => {
         function: {
           name: 'create_analysis',
           arguments: JSON.stringify({
-            analysis_markdown: '# 注册商户趋势\n\n本次累计为 {{claim_0}}。\n\n每日明细如下。',
+            analysis_markdown: [
+              '# 注册商户趋势',
+              '',
+              '本次累计为 {{claim_0}}。',
+              '',
+              '| stat_date | amount |',
+              '| --- | --- |',
+              '| 2026-03-01 | 12.5 |',
+              '| 2026-03-02 | 18.75 |',
+              '',
+              '每日明细如下。',
+            ].join('\n'),
             claims: [{ operation: 'sum', column: 'amount' }],
             table_columns: ['stat_date', 'amount'],
           }),
@@ -424,6 +435,10 @@ for (const expected of ['本次累计为 31.25', '2026-03-01', '12.5', '2026-03-
   if (!summaryDetailDelivery.markdown.includes(expected)) {
     throw new Error(`trusted summary/detail delivery missing ${expected}`);
   }
+}
+if ((summaryDetailDelivery.markdown.match(/\| stat_date \| amount \|/gu) || []).length !== 1
+  || !summaryDetailDelivery.markdown.includes('每日明细如下。')) {
+  throw new Error(`model-authored duplicate detail table was not removed: ${summaryDetailDelivery.markdown}`);
 }
 
 responseMode = 'repair-once';
