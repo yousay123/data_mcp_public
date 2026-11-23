@@ -23,7 +23,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v3';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v4';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -330,12 +330,6 @@ function stageArtifact(pluginHome, filename, content) {
   }
 }
 
-function xml(value) {
-  return String(value).replace(/[&<>"']/g, character => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
-  })[character]);
-}
-
 function executeExcel(args, envelope, pluginHome) {
   assertOnlyKeys(args, new Set(['sheets']));
   if (envelope.rows.length > 9_999) throw new Error('result_agent_artifact_row_limit');
@@ -356,7 +350,7 @@ function executeExcel(args, envelope, pluginHome) {
   return { type: 'excel', filename, path: stageArtifact(pluginHome, filename, bytes), bytes: bytes.length };
 }
 
-function executeChart(args, envelope, pluginHome) {
+function executeChart(args, envelope) {
   assertOnlyKeys(args, new Set(['type', 'label_column', 'value_column', 'max_points']));
   const label = boundedString(args.label_column, 200, 'result_agent_invalid_chart_plan');
   const value = boundedString(args.value_column, 200, 'result_agent_invalid_chart_plan');
@@ -370,35 +364,23 @@ function executeChart(args, envelope, pluginHome) {
     value: parseDecimal(row[value], 'result_agent_invalid_chart_value'),
   })).filter(point => point.value !== null);
   if (points.length < 2) throw new Error('result_agent_invalid_chart_plan');
-  const width = 960; const height = 540; const left = 90; const top = 55; const bottom = 85; const right = 35;
-  const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const chartScale = Math.max(...points.map(point => point.value.scale));
-  const scaledValues = points.map(point => rescaleExact(point.value, chartScale, 'result_agent_invalid_chart_value'));
-  const zero = 0n;
-  const minimum = scaledValues.reduce((current, item) => item < current ? item : current, zero);
-  const maximum = scaledValues.reduce((current, item) => item > current ? item : current, zero);
-  const span = maximum - minimum || 1n;
-  const ratio = item => Number(((item - minimum) * 1_000_000_000n) / span) / 1_000_000_000;
-  const baselineY = top + plotHeight - ratio(zero) * plotHeight;
-  const step = plotWidth / points.length;
-  const title = '查询结果图表';
-  const elements = [`<rect width="100%" height="100%" fill="#fff"/>`, `<text x="${width / 2}" y="30" text-anchor="middle" font-size="20" fill="#173d67">${xml(title)}</text>`, `<line x1="${left}" y1="${top}" x2="${left}" y2="${top + plotHeight}" stroke="#789"/>`, `<line x1="${left}" y1="${top + plotHeight}" x2="${left + plotWidth}" y2="${top + plotHeight}" stroke="#789"/>`];
-  const coordinates = points.map((point, index) => ({
-    ...point,
-    x: left + step * (index + 0.5),
-    y: top + plotHeight - ratio(scaledValues[index]) * plotHeight,
-  }));
-  if (args.type === 'bar') {
-    for (const point of coordinates) elements.push(`<rect x="${point.x - Math.min(step * 0.32, 22)}" y="${Math.min(point.y, baselineY)}" width="${Math.min(step * 0.64, 44)}" height="${Math.max(Math.abs(baselineY - point.y), 1)}" fill="#4276b8"/>`);
-  } else {
-    elements.push(`<polyline fill="none" stroke="#4276b8" stroke-width="3" points="${coordinates.map(point => `${point.x},${point.y}`).join(' ')}"/>`);
-    for (const point of coordinates) elements.push(`<circle cx="${point.x}" cy="${point.y}" r="4" fill="#4276b8"/>`);
-  }
-  for (const point of coordinates) elements.push(`<text x="${point.x}" y="${top + plotHeight + 20}" text-anchor="middle" font-size="10" fill="#496174">${xml(point.label.slice(0, 12))}</text>`);
-  if (envelope.rows.length > points.length) elements.push(`<text x="${left}" y="${height - 20}" font-size="11" fill="#9a5a00">仅展示前 ${points.length} 个数据点，共 ${envelope.rows.length} 行。</text>`);
-  const svg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${elements.join('')}</svg>`);
-  const filename = safeFilename('query-result-chart', 'svg');
-  return { type: 'chart', filename, path: stageArtifact(pluginHome, filename, svg), bytes: svg.length };
+  const spec = {
+    title: `${label} · ${value}`.slice(0, 100),
+    data: { values: points.map(point => ({
+      category: point.label,
+      value: point.value.scale === 0 && Number.isSafeInteger(Number(point.value.coefficient))
+        ? Number(point.value.coefficient)
+        : formatDecimal(point.value.coefficient, point.value.scale, point.value.scale),
+    })) },
+    mark: args.type,
+    encoding: {
+      x: { field: 'category', type: 'ordinal', title: label },
+      y: { field: 'value', type: 'quantitative', title: value },
+    },
+  };
+  const notice = envelope.rows.length > points.length
+    ? `\n\n图表仅展示前 ${points.length} 个有效数据点，共 ${envelope.rows.length} 行。` : '';
+  return { type: 'chart', markdown: `\`\`\`vega-lite\n${JSON.stringify(spec)}\n\`\`\`${notice}` };
 }
 
 function powerOfTen(scale) {
@@ -549,6 +531,49 @@ function computedClaimEvidence(args, envelope) {
 
 function computedClaims(args, envelope) {
   return computedClaimEvidence(args, envelope).map(item => item.display);
+}
+
+function numericEvidence(envelope) {
+  const summaries = [];
+  for (const column of envelope.columns) {
+    try {
+      const values = envelope.rows.map(row => parseDecimal(row[column]));
+      if (!values.some(value => value !== null)) continue;
+      const scale = Math.max(...values.filter(Boolean).map(value => value.scale));
+      const exact = values.map(value => value === null ? null : rescaleExact(value, scale));
+      const present = exact.filter(value => value !== null);
+      const min = present.reduce((a, b) => a < b ? a : b);
+      const max = present.reduce((a, b) => a > b ? a : b);
+      const operations = ['sum', 'average', 'minimum', 'maximum'];
+      const aggregate = Object.fromEntries(operations.map(operation => [operation,
+        computedClaimEvidence({ claims: [{ operation, column }] }, envelope)[0].value,
+      ]));
+      const changes = { up: 0, down: 0, unchanged: 0, missing: 0 };
+      for (let index = 1; index < exact.length; index += 1) {
+        const a = exact[index - 1]; const b = exact[index];
+        changes[a === null || b === null ? 'missing' : b > a ? 'up' : b < a ? 'down' : 'unchanged'] += 1;
+      }
+      summaries.push({ column, ...aggregate,
+        minimum_row_indices: exact.flatMap((value, index) => value === min ? [index] : []),
+        maximum_row_indices: exact.flatMap((value, index) => value === max ? [index] : []),
+        adjacent_changes_in_result_order: changes,
+      });
+    } catch { /* Non-numeric columns have no numeric summary. */ }
+  }
+  return summaries;
+}
+
+function statisticEvidence(envelope) {
+  const facts = [{ column: null, operation: 'returned_row_count', value: String(envelope.rows.length) }];
+  for (const summary of numericEvidence(envelope)) {
+    for (const operation of ['sum', 'average', 'minimum', 'maximum']) {
+      facts.push({ column: summary.column, operation, value: summary[operation] });
+    }
+    for (const [direction, count] of Object.entries(summary.adjacent_changes_in_result_order)) {
+      facts.push({ column: summary.column, operation: `adjacent_${direction}_count`, value: String(count) });
+    }
+  }
+  return facts.map((fact, index) => ({ ...fact, reference: `{{stat_${index}}}`, display: `${fact.column || '结果'}（${fact.operation}）：${fact.value}` }));
 }
 
 function calculationOperand(value, envelope) {
@@ -704,7 +729,7 @@ function validateAuthoredNarrative(markdown, envelope, question) {
     throw new Error('result_agent_invalid_analysis_markdown');
   }
   const narrativeWithoutEvidence = value => value
-    .replace(/\{\{(?:fact|claim|calc)_\d+\}\}/gu, '')
+    .replace(/\{\{(?:fact|claim|calc|stat)_\d+\}\}/gu, '')
     .split('\n')
     .map(line => line.slice(structuralEnumerationPrefix(line).length))
     .join('\n');
@@ -721,7 +746,7 @@ function redactUngroundedNumbers(markdown, envelope, question, analysisArgs) {
     throw new Error('result_agent_invalid_analysis_markdown');
   }
   const placeholders = [];
-  const protectedMarkdown = original.replace(/\{\{(?:fact|claim|calc)_\d+\}\}/gu, placeholder => {
+  const protectedMarkdown = original.replace(/\{\{(?:fact|claim|calc|stat)_\d+\}\}/gu, placeholder => {
     const marker = String.fromCodePoint(0xE000 + placeholders.length);
     placeholders.push(placeholder);
     return marker;
@@ -797,10 +822,11 @@ function renderAuthoredAnalysis(args, envelope, question) {
     fact: sourceFactEvidence(args, envelope),
     claim: computedClaimEvidence(args, envelope),
     calc: computedCalculationEvidence(args, envelope),
+    stat: statisticEvidence(envelope),
   };
   let evidenceCount = 0;
   const rendered = markdown.split('\n').map(line => {
-    const standalone = line.trim().match(/^\{\{(fact|claim|calc)_(\d+)\}\}$/u);
+    const standalone = line.trim().match(/^\{\{(fact|claim|calc|stat)_(\d+)\}\}$/u);
     if (standalone) {
       const index = Number(standalone[2]);
       const item = evidence[standalone[1]][index];
@@ -810,11 +836,15 @@ function renderAuthoredAnalysis(args, envelope, question) {
       evidenceCount += 1;
       return item.display;
     }
-    const replaced = line.replace(/\{\{(fact|claim|calc)_(\d+)\}\}/gu, (_placeholder, kind, rawIndex) => {
+    const replaced = line.replace(/\{\{(fact|claim|calc|stat)_(\d+)\}\}/gu, (_placeholder, kind, rawIndex, offset) => {
       const index = Number(rawIndex);
       const item = evidence[kind][index];
       if (!Number.isSafeInteger(index) || index < 0 || !item) {
         throw new Error('result_agent_ungrounded_analysis');
+      }
+      if (kind === 'fact' && /^\d{4}-\d{2}-\d{2}(?:$|[ T])/u.test(item.value)
+        && /^\s*(?:次|户|个|元|行|倍|%)/u.test(line.slice(offset + _placeholder.length))) {
+        throw new Error('result_agent_invalid_fact_semantics');
       }
       evidenceCount += 1;
       return item.value;
@@ -956,7 +986,7 @@ function toolDefinitions() {
   const analysisProperties = {
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 8000,
-      description: 'Model-authored Markdown. Organize findings and recommendations freely. Bind exact source values with zero-based {{fact_0}} placeholders, aggregates with {{claim_0}}, and host-computed arithmetic with {{calc_0}}.',
+      description: 'Model-authored Markdown. Organize findings freely. Bind source values with {{fact_0}}, aggregates with {{claim_0}}, arithmetic with {{calc_0}}, or use the exact reference provided in computed_facts ({{stat_0}}, etc.).',
     },
     facts: {
       type: 'array', maxItems: 50,
@@ -1002,7 +1032,7 @@ function toolDefinitions() {
   return [
     { type: 'function', function: { name: 'create_analysis', description: 'Write a question-specific analysis and choose generic source facts, exact aggregates, generic arithmetic, and optional detail columns. The model owns narrative and structure; the host binds or computes every exact value.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['analysis_markdown'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
-    { type: 'function', function: { name: 'create_chart', description: 'Create an SVG chart from exact source columns. The tool owns title, annotations, and filename; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
+    { type: 'function', function: { name: 'create_chart', description: 'Create a native inline chart in the same result card from exact source columns. The tool binds all data; this output is not a downloadable file.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
     { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
     { type: 'function', function: { name: 'create_pdf', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
   ];
@@ -1078,6 +1108,8 @@ export async function runInternalResultAgent(options) {
     requested_outputs: outputs,
     result_manifest: envelope.manifest,
     rows: envelope.rows,
+    computed_numeric_evidence: numericEvidence(envelope),
+    computed_facts: statisticEvidence(envelope).map(({ display, ...fact }) => fact),
   });
   if (Buffer.byteLength(serialized) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const messages = [
@@ -1095,6 +1127,8 @@ export async function runInternalResultAgent(options) {
         '差值、比值、变化率等派生数字使用 calculations，由宿主精确计算，并引用从零开始编号的 {{calc_0}}、{{calc_1}}；percent_change 的 operands 顺序是 [基准值, 当前值]，占位符只返回数值，正文需要自行补 %；不要在正文里自行填写派生数字。',
         '自由 Markdown 中不得直接写任何精确数字，即使数字来自 rows、用户问题或 context；原始值必须用 facts，聚合用 claims，跨行算术用 calculations。自然语言趋势、风险和建议可以自由表达。',
         '分析判断可以发散，但不得把推测写成已证实事实；可能原因应明确标注需要结合业务信息核查。',
+        'computed_numeric_evidence 是工具精确计算的校对依据，不是固定输出模板。平均值使用对应列的 average claim，最低/最高值的日期从对应 row_indices 选择 fact；不要把 count 或其他列的值称为日均。趋势依据相邻变化核对，存在反弹不得说连续回落。结果行顺序不代表时间顺序时，不推断时间趋势。',
+        'computed_facts 已提供带 reference 的可信统计值，可直接把 reference（如 {{stat_0}}）放入正文，无需另建 facts。相邻上升/下降次数只能引用 adjacent_up_count/adjacent_down_count 的 reference，不能引用日期或某日业务值。',
         '数据口径由宿主根据可信 context 生成自然段；不得输出 SQL、身份凭据或本机路径。',
       ].join('\n'),
     },
@@ -1142,8 +1176,8 @@ export async function runInternalResultAgent(options) {
         notice ? `数据范围说明：${notice}` : null,
       ].filter(Boolean).join('\n\n');
       return {
-        markdown,
-        files: artifacts.map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),
+        markdown: [markdown, ...artifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown)].join('\n\n'),
+        files: artifacts.filter(artifact => artifact.path).map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),
         artifactTypes: artifacts.map(artifact => artifact.type),
         manifest: envelope.manifest,
         audit: {
@@ -1184,11 +1218,11 @@ export async function runInternalResultAgent(options) {
           }
           const notice = scopeNotice(envelope.manifest);
           return {
-            markdown: analysis?.markdown || [
+            markdown: [analysis?.markdown || [
               `已按同一份受控查询结果生成 ${sanitizedArtifacts.length} 个产物。`,
               notice ? `数据范围说明：${notice}` : null,
-            ].filter(Boolean).join('\n\n'),
-            files: sanitizedArtifacts.map(artifact => ({
+            ].filter(Boolean).join('\n\n'), ...sanitizedArtifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown)].join('\n\n'),
+            files: sanitizedArtifacts.filter(artifact => artifact.path).map(artifact => ({
               path: artifact.path, filename: artifact.filename, type: artifact.type,
             })),
             artifactTypes: sanitizedArtifacts.map(artifact => artifact.type),
@@ -1231,6 +1265,7 @@ export async function runInternalResultAgent(options) {
               '占位符可以嵌入自然语言或表格单元格，但编号必须与 facts/claims/calculations 数组的零基位置一致。',
               '自由 Markdown 不得直接写任何精确数字；原始数字也必须用 fact，聚合交给 claim，跨行算术交给 calculation。',
               '纯文本或单行结果直接使用 facts，不要强行创建数值 claims。',
+              'computed_facts 的 reference 可直接引用统计值，尤其上升/下降次数；不要用日期事实或原始行数值冒充变化次数。',
             ].join(''),
           }),
         },

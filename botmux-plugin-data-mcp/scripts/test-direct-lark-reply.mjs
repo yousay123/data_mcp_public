@@ -53,23 +53,38 @@ const receipt = await deliverDirectLarkReply(caller('om_file'), {
 if (!receipt.delivered || receipt.attachmentCount !== 1) throw new Error('attachment receipt mismatch');
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
 const fileSend = records.find(row => row.args[0] === 'send' && row.args.includes('--files'));
-const noticeSend = records.find(row => row.args[0] === 'send' && row.content?.includes('完整结果见附件'));
-if (!fileSend || fileSend.content !== '' || !noticeSend?.content.includes('SYNTHETIC_SUMMARY')) {
-  throw new Error('attachment-first delivery order mismatch');
+if (!fileSend?.content.includes('SYNTHETIC_SUMMARY')
+  || records.filter(row => row.args[0] === 'send' && row.args.includes('om_file')).length !== 1) {
+  throw new Error('analysis and attachment must use one combined send');
 }
-for (const send of [fileSend, noticeSend]) {
+for (const send of [fileSend]) {
   const quoteIndex = send.args.indexOf('--quote');
   if (quoteIndex < 0 || send.args[quoteIndex + 1] !== 'om_file') {
     throw new Error('every attachment delivery send must stay anchored to the signed turnId');
   }
 }
-if (fileSend.args[fileSend.args.indexOf('--response-kind') + 1] !== 'auxiliary'
-  || noticeSend.args[noticeSend.args.indexOf('--response-kind') + 1] !== 'final') {
-  throw new Error('file/text response lanes were not separated');
+if (fileSend.args[fileSend.args.indexOf('--response-kind') + 1] !== 'final') {
+  throw new Error('combined delivery must finalize once');
+}
+const secondWorkbook = join(outbound, 'second.xlsx');
+writeFileSync(secondWorkbook, 'SECOND_WORKBOOK');
+await deliver('om_two_files', { markdown: '', files: [{ path: workbook }, { path: secondWorkbook }] });
+records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+const twoFiles = records.find(row => row.args[0] === 'send' && row.args.includes('om_two_files'));
+if (!twoFiles?.content.trim() || twoFiles.args.filter(arg => arg === '--files').length !== 2) {
+  throw new Error('multi-file delivery requires a primary card body');
 }
 
 const longReceipt = await deliverDirectLarkReply(caller('om_long'), { markdown: '数'.repeat(30_000) }, pluginHome);
 if (!longReceipt.truncated || longReceipt.textBytes > 20_000) throw new Error('UTF-8 truncation limit failed');
+const chartSpec = { data: { values: [{ x: 'a', y: 1 }, { x: 'b', y: 2 }] }, mark: 'line' };
+await deliver('om_long_chart', { markdown: '数'.repeat(30_000) + '\n\n```vega-lite\n' + JSON.stringify(chartSpec) + '\n```' });
+records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+const longChart = records.find(row => row.args[0] === 'send' && row.args.includes('om_long_chart'));
+const preservedSpec = longChart.content.match(/```vega-lite\n([^]*?)\n```/u)?.[1];
+if (!preservedSpec || JSON.parse(preservedSpec).data.values.length !== 2 || Buffer.byteLength(longChart.content) > 20_000) {
+  throw new Error('truncation corrupted the native chart');
+}
 
 for (const rejected of [
   caller('turn_synthetic'),
@@ -106,8 +121,8 @@ try {
 delete process.env.FAKE_BOTMUX_FAIL;
 if (attachmentFailure !== 'direct_reply_attachment_failed') throw new Error('attachment failure code mismatch');
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
-if (records.some(row => row.content?.includes('NO_FALSE_NOTICE'))) {
-  throw new Error('text notice was sent after attachment failure');
+if (records.filter(row => row.content?.includes('NO_FALSE_NOTICE')).length !== 1) {
+  throw new Error('failed combined send must not trigger an automatic resend');
 }
 
 for (const fileResult of ['failed-attachment', 'missing-message-id']) {
@@ -120,14 +135,14 @@ for (const fileResult of ['failed-attachment', 'missing-message-id']) {
     }, pluginHome);
   } catch (error) { partialAttachmentFailure = error.code; }
   delete process.env.FAKE_BOTMUX_FILE_RESULT;
-  if (partialAttachmentFailure !== 'direct_reply_attachment_failed') {
+  if (partialAttachmentFailure !== 'direct_reply_partial_delivery') {
     throw new Error(`partial attachment failure was accepted: ${fileResult}`);
   }
 }
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
-if (records.some(row => row.content?.includes('NO_FALSE_NOTICE_failed-attachment')
-  || row.content?.includes('NO_FALSE_NOTICE_missing-message-id'))) {
-  throw new Error('text notice was sent after a partial attachment failure');
+if (records.filter(row => row.content?.includes('NO_FALSE_NOTICE_failed-attachment')).length !== 1
+  || records.filter(row => row.content?.includes('NO_FALSE_NOTICE_missing-message-id')).length !== 1) {
+  throw new Error('partial attachment delivery must not automatically resend the card');
 }
 
 const outsideWorkbook = join(root, 'outside.xlsx');
@@ -142,7 +157,7 @@ if (outsideFailure !== 'direct_reply_attachment_failed') {
   throw new Error('regular file outside outbound was not rejected');
 }
 
-process.env.FAKE_BOTMUX_FAIL = 'text';
+process.env.FAKE_BOTMUX_FAIL = 'send';
 let partial;
 try {
   await deliverDirectLarkReply(caller('om_partial_text'), {
@@ -150,6 +165,6 @@ try {
   }, pluginHome);
 } catch (error) { partial = error.code; }
 delete process.env.FAKE_BOTMUX_FAIL;
-if (partial !== 'direct_reply_partial_delivery') throw new Error('partial delivery code mismatch');
+if (partial !== 'direct_reply_attachment_failed') throw new Error('unconfirmed delivery code mismatch');
 
 console.log('direct Feishu reply tests passed');

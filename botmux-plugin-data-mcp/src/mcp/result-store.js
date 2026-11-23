@@ -199,16 +199,21 @@ export class ResultStore {
     return updated;
   }
 
-  reserveTurn(identity, turnId, now = Date.now()) {
+  reserveTurn(identity, turnId, now = Date.now(), scopes = ['all']) {
     if (typeof turnId !== 'string' || !turnId.trim()) throw new Error('result_store_turn_required');
     const { bindingKey } = this.binding(identity);
-    const turnKey = this.digest('turn-v1', [bindingKey, turnId]);
-    const path = join(this.turns, `${turnKey}.lock`);
+    const acquired = [];
     try {
-      const fd = openSync(path, 'wx', 0o600);
-      try { writeFileSync(fd, `${now}\n`); } finally { closeSync(fd); }
+      for (const scope of [...new Set(scopes)].sort()) {
+        const turnKey = this.digest('turn-v2', [bindingKey, turnId, scope]);
+        const path = join(this.turns, `${turnKey}.lock`);
+        const fd = openSync(path, 'wx', 0o600);
+        acquired.push(path);
+        try { writeFileSync(fd, `${now}\n`); } finally { closeSync(fd); }
+      }
       return true;
     } catch (error) {
+      for (const path of acquired) safeUnlink(path);
       if (error?.code === 'EEXIST') return false;
       throw error;
     }

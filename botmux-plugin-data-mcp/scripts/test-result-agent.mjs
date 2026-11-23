@@ -166,6 +166,18 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
+    if (responseMode === 'stat-evidence') {
+      const content = JSON.parse(payload.messages.find(message => message.role === 'user').content);
+      const reference = content.computed_facts.find(fact => fact.column === 'amount' && fact.operation === 'adjacent_up_count').reference;
+      const repairing = payload.messages.some(message => message.role === 'tool');
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
+        id: 'stat-evidence', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
+          analysis_markdown: repairing ? `相邻上升 ${reference} 次。` : '相邻上升 {{fact_0}} 次。',
+          ...(repairing ? {} : { facts: [{ row_index: 0, column: 'stat_date' }] }),
+        }) },
+      }] } }] }));
+      return;
+    }
     if (responseMode === 'summary-detail') {
       const call = {
         id: 'summary-detail', type: 'function',
@@ -313,14 +325,25 @@ if (!delivered.markdown.includes('## 数据口径')
   || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
   throw new Error('analysis did not combine result and query scope');
 }
-if (delivered.files.length !== 4 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
+if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
   throw new Error('result Agent did not create every requested artifact');
+}
+const inlineChart = JSON.parse(delivered.markdown.match(/```vega-lite\n([^]*?)\n```/u)[1]);
+if (inlineChart.mark !== 'line' || inlineChart.data.values[1].category !== '2026-03-02'
+  || Number(inlineChart.data.values[1].value) !== 18.75 || delivered.files.some(file => file.type === 'chart')) {
+  throw new Error('chart must bind source rows in the result card rather than become an SVG attachment');
+}
+const numericSummary = JSON.parse(requests[0].payload.messages.find(message => message.role === 'user').content)
+  .computed_numeric_evidence.find(summary => summary.column === 'amount');
+if (Number(numericSummary.average) !== 15.625 || numericSummary.minimum_row_indices.join() !== '0'
+  || numericSummary.adjacent_changes_in_result_order.up !== 1) {
+  throw new Error('model did not receive exact generic analysis evidence');
 }
 if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -385,9 +408,6 @@ for (const file of delivered.files) {
   const content = readFileSync(file.path);
   if (file.type === 'excel' && content.subarray(0, 2).toString() !== 'PK') throw new Error('invalid xlsx');
   if (file.type === 'pdf' && content.subarray(0, 5).toString() !== '%PDF-') throw new Error('invalid pdf');
-  if (file.type === 'chart' && (!content.toString().includes('<svg') || !content.toString().includes('2026-03-02'))) {
-    throw new Error('chart did not use protected source rows');
-  }
   if (file.type === 'document' && !content.toString().includes('18.75')) throw new Error('document did not use protected source rows');
 }
 
@@ -423,6 +443,15 @@ for (const expected of ['相加 31.25', '相减 6.25', '相乘 234.375', '相除
 }
 if (calculationDelivery.markdown.includes('NaN') || calculationDelivery.markdown.includes('Infinity')) {
   throw new Error(`generic row-bound calculations were not rendered exactly: ${calculationDelivery.markdown}`);
+}
+
+responseMode = 'stat-evidence';
+const statDelivery = await runInternalResultAgent({
+  result, question: '解释相邻变化', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!statDelivery.markdown.includes('相邻上升 1 次。')
+  || statDelivery.markdown.includes('2026-03-01 次') || statDelivery.audit.modelRepairCount !== 1) {
+  throw new Error('date/count type mismatch was not repaired using trusted statistics');
 }
 
 responseMode = 'summary-detail';
@@ -612,7 +641,7 @@ for (const claim of exactClaims) {
   const utf16 = Buffer.from(`\ufeff${claim}`, 'utf16le').swap16().toString('hex').toUpperCase();
   if (!readFileSync(pdf.path).toString().includes(utf16)) throw new Error(`missing exact PDF claim: ${claim}`);
 }
-if (!readFileSync(precision.files.find(file => file.type === 'chart').path, 'utf8').includes('<svg')) {
+if (!precision.markdown.includes('```vega-lite') || !precision.markdown.includes('9007199254740993.00')) {
   throw new Error('high-precision chart was not generated from exact decimal inputs');
 }
 
@@ -682,7 +711,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v3') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

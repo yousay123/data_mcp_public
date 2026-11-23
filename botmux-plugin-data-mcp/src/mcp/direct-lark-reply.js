@@ -155,6 +155,18 @@ function assertOutboundFile(path, pluginHome) {
   }
 }
 
+function prepareCardText(text) {
+  const charts = [...text.matchAll(/```(?:vega-lite|vegalite)[ \t]*\r?\n[\s\S]*?\n```/gu)].map(match => match[0]);
+  if (!charts.length) return truncateUtf8(text);
+  const chartText = `\n\n${charts.join('\n\n')}`;
+  const chartBytes = Buffer.byteLength(chartText);
+  // Never cut a JSON fence in half: a malformed fence loses the native chart.
+  if (chartBytes > MAX_DIRECT_REPLY_TEXT_BYTES - 128) throw fixedError('direct_reply_text_too_large');
+  const narrative = text.replace(/```(?:vega-lite|vegalite)[ \t]*\r?\n[\s\S]*?\n```/gu, '').trim();
+  const prepared = truncateUtf8(narrative, MAX_DIRECT_REPLY_TEXT_BYTES - chartBytes);
+  return { text: prepared.text + chartText, bytes: prepared.bytes + chartBytes, truncated: prepared.truncated };
+}
+
 function successfulSend(result) {
   return result?.success === true && typeof result?.messageId === 'string';
 }
@@ -168,53 +180,37 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
   if (files.length > 6) throw fixedError('direct_reply_attachment_failed');
   const baseText = typeof delivery?.markdown === 'string' ? delivery.markdown.trim() : '';
   const temporary = mkdtempSync(join(tmpdir(), 'data-mcp-direct-reply-'));
-  let attachmentCount = 0;
   try {
     const bodyPath = join(temporary, 'reply.md');
-    if (files.length > 0) {
-      writeFileSync(bodyPath, '', { mode: 0o600 });
-      let fileResult;
-      try {
-        fileResult = await runBotmux([
-          'send', '--content-file', bodyPath,
-          ...files.flatMap(file => ['--files', file]),
-          '--no-mention', '--response-kind', 'auxiliary',
-          '--quote', identity.turnId,
-        ]);
-      } catch {
-        throw fixedError('direct_reply_attachment_failed');
-      }
-      const failed = Array.isArray(fileResult.failedAttachments) ? fileResult.failedAttachments.length : 0;
-      const sent = Array.isArray(fileResult.attachmentMessageIds) ? fileResult.attachmentMessageIds.length : 0;
-      if (!successfulSend(fileResult) || failed > 0 || sent !== files.length) {
-        throw fixedError('direct_reply_attachment_failed');
-      }
-      attachmentCount = files.length;
-    }
-
-    const withAttachmentNotice = attachmentCount > 0
-      ? `${baseText}${baseText ? '\n\n' : ''}完整结果见附件。`
-      : baseText;
-    const prepared = truncateUtf8(withAttachmentNotice);
+    // The host requires a primary card body when multiple files accompany a reply.
+    // One send also keeps analysis and native charts in the same card.
+    const prepared = prepareCardText(baseText || (files.length ? '查询结果文件见附件。' : '查询结果为空。'));
     writeFileSync(bodyPath, prepared.text, { mode: 0o600 });
     let textResult;
     try {
       textResult = await runBotmux([
         'send', '--content-file', bodyPath,
-        '--no-mention', '--response-kind', 'final',
+        ...files.flatMap(file => ['--files', file]),
+        '--no-mention', '--response-kind', delivery?.responseKind === 'auxiliary' ? 'auxiliary' : 'final',
         '--quote', identity.turnId,
       ]);
     } catch {
       throw fixedError(
-        attachmentCount > 0 ? 'direct_reply_partial_delivery' : 'direct_reply_transport_failed',
-        { delivered: false, textBytes: 0, attachmentCount, truncated: prepared.truncated },
+        files.length > 0 ? 'direct_reply_attachment_failed' : 'direct_reply_transport_failed',
+        { delivered: false, textBytes: 0, attachmentCount: 0, truncated: prepared.truncated },
       );
     }
     if (!successfulSend(textResult)) {
       throw fixedError(
-        attachmentCount > 0 ? 'direct_reply_partial_delivery' : 'direct_reply_transport_failed',
-        { delivered: false, textBytes: 0, attachmentCount, truncated: prepared.truncated },
+        'direct_reply_transport_failed',
+        { delivered: false, textBytes: 0, attachmentCount: 0, truncated: prepared.truncated },
       );
+    }
+    const attachmentCount = Array.isArray(textResult.attachmentMessageIds) ? textResult.attachmentMessageIds.length : 0;
+    if (attachmentCount !== files.length || textResult.failedAttachments?.length > 0) {
+      throw fixedError('direct_reply_partial_delivery', {
+        delivered: false, textBytes: prepared.bytes, attachmentCount, truncated: prepared.truncated,
+      });
     }
     return {
       delivered: true,

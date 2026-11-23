@@ -113,7 +113,7 @@ const response = await new Promise((resolvePromise, rejectPromise) => {
 });
 
 const receipt = JSON.parse(response?.result?.content?.[0]?.text || '{}');
-if (receipt.status !== 'delivered' || receipt.attachmentCount !== 4) {
+if (receipt.status !== 'delivered' || receipt.attachmentCount !== 3) {
   throw new Error(`exact chain delivery failed: ${JSON.stringify(response)}`);
 }
 if (modelRows?.[0]?.amount !== '9007199254740993.00'
@@ -122,7 +122,7 @@ if (modelRows?.[0]?.amount !== '9007199254740993.00'
 }
 
 const records = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse);
-const delivery = records.find(record => record.args[0] === 'send' && record.files?.length === 4);
+const delivery = records.find(record => record.args[0] === 'send' && record.files?.length === 3);
 if (!delivery) throw new Error('trusted delivery did not capture every exact artifact');
 const deliveredText = records.map(record => record.content || '').join('\n');
 const exactClaims = [
@@ -158,7 +158,7 @@ function zipEntries(bytes) {
 const captured = Object.fromEntries(delivery.files.map(file => [file.path.split('.').pop(), Buffer.from(file.base64, 'base64')]));
 const document = captured.md.toString('utf8');
 const pdfText = captured.pdf.toString('latin1');
-const chart = captured.svg.toString('utf8');
+const chart = deliveredText.match(/```vega-lite\n([^]*?)\n```/u)?.[1] || '';
 const workbook = zipEntries(captured.xlsx).get('xl/worksheets/sheet1.xml')?.toString('utf8') || '';
 for (const claim of exactClaims) {
   if (!document.includes(claim)) throw new Error(`document lost exact claim: ${claim}`);
@@ -168,7 +168,7 @@ for (const claim of exactClaims) {
 for (const sourceValue of ['9007199254740993.00', '18446744073709551615', '-3.50']) {
   if (!workbook.includes(sourceValue)) throw new Error(`Excel lost exact source value: ${sourceValue}`);
 }
-if (!chart.includes('<svg') || !chart.includes('184467440737')) {
+if (JSON.parse(chart).mark !== 'bar' || !chart.includes('18446744073709551615')) {
   throw new Error('chart did not bind exact large-integer labels');
 }
 if (delivery.files.some(file => existsSync(file.path))) throw new Error('trusted delivery did not clean staged files');

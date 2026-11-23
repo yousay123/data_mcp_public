@@ -55,6 +55,7 @@ function cleanupStaleOutboundArtifacts(now = Date.now()) {
   for (const name of readdirSync(outbound)) {
     if (!OUTBOUND_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix) || name.startsWith(`.${prefix}`))) continue;
     const path = join(outbound, name);
+    if (stagedOutboundArtifacts.has(path)) continue;
     try {
       if (now - statSync(path).mtimeMs >= OUTBOUND_STALE_AFTER_MS) unlinkSync(path);
     } catch { /* concurrent consumer or unrelated filesystem failure */ }
@@ -62,6 +63,12 @@ function cleanupStaleOutboundArtifacts(now = Date.now()) {
 }
 
 cleanupStaleOutboundArtifacts();
+// Failed artifacts survive a turn/process, but not indefinitely in a long-lived server.
+const outboundSweep = setInterval(() => {
+  try { cleanupStaleOutboundArtifacts(); }
+  catch { console.error('[data-mcp] outbound cleanup failed'); }
+}, 60_000);
+outboundSweep.unref();
 process.once('exit', removeStagedOutboundArtifacts);
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
@@ -1154,7 +1161,11 @@ async function continueQueryResult(caller, args, runtimeConfig) {
     store.audit(identity, caller.turnId, question, null, active.status);
     return { error: fixedFollowupResult(active.status) };
   }
-  if (!store.reserveTurn(identity, caller.turnId)) {
+  const outputScopes = [...new Set(requestedOutputs(args))];
+  if (!outputScopes.length || outputScopes.some(output => !['analysis', 'chart', 'excel', 'pdf', 'document'].includes(output))) {
+    return { error: fixedFollowupResult('invalid_followup_request') };
+  }
+  if (!store.reserveTurn(identity, caller.turnId, Date.now(), outputScopes)) {
     store.audit(identity, caller.turnId, question, active.record.version, 'rate_limited');
     return { error: fixedFollowupResult('rate_limited') };
   }
@@ -1227,19 +1238,24 @@ async function sendPreparedDirectReply(caller, prepared) {
   const paths = Array.isArray(prepared.delivery?.files)
     ? prepared.delivery.files.map(file => file?.path).filter(Boolean)
     : [];
+  for (const path of paths) stagedOutboundArtifacts.add(path);
   const guard = prepared.resultGuard;
   const queueKey = guard?.store && guard?.identity
     ? guard.store.binding(guard.identity).bindingKey
     : null;
   const previous = queueKey ? directDeliveryQueues.get(queueKey) || Promise.resolve() : Promise.resolve();
   const operation = previous.catch(() => {}).then(async () => {
+    let delivered = false;
     try {
       if (guard) guard.store.assertVersion(guard.identity, guard.version);
+      const responseKind = guard && !guard.store.reserveTurn(guard.identity, caller.turnId, Date.now(), ['delivery_primary'])
+        ? 'auxiliary' : 'final';
       const receipt = await deliverDirectLarkReply(
         caller,
-        prepared.delivery,
+        { ...prepared.delivery, responseKind },
         nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
       );
+      delivered = receipt.delivered === true;
       return { status: 'delivered', ...receipt };
     } catch (error) {
       if (error?.message === 'result_store_version_changed') {
@@ -1247,10 +1263,13 @@ async function sendPreparedDirectReply(caller, prepared) {
       }
       return directReplyFailure(error);
     } finally {
-      if (guard?.clearAfterDelivery) {
+      if (delivered && guard?.clearAfterDelivery) {
         guard.store.clearIfVersion(guard.identity, guard.version);
       }
-      for (const path of paths) discardStagedOutboundArtifact(path);
+      for (const path of paths) {
+        if (delivered) discardStagedOutboundArtifact(path);
+        else stagedOutboundArtifacts.delete(path); // Retain private artifacts until the bounded stale-file cleanup.
+      }
     }
   });
   if (queueKey) {

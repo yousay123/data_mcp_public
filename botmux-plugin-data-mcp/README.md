@@ -291,6 +291,24 @@ accepts SQL, table names, identity, or task fields from model arguments.
 
 ## Current Status
 
+### Result delivery (0.4.18)
+
+- Analysis, the source-bound detail table, and the native Vega-Lite chart share
+  one primary card. Charts are not SVG file attachments; Excel remains an XLSX
+  attachment in the same send operation. The host must support Vega-Lite cards.
+- Follow-ups reserve requested output types separately for each trusted turn.
+  The same output is not retried automatically; a different missing output may
+  be delivered through the auxiliary lane after the primary reply. An ambiguous
+  transport result must be reconciled before retrying to avoid duplicate files.
+- Only confirmed complete delivery removes staged files immediately. Failed
+  private artifacts survive process shutdown and expire after fifteen minutes,
+  with a one-minute sweep interval. Queued/in-flight files are excluded from
+  the sweep. Retention is not a user-visible recovery handle.
+- Exact statistics and adjacent-change counts are supplied as trusted evidence
+  for model-authored analysis. Bound values and date/count type mismatches are
+  checked; this does not prove every qualitative interpretation or causal claim
+  in natural language. Such claims still require analytical review.
+
 This plugin expects a Data MCP HTTP service to be reachable from the host. If
 the service is absent, identity-bound tools return a structured
 `Data MCP 服务不可达` error instead of falling back to model-supplied identity or

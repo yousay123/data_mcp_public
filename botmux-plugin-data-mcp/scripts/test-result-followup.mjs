@@ -314,13 +314,18 @@ if (!JSON.stringify(botCaller).includes('trusted_human_or_schedule_required')) t
 
 const excel = await plugin.call('continue_query_result_for_user', {
   question: 'export the active result', requested_outputs: ['excel'],
-}, { ...callerA, turnId: 'om_excel' });
+}, followupCaller);
 const excelVisible = JSON.stringify(excel.result?.content ?? []);
 if (excelVisible.includes(rowSentinel) || excelVisible.includes('.xlsx') || excelVisible.includes(root)) {
   throw new Error('Excel direct-delivery receipt exposed rows or attachment paths');
 }
 if (toolPayload(excel).status !== 'delivered' || toolPayload(excel).attachmentCount !== 1) {
   throw new Error('Excel follow-up did not use the Agent tool and trusted delivery');
+}
+const excelSend = readFileSync(botmuxLog, 'utf8').trim().split('\n').map(JSON.parse)
+  .filter(row => row.args[0] === 'send' && row.args.includes('--files')).at(-1);
+if (excelSend.args[excelSend.args.indexOf('--response-kind') + 1] !== 'auxiliary') {
+  throw new Error('same-turn missing output must use auxiliary after the primary final');
 }
 
 const auditText = readFileSync(join(pluginHome, 'active-results-v1', 'audit.jsonl'), 'utf8');
