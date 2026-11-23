@@ -2,20 +2,25 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const MAX_IPC_BYTES = 6 * 1024 * 1024;
-// Keep the inner model deadline below the host tool-call deadline. This makes
-// failures observable here instead of leaving the caller with an ambiguous
-// 60-second timeout while the isolated child is still running.
-const AGENT_TIMEOUT_MS = 30_000;
+// Leave enough room for a bounded model retry while still returning a
+// controlled error before the outer Data MCP tool deadline.
+const AGENT_TIMEOUT_MS = 300_000;
 const workerPath = fileURLToPath(new URL('../result-agent/worker.js', import.meta.url));
 const CONFIG_KEYS = [
   'DATA_MCP_RESULT_MODEL_ENDPOINT',
   'DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS',
   'DATA_MCP_RESULT_MODEL',
   'DATA_MCP_RESULT_MODEL_API_KEY',
+  'DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS',
+  'DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS',
+  'DATA_MCP_RESULT_MODEL_REQUEST_TIMEOUT_MS',
   'DATA_MCP_RESULT_MODEL_TEST_EXCEPTION',
 ];
 
 export function runIsolatedResultAgent(options) {
+  if (Number.isFinite(options.timeoutMs) && options.timeoutMs <= 0) {
+    return Promise.reject(new Error('result_agent_timeout'));
+  }
   const request = {
     result: options.result,
     question: options.question,
@@ -36,7 +41,7 @@ export function runIsolatedResultAgent(options) {
     let stderrBytes = 0;
     let timedOut = false;
     const timeoutMs = Number.isFinite(options.timeoutMs)
-      ? Math.max(1_000, Math.min(AGENT_TIMEOUT_MS, options.timeoutMs))
+      ? Math.max(1, Math.min(AGENT_TIMEOUT_MS, options.timeoutMs))
       : AGENT_TIMEOUT_MS;
     const timer = setTimeout(() => {
       timedOut = true;

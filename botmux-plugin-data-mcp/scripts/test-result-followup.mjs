@@ -28,7 +28,20 @@ let planCounter = 0;
 let modelCalls = 0;
 const modelPayloads = [];
 let mutateActiveResultDuringModelCall;
+let resolveOldConcurrentStarted;
+let resolveOldFailureStarted;
+const oldConcurrentStarted = new Promise(resolve => { resolveOldConcurrentStarted = resolve; });
+const oldFailureStarted = new Promise(resolve => { resolveOldFailureStarted = resolve; });
 
+function waitForFixtureSignal(signal, label) {
+  return Promise.race([
+    signal,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`timed out waiting for ${label}`)),
+      5_000,
+    )),
+  ]);
+}
 function jsonResponse(res, value, status = 200) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(value));
@@ -49,7 +62,28 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/run') {
-      jsonResponse(res, {
+      if (body.query_plan_id === 'concurrent-old-failure') {
+        resolveOldFailureStarted();
+        setTimeout(() => jsonResponse(res, {
+          status: 'error', result_class: 'policy_error', datasource: 'dlc',
+          query_id: 'dlc-concurrent-old-failure', error_code: 'query_failed', retryable: false,
+          failure_stage: 'dlc_authorization', failure_action: 'DescribeTasks',
+          diagnostic_source: 'wedata-tencent-workflow', diagnostic_case: 'PERM-002',
+          diagnostic_summary: '合成旧请求失败', suggested_action: '合成建议',
+        }), 300);
+        return;
+      }
+      const scenario = body.query_plan_id === 'concurrent-old'
+        ? { marker: 'OLD_RESULT', delayMs: 300 }
+        : body.query_plan_id === 'concurrent-new'
+          ? { marker: 'NEW_RESULT', delayMs: 10 }
+          : null;
+      if (body.query_plan_id === 'concurrent-old') resolveOldConcurrentStarted();
+      const columns = [
+        { name: 'synthetic_value', type: 'String' },
+        ...(scenario ? [{ name: 'scenario_marker', type: 'String' }] : []),
+      ];
+      const response = {
         status: 'success', datasource: 'tchouse-c', row_count: 1,
         rows_before_limit_at_least: 1, truncated: false,
         effective_limit: 200, truncation_uncertain: true,
@@ -57,10 +91,12 @@ const service = createServer((req, res) => {
         user_limit_notice: '当前结果仅代表限定范围，不能用于全量汇总。',
         limit_notice: '查询结果达到或超出限制（上限 200 行）',
         limit_injected: true, limit_capped: false,
-        columns: [{ name: 'synthetic_value', type: 'String' }],
-        rows: [{ synthetic_value: rowSentinel }],
-        result_context: canonicalContext([{ name: 'synthetic_value', type: 'String' }]),
-      });
+        columns,
+        rows: [{ synthetic_value: rowSentinel, ...(scenario ? { scenario_marker: scenario.marker } : {}) }],
+        result_context: canonicalContext(columns),
+      };
+      if (scenario) setTimeout(() => jsonResponse(res, response), scenario.delayMs);
+      else jsonResponse(res, response);
       return;
     }
     jsonResponse(res, { status: 'error' }, 404);
@@ -84,6 +120,7 @@ const model = createServer((req, res) => {
       if (!tools.includes('create_excel')) throw new Error('internal result Agent did not receive Excel tool');
       const content = JSON.parse(body.messages.find(message => message.role === 'user').content);
       const analysis = content.requested_outputs.includes('analysis');
+      const scenario = content.result_manifest.columns.some(column => column.name === 'scenario_marker');
       jsonResponse(res, { choices: [{ message: {
         content: null,
         tool_calls: [{
@@ -91,7 +128,12 @@ const model = createServer((req, res) => {
           function: {
             name: analysis ? 'create_analysis' : 'create_excel',
             arguments: JSON.stringify(analysis ? {
-              claims: [{ operation: 'count' }],
+              analysis_markdown: scenario ? '# 并发结果\n\n{{fact_0}}' : '# 合成结果\n\n{{fact_0}}',
+              facts: [{
+                row_index: 0,
+                column: scenario ? 'scenario_marker' : 'synthetic_value',
+                label: scenario ? '场景' : '结果值',
+              }],
             } : {
               sheets: [{ columns: ['synthetic_value'] }],
             }),
@@ -304,6 +346,62 @@ for (const expected of [
   if (!followupModelPayload.includes(expected)) {
     throw new Error(`stored follow-up result lost limit evidence: ${expected}`);
   }
+}
+
+const sendsBeforeConcurrent = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').length;
+const oldRequest = plugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'concurrent-old', output_mode: 'analysis', question: 'old concurrent result',
+}, { ...callerA, turnId: 'om_concurrent_old' });
+await waitForFixtureSignal(oldConcurrentStarted, 'old concurrent service request');
+const newRequest = plugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'concurrent-new', output_mode: 'analysis', question: 'new concurrent result',
+}, { ...callerA, turnId: 'om_concurrent_new' });
+const [oldConcurrent, newConcurrent] = await Promise.all([oldRequest, newRequest]);
+if (!JSON.stringify(oldConcurrent).includes('result_superseded')
+  || toolPayload(newConcurrent).status !== 'delivered') {
+  throw new Error('a slower first-turn result was not superseded by the newer generation');
+}
+const concurrentSends = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').slice(sendsBeforeConcurrent);
+if (concurrentSends.length !== 1
+  || !concurrentSends[0].content.includes('NEW_RESULT')
+  || concurrentSends[0].content.includes('OLD_RESULT')) {
+  throw new Error('superseded first-turn data was delivered or the newer result was not delivered once');
+}
+const concurrentActive = liveStore.read(liveIdentity);
+if (concurrentActive.status !== 'active'
+  || concurrentActive.record.payload.result.rows[0].scenario_marker !== 'NEW_RESULT') {
+  throw new Error('the active result store retained the slower superseded generation');
+}
+
+const sendsBeforeFailureRace = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').length;
+const oldFailureRequest = plugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'concurrent-old-failure', output_mode: 'analysis', question: 'old failure',
+}, { ...callerA, turnId: 'om_concurrent_old_failure' });
+await waitForFixtureSignal(oldFailureStarted, 'old failure service request');
+const newerSuccessRequest = plugin.call('deliver_query_result_for_user', {
+  sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
+  query_plan_id: 'concurrent-new', output_mode: 'analysis', question: 'new success after old failure',
+}, { ...callerA, turnId: 'om_concurrent_new_after_failure' });
+const [oldFailure, newerSuccess] = await Promise.all([oldFailureRequest, newerSuccessRequest]);
+if (!JSON.stringify(oldFailure).includes('result_superseded')
+  || toolPayload(newerSuccess).status !== 'delivered') {
+  throw new Error(`an older failed query was not superseded by the newer successful generation: ${JSON.stringify({
+    oldFailure: toolPayload(oldFailure),
+    newerSuccess: toolPayload(newerSuccess),
+  })}`);
+}
+const failureRaceSends = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').slice(sendsBeforeFailureRace);
+if (failureRaceSends.length !== 1
+  || !failureRaceSends[0].content.includes('NEW_RESULT')
+  || failureRaceSends[0].content.includes('DLC 查询失败')) {
+  throw new Error('a superseded failure message was delivered after the newer result');
 }
 
 await plugin.close();

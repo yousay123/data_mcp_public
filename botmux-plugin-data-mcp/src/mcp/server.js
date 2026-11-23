@@ -22,8 +22,10 @@ const SENSITIVE_PROCESS_ENV_KEYS = [
 ];
 const OUTBOUND_ARTIFACT_PREFIXES = ['data-mcp-', 'result-agent-'];
 const OUTBOUND_STALE_AFTER_MS = 15 * 60 * 1000;
-const DELIVERY_BUDGET_MS = 55_000;
+const DELIVERY_BUDGET_MS = 330_000;
+const DIRECT_DELIVERY_RESERVE_MS = 30_000;
 const stagedOutboundArtifacts = new Set();
+const directDeliveryQueues = new Map();
 let hostEnvCache;
 let packageVersionCache;
 
@@ -225,17 +227,29 @@ function configValue(name) {
   return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
 }
 
+function hostOnlyConfigValue(name) {
+  const fromHostFile = hostEnv()[name];
+  return typeof fromHostFile === 'string' && fromHostFile ? fromHostFile : undefined;
+}
+
 if (configValue('DATA_MCP_RESULT_MODEL_TEST_EXCEPTION')) {
   console.error('[data-mcp] WARN test-only result model endpoint exception is configured');
 }
-if (configValue('DATA_MCP_TEST_PROFILE_APP_ID') || configValue('DATA_MCP_TEST_PROFILE_ENV_FILE')) {
+if (process.env.DATA_MCP_TEST_PROFILE_APP_ID || process.env.DATA_MCP_TEST_PROFILE_ENV_FILE) {
+  console.error(
+    '[data-mcp] WARN process-level signed-app test profile selectors are ignored; '
+    + 'configure them in KSHER_AGENT_DATA_MCP_ENV_FILE',
+  );
+}
+if (hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_APP_ID')
+  || hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_ENV_FILE')) {
   console.error('[data-mcp] WARN signed-app test profile selection is configured');
 }
 
 function runtimeConfigForCaller(caller) {
   const profile = resolveSignedAppTestProfile(caller, {
-    DATA_MCP_TEST_PROFILE_APP_ID: configValue('DATA_MCP_TEST_PROFILE_APP_ID'),
-    DATA_MCP_TEST_PROFILE_ENV_FILE: configValue('DATA_MCP_TEST_PROFILE_ENV_FILE'),
+    DATA_MCP_TEST_PROFILE_APP_ID: hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_APP_ID'),
+    DATA_MCP_TEST_PROFILE_ENV_FILE: hostOnlyConfigValue('DATA_MCP_TEST_PROFILE_ENV_FILE'),
   });
   return Object.freeze({
     testProfileSelected: profile !== undefined,
@@ -959,14 +973,15 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
   const deliveryStartedAt = Date.now();
   let identity;
   let store;
+  let reservedVersion;
   if (caller.senderType === 'user') {
     try {
       identity = activeResultIdentity(caller);
       store = resultStoreFor(caller);
-      // A new first-turn query invalidates the old active result before any
-      // work starts. If the new snapshot cannot be stored, follow-ups must see
-      // no result rather than silently using data from the previous query.
-      store.clear(identity);
+      // Reserve a monotonically increasing generation before any asynchronous
+      // work. A slower earlier query may finish later, but it cannot overwrite
+      // or deliver after a newer first-turn query has superseded it.
+      reservedVersion = store.put(identity, { state: 'pending' }).version;
     } catch {
       try { clearAllStoredResults(nonBlankProcessEnv('BOTMUX_PLUGIN_HOME')); }
       catch { /* fail safe: follow-up store creation still remains unavailable */ }
@@ -974,10 +989,23 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       store = undefined;
     }
   }
-  const result = await callDataMcpService('run', caller, args, runtimeConfig);
+  let result;
+  try {
+    result = await callDataMcpService('run', caller, args, runtimeConfig);
+  } catch (error) {
+    if (store && Number.isSafeInteger(reservedVersion)) {
+      store.clearIfVersion(identity, reservedVersion);
+    }
+    throw error;
+  }
   if (result?.status !== 'success') {
     const failure = deterministicDlcFailure(result, args);
-    if (!failure) return { error: isolatedDeliveryFailure() };
+    if (!failure) {
+      if (store && Number.isSafeInteger(reservedVersion)) {
+        store.clearIfVersion(identity, reservedVersion);
+      }
+      return { error: isolatedDeliveryFailure() };
+    }
     return {
       delivery: {
         schemaVersion: 1,
@@ -985,6 +1013,16 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
         markdown: failure.markdown,
         responseKind: 'final',
       },
+      ...(store && Number.isSafeInteger(reservedVersion)
+        ? {
+            resultGuard: {
+              store,
+              identity,
+              version: reservedVersion,
+              clearAfterDelivery: true,
+            },
+          }
+        : {}),
     };
   }
   let authored;
@@ -993,22 +1031,8 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       result,
       args,
       runtimeConfig,
-      DELIVERY_BUDGET_MS - (Date.now() - deliveryStartedAt),
+      DELIVERY_BUDGET_MS - DIRECT_DELIVERY_RESERVE_MS - (Date.now() - deliveryStartedAt),
     );
-    if (store && identity) {
-      try {
-        store.audit(
-          identity,
-          caller.turnId || 'initial',
-          args.question || '',
-          null,
-          'result_agent_succeeded',
-          Date.now(),
-          resultAgentAuditDetail(authored.audit, result),
-        );
-      } catch { /* best-effort non-sensitive audit */ }
-    }
-    delete authored.audit;
   } catch (error) {
     const errorCode = resultAgentAuditStatus(error);
     if (store && identity) {
@@ -1030,10 +1054,44 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     }
     authored = deterministicResultAgentFailure(result, args, errorCode);
   }
-  if (store) {
-    try { store.put(identity, storedPayload(args, result)); }
-    catch {
-      store.clear(identity);
+  let committedVersion;
+  const authoredAudit = authored.audit;
+  delete authored.audit;
+  if (store && Number.isSafeInteger(reservedVersion)) {
+    try {
+      committedVersion = store.replaceIfVersion(
+        identity,
+        reservedVersion,
+        storedPayload(args, result),
+      ).version;
+      if (authoredAudit) {
+        try {
+          store.audit(
+            identity,
+            caller.turnId || 'initial',
+            args.question || '',
+            committedVersion,
+            'result_agent_succeeded',
+            Date.now(),
+            resultAgentAuditDetail(authoredAudit, result),
+          );
+        } catch { /* best-effort non-sensitive audit */ }
+      }
+    } catch (error) {
+      if (error?.message === 'result_store_version_changed') {
+        for (const file of authored.files || []) discardStagedOutboundArtifact(file.path);
+        try {
+          store.audit(
+            identity,
+            caller.turnId || 'initial',
+            args.question || '',
+            reservedVersion,
+            'result_superseded',
+          );
+        } catch { /* best-effort non-sensitive audit */ }
+        return { error: fixedFollowupResult('result_superseded') };
+      }
+      store.clearIfVersion(identity, reservedVersion);
       try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
       catch { /* best-effort non-sensitive audit */ }
     }
@@ -1046,6 +1104,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       ...(authored.files.length ? { files: authored.files } : {}),
       responseKind: 'final',
     },
+    ...(committedVersion ? { resultGuard: { store, identity, version: committedVersion } } : {}),
   };
 }
 
@@ -1100,6 +1159,7 @@ async function continueQueryResult(caller, args, runtimeConfig) {
         ...(authored.files.length ? { files: authored.files } : {}),
         responseKind: 'final',
       },
+      resultGuard: { store, identity, version: expectedVersion },
     };
   } catch (error) {
     const errorCode = resultAgentAuditStatus(error);
@@ -1139,18 +1199,39 @@ async function sendPreparedDirectReply(caller, prepared) {
   const paths = Array.isArray(prepared.delivery?.files)
     ? prepared.delivery.files.map(file => file?.path).filter(Boolean)
     : [];
-  try {
-    const receipt = await deliverDirectLarkReply(
-      caller,
-      prepared.delivery,
-      nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
-    );
-    return { status: 'delivered', ...receipt };
-  } catch (error) {
-    return directReplyFailure(error);
-  } finally {
-    for (const path of paths) discardStagedOutboundArtifact(path);
+  const guard = prepared.resultGuard;
+  const queueKey = guard?.store && guard?.identity
+    ? guard.store.binding(guard.identity).bindingKey
+    : null;
+  const previous = queueKey ? directDeliveryQueues.get(queueKey) || Promise.resolve() : Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    try {
+      if (guard) guard.store.assertVersion(guard.identity, guard.version);
+      const receipt = await deliverDirectLarkReply(
+        caller,
+        prepared.delivery,
+        nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
+      );
+      return { status: 'delivered', ...receipt };
+    } catch (error) {
+      if (error?.message === 'result_store_version_changed') {
+        return fixedFollowupResult('result_superseded');
+      }
+      return directReplyFailure(error);
+    } finally {
+      if (guard?.clearAfterDelivery) {
+        guard.store.clearIfVersion(guard.identity, guard.version);
+      }
+      for (const path of paths) discardStagedOutboundArtifact(path);
+    }
+  });
+  if (queueKey) {
+    directDeliveryQueues.set(queueKey, operation);
+    operation.finally(() => {
+      if (directDeliveryQueues.get(queueKey) === operation) directDeliveryQueues.delete(queueKey);
+    });
   }
+  return operation;
 }
 
 async function callDataMcpService(kind, caller, args, runtimeConfig) {

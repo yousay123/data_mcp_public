@@ -173,6 +173,13 @@ export class ResultStore {
     safeUnlink(this.recordPath(bindingKey));
   }
 
+  clearIfVersion(identity, expectedVersion, now = Date.now()) {
+    const current = this.read(identity, now);
+    if (current.status !== 'active' || current.record.version !== expectedVersion) return false;
+    safeUnlink(this.recordPath(current.record.bindingKey));
+    return true;
+  }
+
   assertVersion(identity, expectedVersion, now = Date.now()) {
     const current = this.read(identity, now);
     if (current.status !== 'active' || current.record.version !== expectedVersion) {

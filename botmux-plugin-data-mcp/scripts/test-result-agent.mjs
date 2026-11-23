@@ -10,9 +10,14 @@ const root = mkdtempSync(join(tmpdir(), 'data-mcp-result-agent-'));
 const pluginHome = join(root, 'plugin-home');
 let responseMode = 'tools';
 let requests = [];
+let modelHttpFailuresRemaining = 0;
+let repairResponses = 0;
 
 const toolCalls = [
-  ['call_analysis', 'create_analysis', { claims: [{ operation: 'sum', column: 'amount' }] }],
+  ['call_analysis', 'create_analysis', {
+    analysis_markdown: '# 金额变化观察\n\n{{claim_0}}\n\n金额表现存在变化，建议结合业务活动进一步核查。',
+    claims: [{ operation: 'sum', column: 'amount' }],
+  }],
   ['call_excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
   ['call_chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
   ['call_pdf', 'create_pdf', { claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }],
@@ -25,6 +30,12 @@ const modelServer = createServer((req, res) => {
   req.on('end', () => {
     const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     requests.push({ payload, authorization: req.headers.authorization });
+    if (modelHttpFailuresRemaining > 0) {
+      modelHttpFailuresRemaining -= 1;
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'synthetic transient failure' }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' });
     if (payload.tool_choice === 'none') {
       res.end(JSON.stringify({ choices: [{ message: { content: '已按同一查询结果生成全部产物。' } }] }));
@@ -66,7 +77,7 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'precision') {
       const claims = ['sum', 'average', 'minimum', 'maximum'].map(operation => ({ operation, column: 'amount' }));
       const calls = [
-        ['pa', 'create_analysis', { claims }],
+        ['pa', 'create_analysis', { analysis_markdown: '# 精度校验\n\n{{claim_0}}\n\n{{claim_1}}\n\n{{claim_2}}\n\n{{claim_3}}', claims }],
         ['pd', 'create_document', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pp', 'create_pdf', { claims, table_columns: ['stat_date', 'amount'] }],
         ['pc', 'create_chart', { type: 'bar', label_column: 'stat_date', value_column: 'amount' }],
@@ -76,7 +87,7 @@ const modelServer = createServer((req, res) => {
       return;
     }
     if (responseMode === 'invalid-decimal') {
-      const call = { id: 'bad', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      const call = { id: 'bad', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ analysis_markdown: '# 异常值\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'amount' }] }) } };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
@@ -85,10 +96,44 @@ const modelServer = createServer((req, res) => {
         id: 'count', type: 'function',
         function: {
           name: 'create_analysis',
-          arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'row_count' }] }),
+          arguments: JSON.stringify({ analysis_markdown: '# 数据量结果\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'row_count' }] }),
         },
       };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'string-fact') {
+      const call = {
+        id: 'string-fact', type: 'function',
+        function: {
+          name: 'create_analysis',
+          arguments: JSON.stringify({
+            analysis_markdown: '# 当前账号\n\n{{fact_0}}\n\n该账号来自本次查询结果。',
+            facts: [{ row_index: 0, column: 'account', label: '当前账号' }],
+          }),
+        },
+      };
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'repair-once') {
+      repairResponses += 1;
+      const args = repairResponses === 1
+        ? { analysis_markdown: '# 趋势判断\n\n较前期增长 33.3%，建议继续观察。' }
+        : {
+            analysis_markdown: '# 趋势判断\n\n{{fact_0}}\n\n建议结合业务活动继续观察。',
+            facts: [{ row_index: 1, column: 'amount', label: '最新金额' }],
+          };
+      const call = {
+        id: `repair-${repairResponses}`,
+        type: 'function',
+        function: { name: 'create_analysis', arguments: JSON.stringify(args) },
+      };
+      res.end(JSON.stringify({
+        id: `resp_repair_${repairResponses}`,
+        model: 'internal-test-model-resolved',
+        choices: [{ message: { content: null, tool_calls: [call] } }],
+      }));
       return;
     }
     res.end(JSON.stringify({
@@ -128,7 +173,7 @@ const delivered = await runInternalResultAgent({
   runtimeConfig,
   pluginHome,
 });
-if (!delivered.markdown.includes('## 查询口径')
+if (!delivered.markdown.includes('## 数据口径')
   || !delivered.markdown.includes('synthetic.events')
   || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
   throw new Error('analysis did not combine result and query scope');
@@ -140,7 +185,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -183,7 +228,7 @@ const rowCountDelivery = await runInternalResultAgent({
 });
 for (const expected of [
   '**数据量：1,261,699 行**',
-  '## 查询口径',
+  '## 数据口径',
   'DLC',
   'ksher_dim.dim_kgp_va_account',
   'COUNT(*) AS row_count',
@@ -209,6 +254,61 @@ for (const file of delivered.files) {
     throw new Error('chart did not use protected source rows');
   }
   if (file.type === 'document' && !content.toString().includes('18.75')) throw new Error('document did not use protected source rows');
+}
+
+responseMode = 'string-fact';
+const stringResult = {
+  status: 'success', datasource: 'tchouse-c', row_count: 1,
+  columns: [{ name: 'account', type: 'String' }],
+  rows: [{ account: 'trusted_user_01' }],
+  truncated: false, quality_warnings: [],
+  result_context: canonicalContext([{ name: 'account', type: 'String' }], {
+    metric_columns: ['account'],
+    metric_expressions: ['currentUser() AS account'],
+  }),
+};
+const stringDelivery = await runInternalResultAgent({
+  result: stringResult,
+  question: '只返回当前账号', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+if (!stringDelivery.markdown.includes('**当前账号**：trusted_user_01')
+  || stringDelivery.markdown.includes('返回记录数')) {
+  throw new Error('generic string fact was not rendered from the protected row');
+}
+
+responseMode = 'repair-once';
+requests = [];
+repairResponses = 0;
+const repairedDelivery = await runInternalResultAgent({
+  result,
+  question: '分析变化并给出建议',
+  requestedOutputs: ['analysis'],
+  runtimeConfig,
+  pluginHome,
+});
+if (requests.length !== 2
+  || repairedDelivery.audit?.modelRepairCount !== 1
+  || repairedDelivery.audit?.modelAttemptCount !== 2
+  || !repairedDelivery.markdown.includes('**最新金额**：18.75')
+  || repairedDelivery.markdown.includes('33.3%')) {
+  throw new Error('analysis repair did not replace an ungrounded number with a source-bound fact');
+}
+
+responseMode = 'string-fact';
+requests = [];
+modelHttpFailuresRemaining = 1;
+const retriedDelivery = await runInternalResultAgent({
+  result: stringResult,
+  question: '只返回当前账号',
+  requestedOutputs: ['analysis'],
+  runtimeConfig,
+  pluginHome,
+});
+if (requests.length !== 2
+  || retriedDelivery.audit?.modelAttemptCount !== 2
+  || retriedDelivery.audit?.modelRetriesUsed !== 1
+  || !retriedDelivery.markdown.includes('trusted_user_01')) {
+  throw new Error('transient model failure was not retried safely');
 }
 
 responseMode = 'none';
@@ -376,10 +476,82 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v1') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v2') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
+
+let exhaustedBudgetError;
+try {
+  await runIsolatedResultAgent({
+    result,
+    question: '预算已耗尽时不得继续请求模型',
+    requestedOutputs: ['analysis'],
+    runtimeConfig,
+    pluginHome,
+    timeoutMs: -1,
+  });
+} catch (error) { exhaustedBudgetError = error; }
+if (exhaustedBudgetError?.message !== 'result_agent_timeout') {
+  throw new Error(`exhausted result Agent budget must fail immediately, got ${exhaustedBudgetError?.message}`);
+}
+
+let slowModelRequests = 0;
+const slowModelServer = createServer((req, res) => {
+  req.resume();
+  req.on('end', () => {
+    slowModelRequests += 1;
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{
+              id: 'slow-string-fact',
+              type: 'function',
+              function: {
+                name: 'create_analysis',
+                arguments: JSON.stringify({
+                  analysis_markdown: '{{fact_0}}',
+                  facts: [{ row_index: 0, column: 'account', label: '当前账号' }],
+                }),
+              },
+            }],
+          },
+        }],
+      }));
+    }, 200);
+  });
+});
+await new Promise(resolve => slowModelServer.listen(0, '127.0.0.1', resolve));
+const slowAddress = slowModelServer.address();
+if (!slowAddress || typeof slowAddress === 'string') throw new Error('slow model fixture did not bind');
+const slowValues = {
+  ...values,
+  DATA_MCP_RESULT_MODEL_ENDPOINT: `http://127.0.0.1:${slowAddress.port}/v1/chat/completions`,
+};
+const smallBudgetStartedAt = Date.now();
+let smallBudgetError;
+try {
+  await runIsolatedResultAgent({
+    result: stringResult,
+    question: '小正数预算不得被扩大',
+    requestedOutputs: ['analysis'],
+    runtimeConfig: { value: name => slowValues[name] },
+    pluginHome,
+    timeoutMs: 50,
+  });
+} catch (error) { smallBudgetError = error; }
+const smallBudgetElapsedMs = Date.now() - smallBudgetStartedAt;
+if (smallBudgetError?.message !== 'result_agent_timeout' || smallBudgetElapsedMs >= 1_000) {
+  throw new Error(`small positive budget was expanded: ${JSON.stringify({
+    error: smallBudgetError?.message,
+    elapsedMs: smallBudgetElapsedMs,
+    modelRequests: slowModelRequests,
+  })}`);
+}
+await new Promise((resolve, reject) => slowModelServer.close(error => error ? reject(error) : resolve()));
 
 for (const file of delivered.files) rmSync(file.path, { force: true });
 for (const file of precision.files) rmSync(file.path, { force: true });

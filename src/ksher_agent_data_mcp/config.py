@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     query_repair_max_failures: int = Field(
         default=3, alias="QUERY_REPAIR_MAX_FAILURES", ge=1, le=10
     )
+    query_plan_ttl_seconds: int = Field(
+        default=10 * 60,
+        alias="DATA_MCP_QUERY_PLAN_TTL_SECONDS",
+        ge=60,
+        le=15 * 60,
+    )
     query_plan_compare_ttl_seconds: int = Field(
         default=15 * 60,
         alias="DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS",

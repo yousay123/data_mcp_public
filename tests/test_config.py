@@ -122,6 +122,16 @@ def test_compare_query_plan_ttl_has_independent_server_side_cap() -> None:
         Settings(DATA_MCP_QUERY_PLAN_COMPARE_TTL_SECONDS=901)
 
 
+def test_single_query_plan_ttl_defaults_to_ten_minutes_and_is_bounded() -> None:
+    assert Settings().query_plan_ttl_seconds == 600
+    assert Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=300).query_plan_ttl_seconds == 300
+
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=59)
+    with pytest.raises(ValueError):
+        Settings(DATA_MCP_QUERY_PLAN_TTL_SECONDS=901)
+
+
 def test_dlc_permission_resolution_has_bounded_default_timeouts() -> None:
     settings = Settings()
 

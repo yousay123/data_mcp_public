@@ -96,7 +96,7 @@ const modelServer = createServer((req, res) => {
         { id: 'pdf', type: 'function', function: { name: 'create_pdf', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
         { id: 'document', type: 'function', function: { name: 'create_document', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'] }) } },
       ];
-      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ claims: [{ operation: 'sum', column: 'amount' }] }) } };
+      const analysisCall = { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ analysis_markdown: '# 查询结果\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'amount' }] }) } };
       const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
       res.end(JSON.stringify({
         id: 'resp_delivery_fixture', model: 'internal-test-model-resolved',
@@ -178,7 +178,14 @@ const responses = await runPlugin([
       requested_outputs: ['excel', 'chart', 'pdf', 'document'],
       question: '生成 Excel、图表、PDF 和文档',
     },
-    _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_excel' } },
+    _meta: {
+      botmuxTrustedCaller: {
+        ...caller,
+        requestUserOpenId: 'ou_test_artifacts',
+        requestUserUnionId: 'on_test_artifacts',
+        turnId: 'om_excel',
+      },
+    },
   },
   {
     name: 'run_query_for_user',
@@ -292,7 +299,7 @@ const nonFallbackAgentFailure = await runPlugin([{
     requested_outputs: ['excel'], question: '生成 Excel',
   },
   _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_agent_artifact_failed' } },
-}]);
+}], { DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS: '1' });
 if (toolPayload(nonFallbackAgentFailure[0]).status !== 'delivered') {
   throw new Error('non-fallback result Agent failure was not directly delivered');
 }
@@ -338,7 +345,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v1'
+  && row.prompt_template_version === 'result-agent-tool-contract-v2'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -350,7 +357,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v1'
+  && row.prompt_template_version === 'result-agent-tool-contract-v2'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

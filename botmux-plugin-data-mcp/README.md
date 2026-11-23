@@ -160,9 +160,13 @@ Environment contract:
   - Internal model name.
 - `DATA_MCP_RESULT_MODEL_API_KEY`
 
-结果代理在独立子进程中运行，单独最多 30 秒；首次查询交付从调用 Data MCP 开始共享
-55 秒总预算，查询耗时会从结果代理预算中扣除。该预算刻意短于 BotMux 工具调用超时，
+结果代理在独立子进程中运行，单独最多 300 秒；首次查询的“查库 + 结果生成”共享
+330 秒准备预算，其中固定预留 30 秒用于进入飞书直投阶段，查询耗时会从结果代理预算中扣除。
+飞书 transport 使用独立的有界超时，不计入这 330 秒准备预算。结果代理预算刻意短于 BotMux 工具调用超时，
 使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
+模型单次请求默认最多等待 140 秒；网络错误、超时、408、425、429 和 5xx 默认最多尝试
+2 次并做有界退避。模型返回成功但分析引用了未绑定的数字或无效事实时，结果代理会把
+安全错误码反馈给模型，最多纠正 2 次；不会重新查询数据库，也不会用固定分析模板替代模型。
 首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
 `stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
 混成同一个不可定位错误。仅当请求输出为 `analysis`、结果不超过 20 行 × 20 列、
@@ -227,10 +231,14 @@ plugin should migrate from the process environment to that value.
 requested output types. It reuses the caller-bound stored rows/schema/context
 without rerunning the query. The internal result Agent must call the matching
 analysis/Excel/PDF/chart/document tool; every artifact binds values to that same
-stored result. Artifact tools accept no model-authored titles, paragraphs,
-labels, annotations, sheet names, or filenames. The model selects only columns,
-aggregations, chart type, and layout; controlled templates render every word,
-and arbitrary-precision decimal arithmetic computes every numerical claim.
+stored result. For analysis, the model owns the Markdown structure, narrative,
+observations, risks, opportunities, and recommendations. Exact source values of
+any scalar type are selected through generic row/column facts, while optional
+numeric aggregates are selected as claims and computed with arbitrary-precision
+decimal arithmetic by the host. Detail tables and generated artifacts always
+read from the same stored rows. This keeps model reasoning flexible without
+allowing it to rewrite returned accounts, permissions, dates, strings, or numbers.
+Document/chart/file tools still reject model-authored filenames and raw data.
 The ClickHouse transport forces quoted Decimal and 64-bit integer JSON values,
 so exact strings survive the Python service, MCP IPC, and Agent boundaries. Per
 trusted turn id, only one follow-up call is accepted. Agent text and files are replied
@@ -239,9 +247,9 @@ Topic messages stay in the original topic; ordinary group and P2P messages
 remain flat replies in the same conversation. Before sending, the plugin uses
 Botmux's live session observation to verify that the bound session app matches
 the signed app id, then delegates routing to `botmux send`. Direct delivery has
-no cross-invocation deduplication: repeating the same delivery tool call can
-send duplicate text and attachments, so callers must not retry after an
-ambiguous receipt.
+no cross-invocation deduplication: model transport retries happen before
+delivery, but callers must not repeat a delivery tool call after an ambiguous
+receipt because that can send duplicate text and attachments.
 It fails closed rather than falling back to another bot profile. Normal MCP content contains only delivery
 counts/status or a fixed error code; it never contains result text, filenames,
 paths, or file bytes.

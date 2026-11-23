@@ -1,4 +1,3 @@
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -291,7 +290,7 @@ def test_query_plan_rejects_expired_plan_only() -> None:
     service = build_service()
     plan_id = issue_baseline_plan(service)
     service.query_plans._plans[plan_id].issued_at = (
-        time.time() - service.query_plans.ttl_seconds - 1
+        service.query_plans._clock() - service.query_plans.ttl_seconds - 1
     )
 
     result = run_with_plan(service, plan_id)
@@ -508,8 +507,8 @@ def test_compare_plan_uses_independent_bounded_ttl() -> None:
         lark_app_id=APP_ID,
         execution_mode="compare",
     )
-    store._plans[single].issued_at = time.time() - 301
-    store._plans[compare].issued_at = time.time() - 301
+    store._plans[single].issued_at = store._clock() - 301
+    store._plans[compare].issued_at = store._clock() - 301
 
     single_ok, single_code, _ = store.consume_for_run(
         single,
@@ -533,7 +532,7 @@ def test_compare_plan_uses_independent_bounded_ttl() -> None:
     assert compare_ok
     assert compare_code == "ok"
 
-    store._plans[compare].issued_at = time.time() - 901
+    store._plans[compare].issued_at = store._clock() - 901
     expired_ok, expired_code, _ = store.consume_for_run(
         compare,
         session_id=SESSION_ID,
@@ -553,6 +552,36 @@ def test_compare_plan_store_rejects_ttl_above_server_cap() -> None:
         assert "server-side maximum" in str(exc)
     else:
         raise AssertionError("compare TTL above 15 minutes must be rejected")
+
+
+def test_single_plan_store_rejects_ttl_above_server_cap() -> None:
+    with pytest.raises(ValueError, match="server-side maximum"):
+        QueryPlanStore(ttl_seconds=901)
+
+
+def test_query_plan_expiry_uses_injected_monotonic_clock() -> None:
+    now = [2_000.0]
+    store = QueryPlanStore(ttl_seconds=600, clock=lambda: now[0])
+    plan_id = store.issue(
+        UNION_ID,
+        SQL,
+        DATASOURCE,
+        session_id=SESSION_ID,
+        lark_app_id=APP_ID,
+    )
+
+    now[0] += 601
+    ok, code = store.consume(
+        plan_id,
+        session_id=SESSION_ID,
+        union_id=UNION_ID,
+        sql=SQL,
+        datasource=DATASOURCE,
+        lark_app_id=APP_ID,
+    )
+
+    assert not ok
+    assert code == "query_plan_not_found_or_expired"
 
 
 def test_compare_plan_atomic_counter_allows_only_two_concurrent_consumers() -> None:
@@ -866,3 +895,25 @@ def test_repair_chain_unknown_id_is_rejected_with_zero_remaining() -> None:
     assert code == "repair_chain_not_found_or_expired"
     assert chain_id == "repair_missing"
     assert store.remaining(chain_id) == 0
+
+
+def test_repair_chain_expiry_uses_injected_monotonic_clock() -> None:
+    now = [100.0]
+    store = RepairChainStore(
+        max_failures=3,
+        ttl_seconds=300,
+        clock=lambda: now[0],
+    )
+
+    ok, _, first = store.prepare(UNION_ID, None, scope_id="turn-a")
+    assert ok
+
+    now[0] += 301
+    ok, code, expired = store.prepare(UNION_ID, first, scope_id="turn-a")
+    assert not ok
+    assert code == "repair_chain_not_found_or_expired"
+    assert expired == first
+
+    ok, _, replacement = store.prepare(UNION_ID, None, scope_id="turn-a")
+    assert ok
+    assert replacement != first

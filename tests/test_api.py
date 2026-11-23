@@ -56,7 +56,9 @@ def test_health_exposes_runtime_version_and_sql_guard_capabilities() -> None:
     assert "max_rows_to_read" not in payload["query_resource_limits"]
     assert "max_bytes_to_read" not in payload["query_resource_limits"]
     assert "max_memory_bytes" not in payload["query_resource_limits"]
-    assert payload["query_resource_limits"]["query_plan_single_ttl_seconds"] == 300
+    assert payload["query_resource_limits"]["query_plan_single_ttl_seconds"] == (
+        settings.query_plan_ttl_seconds
+    )
     assert payload["query_resource_limits"]["query_plan_compare_ttl_seconds"] <= 900
     assert payload["export_receipt"] == {
         "schema_version": 1,

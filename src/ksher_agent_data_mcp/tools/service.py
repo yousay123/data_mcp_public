@@ -72,6 +72,7 @@ class DataMcpService:
         # This process is intentionally single-worker; a multi-worker deploy
         # must move plans to shared storage before enabling this contract.
         self.query_plans = QueryPlanStore(
+            ttl_seconds=container.settings.query_plan_ttl_seconds,
             compare_ttl_seconds=container.settings.query_plan_compare_ttl_seconds
         )
         self.repair_chains = RepairChainStore(container.settings.query_repair_max_failures)
