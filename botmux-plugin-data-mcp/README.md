@@ -165,8 +165,10 @@ Environment contract:
 飞书 transport 使用独立的有界超时，不计入这 330 秒准备预算。结果代理预算刻意短于 BotMux 工具调用超时，
 使超时能在插件内被记录为 `result_agent_timeout`，而不是由外层先中断并留下执行状态不明。
 模型单次请求默认最多等待 140 秒；网络错误、超时、408、425、429 和 5xx 默认最多尝试
-2 次并做有界退避。模型返回成功但分析引用了未绑定的数字或无效事实时，结果代理会把
-安全错误码反馈给模型，最多纠正 2 次；不会重新查询数据库，也不会用固定分析模板替代模型。
+2 次并做有界退避。工具参数、可选引用或结果协议无效时，结果代理会把
+安全错误码反馈给模型，最多纠正 2 次。分析正文不再使用数字白名单或强制占位符，
+允许模型自由计算、比较、提出假设和预测；要求模型区分实际观察与估算、建议。
+明细表、图表和文件继续直接绑定原始查询数据；不会重新查询数据库，也不会用固定模板替代分析。
 首轮结果代理失败会写入绑定身份的非敏感审计状态，并记录安全的
 `stage`、`action`、`error_code` 与 `query_id`，避免把配置、模型请求和结果校验故障
 混成同一个不可定位错误。仅当请求输出为 `analysis`、结果不超过 20 行 × 20 列、
@@ -291,13 +293,13 @@ accepts SQL, table names, identity, or task fields from model arguments.
 
 ## Current Status
 
-### Result delivery (0.4.19)
+### Result delivery (0.4.20)
 
 - Analysis, the source-bound detail table, and the native Vega-Lite chart share
   one primary card. Charts are not SVG file attachments; Excel remains an XLSX
   attachment in the same send operation. The host must support Vega-Lite cards.
-- The card orders detail, chart, concise analysis, then one scope paragraph at
-  the bottom. Model-authored duplicate headings and repeated paragraphs are
+- The card orders detail, chart, unheaded concise analysis, then one lightly
+  labelled natural-language scope paragraph at the bottom. Duplicate headings and paragraphs are
   removed. The default analysis is one or two complete sentences; detailed
   analysis remains available when requested. Oversized cards omit complete
   paragraphs instead of cutting a sentence or chart in half.
@@ -309,10 +311,16 @@ accepts SQL, table names, identity, or task fields from model arguments.
   private artifacts survive process shutdown and expire after fifteen minutes,
   with a one-minute sweep interval. Queued/in-flight files are excluded from
   the sweep. Retention is not a user-visible recovery handle.
-- Exact statistics and adjacent-change counts are supplied as trusted evidence
-  for model-authored analysis. Bound values and date/count type mismatches are
-  checked; this does not prove every qualitative interpretation or causal claim
-  in natural language. Such claims still require analytical review.
+- Exact statistics and adjacent-change counts remain optional evidence for
+  analysis. The narrative can contain new calculations, estimates, scenarios
+  and recommendations without numeric censorship; model-authored analysis is
+  not represented as a deterministic calculation guarantee. Source rows in
+  tables, charts and files remain tool-owned. The model is instructed to label
+  hypotheses and forecasts and distinguish them from observed facts.
+- Python service 0.4.5 adds query-plan-bound semantics for CTE source filters,
+  time grain and aggregation methods. Both regular and fallback delivery use
+  the same natural-language scope formatter. Missing or complex scope details
+  are identified explicitly rather than copied from SELECT expressions.
 
 This plugin expects a Data MCP HTTP service to be reachable from the host. If
 the service is absent, identity-bound tools return a structured

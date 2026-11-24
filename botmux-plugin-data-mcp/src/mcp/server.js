@@ -1,3 +1,4 @@
+import { renderQueryContext } from '../result-agent/query-context.js';
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -819,22 +820,7 @@ function fallbackMarkdownCell(value) {
 }
 
 function deterministicContextLines(result) {
-  const context = result?.result_context;
-  if (!context || typeof context !== 'object') return [];
-  const rows = [
-    ['数据源', String(context.datasource || result.datasource || '').toUpperCase()],
-    ['数据表', Array.isArray(context.tables) ? context.tables.join('、') : ''],
-    ['统计口径', Array.isArray(context.metric_expressions)
-      ? context.metric_expressions.join('、') : ''],
-  ].filter(([, value]) => value);
-  if (Array.isArray(context.time_range_predicates) && context.time_range_predicates.length) {
-    rows.push(['时间范围', context.time_range_predicates.join(' AND ')]);
-  }
-  if (!rows.length) return [];
-  const sentence = rows
-    .map(([label, value]) => `${label}为“${fallbackMarkdownCell(value)}”`)
-    .join('，');
-  return ['## 数据口径', '', `${sentence}。`];
+  return renderQueryContext(result?.result_context);
 }
 
 function deterministicAnalysisFallback(result, args, errorCode) {

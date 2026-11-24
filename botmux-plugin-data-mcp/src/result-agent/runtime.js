@@ -4,6 +4,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { basename, join, resolve } from 'node:path';
 import { buildModelWorkbook } from './model-workbook.js';
+import { renderQueryContext } from './query-context.js';
 import { pinnedModelLookup, resolvePrivateModelAddress } from '../mcp/private-network.js';
 
 const OUTPUTS = new Set(['analysis', 'excel', 'pdf', 'chart', 'document']);
@@ -23,8 +24,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v5';
-const SUMMARY_UNAVAILABLE = '本次未生成可用的分析总结，请以结果明细为准。';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v6';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -366,7 +366,6 @@ function executeChart(args, envelope) {
   })).filter(point => point.value !== null);
   if (points.length < 2) throw new Error('result_agent_invalid_chart_plan');
   const spec = {
-    title: `${label} · ${value}`.slice(0, 100),
     data: { values: points.map(point => ({
       category: point.label,
       value: point.value.scale === 0 && Number.isSafeInteger(Number(point.value.coefficient))
@@ -464,22 +463,6 @@ function markdownTableCell(value) {
     .replace(/[\r\n]+/g, ' ');
 }
 
-function queryContextLines(envelope) {
-  const context = envelope.manifest.context;
-  const parts = [`本次结果来自 ${String(context.datasource).toUpperCase()} 的 ${context.tables.join('、')}`];
-  if (context.metric_expressions.length) parts.push(`统计口径为 ${context.metric_expressions.join('、')}`);
-  if (context.time_range_predicates.length) parts.push(`时间范围按 ${context.time_range_predicates.join(' AND ')} 限定`);
-  const otherFilters = context.filter_predicates.filter(
-    predicate => !context.time_range_predicates.includes(predicate),
-  );
-  if (otherFilters.length) parts.push(`同时应用 ${otherFilters.join(' AND ')} 过滤`);
-  if (context.grouping_columns.length) parts.push(`并按 ${context.grouping_columns.join('、')} 分组`);
-  return [
-    '## 数据口径',
-    '',
-    `${parts.map(markdownTableCell).join('，')}。`,
-  ];
-}
 
 function roundedDivide(numerator, denominator) {
   if (denominator <= 0n) throw new Error('result_agent_invalid_claim_value');
@@ -688,98 +671,11 @@ function sourceFactEvidence(args, envelope) {
   });
 }
 
-function structuralEnumerationPrefix(line) {
-  const digit = line.match(/^(\s*)(\p{N}{1,2})[.)、]\s+/u);
-  if (digit) {
-    const normalized = digit[2].normalize('NFKC');
-    if (/^\d{1,2}$/u.test(normalized) && Number(normalized) >= 1 && Number(normalized) <= 20) {
-      return digit[0];
-    }
-  }
-  return line.match(/^(\s*)(?:一|二|三|四|五|六|七|八|九|十)[.)、]\s+/u)?.[0] || '';
-}
-
-function containsNumericLiteral(value) {
-  const text = String(value || '');
-  const normalized = text.normalize('NFKC');
-  const digitPattern = /[+\-]?\p{N}[\p{N},]*(?:\.\p{N}+)?(?:[eE][+\-]?\p{N}+)?%?/u;
-  const chineseNumeral = '零〇一二两三四五六七八九十百千万亿兆壹贰叁肆伍陆柒捌玖拾佰仟萬億';
-  const chinesePattern = new RegExp([
-    `第[${chineseNumeral}]+`,
-    `[${chineseNumeral}]{2,}`,
-    `[${chineseNumeral}](?:天|日|周|月|年|户|行|列|个|次|倍|元|万|萬|亿|億|兆)`,
-    `(?:百分之|千分之|万分之|萬分之)[${chineseNumeral}]+`,
-    `[${chineseNumeral}]+分之[${chineseNumeral}]+`,
-    '(?:过半|過半|半数|半數|一半|大半|小半)',
-    '(?:翻倍|双倍|雙倍|数倍|數倍|多倍)',
-    '(?:数十|數十|数百|數百|数千|數千|数万|數萬|几十|幾十|上百|上千|上万|上萬)',
-  ].join('|'), 'u');
-  const englishPattern = /\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|trillion|percent|half|quarter|dozen)\b/iu;
-  return digitPattern.test(text)
-    || digitPattern.test(normalized)
-    || chinesePattern.test(text)
-    || chinesePattern.test(normalized)
-    || englishPattern.test(text)
-    || englishPattern.test(normalized);
-}
-
-function validateAuthoredNarrative(markdown, envelope, question) {
-  const original = String(markdown);
-  const normalized = original.normalize('NFKC');
+function validateAuthoredNarrative(markdown) {
+  const normalized = String(markdown).normalize('NFKC');
   if (/<\/?(?:script|style|iframe)\b|javascript:|file:\/\/|https?:\/\//iu.test(normalized)) {
     throw new Error('result_agent_invalid_analysis_markdown');
   }
-  const narrativeWithoutEvidence = value => value
-    .replace(/\{\{(?:fact|claim|calc|stat)_\d+\}\}/gu, '')
-    .split('\n')
-    .map(line => line.slice(structuralEnumerationPrefix(line).length))
-    .join('\n');
-  if (containsNumericLiteral(narrativeWithoutEvidence(original))
-    || containsNumericLiteral(narrativeWithoutEvidence(normalized))) {
-    throw new Error('result_agent_ungrounded_analysis');
-  }
-}
-
-function redactUngroundedNumbers(markdown, envelope, question, analysisArgs) {
-  const original = boundedString(markdown, 8_000, 'result_agent_invalid_analysis_markdown');
-  const normalized = original.normalize('NFKC');
-  if (/<\/?(?:script|style|iframe)\b|javascript:|file:\/\/|https?:\/\//iu.test(normalized)) {
-    throw new Error('result_agent_invalid_analysis_markdown');
-  }
-  const placeholders = [];
-  const protectedMarkdown = original.replace(/\{\{(?:fact|claim|calc|stat)_\d+\}\}/gu, placeholder => {
-    const marker = String.fromCodePoint(0xE000 + placeholders.length);
-    placeholders.push(placeholder);
-    return marker;
-  });
-  const redacted = protectedMarkdown.split('\n').map(line => {
-    const enumeration = structuralEnumerationPrefix(line);
-    const body = enumeration ? line.slice(enumeration.length) : line;
-    return containsNumericLiteral(body) ? '' : `${enumeration}${body}`;
-  }).join('\n').replace(/\n{3,}/gu, '\n\n');
-  const restored = [...redacted].map(character => {
-    const codePoint = character.codePointAt(0);
-    return codePoint >= 0xE000 && codePoint < 0xE000 + placeholders.length
-      ? placeholders[codePoint - 0xE000]
-      : character;
-  }).join('');
-  const missingEvidence = [];
-  for (let index = 0; index < (analysisArgs.facts?.length || 0); index += 1) {
-    if (analysisArgs.table_columns?.includes(analysisArgs.facts[index]?.column)) continue;
-    const placeholder = `{{fact_${index}}}`;
-    if (!restored.includes(placeholder)) missingEvidence.push(placeholder);
-  }
-  for (const [kind, values] of [
-    ['claim', analysisArgs.claims],
-    ['calc', analysisArgs.calculations],
-  ]) {
-    for (let index = 0; index < (values?.length || 0); index += 1) {
-      const placeholder = `{{${kind}_${index}}}`;
-      if (!restored.includes(placeholder)) missingEvidence.push(placeholder);
-    }
-  }
-  if (!missingEvidence.length) return restored.trim() || SUMMARY_UNAVAILABLE;
-  return `${restored.trim()}\n\n${missingEvidence.join('\n\n')}`;
 }
 
 function markdownTableCells(line) {
@@ -790,7 +686,7 @@ function markdownTableCells(line) {
   return cells.length ? cells : null;
 }
 
-function stripModelAuthoredMarkdownTables(markdown) {
+function stripModelAuthoredMarkdownTables(markdown, onTable) {
   const lines = String(markdown).split('\n');
   const retained = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -804,6 +700,7 @@ function stripModelAuthoredMarkdownTables(markdown) {
       retained.push(lines[index]);
       continue;
     }
+    onTable?.();
     index += 1;
     while (index + 1 < lines.length) {
       const row = markdownTableCells(lines[index + 1]);
@@ -816,17 +713,14 @@ function stripModelAuthoredMarkdownTables(markdown) {
 
 function renderAuthoredAnalysis(args, envelope, question) {
   const authoredMarkdown = boundedString(args.analysis_markdown, 8_000, 'result_agent_invalid_analysis_markdown');
-  const markdown = Array.isArray(args.table_columns) && args.table_columns.length
-    ? stripModelAuthoredMarkdownTables(authoredMarkdown)
-    : authoredMarkdown;
-  validateAuthoredNarrative(markdown, envelope, question);
+  const markdown = stripModelAuthoredMarkdownTables(authoredMarkdown);
+  validateAuthoredNarrative(markdown);
   const evidence = {
     fact: sourceFactEvidence(args, envelope),
     claim: computedClaimEvidence(args, envelope),
     calc: computedCalculationEvidence(args, envelope),
     stat: statisticEvidence(envelope),
   };
-  let evidenceCount = 0;
   const rendered = markdown.split('\n').map(line => {
     const standalone = line.trim().match(/^\{\{(fact|claim|calc|stat)_(\d+)\}\}$/u);
     if (standalone) {
@@ -835,28 +729,19 @@ function renderAuthoredAnalysis(args, envelope, question) {
       if (!Number.isSafeInteger(index) || index < 0 || !item) {
         throw new Error('result_agent_ungrounded_analysis');
       }
-      evidenceCount += 1;
       return item.display;
     }
-    const replaced = line.replace(/\{\{(fact|claim|calc|stat)_(\d+)\}\}/gu, (_placeholder, kind, rawIndex, offset) => {
+    const replaced = line.replace(/\{\{(fact|claim|calc|stat)_(\d+)\}\}/gu, (_placeholder, kind, rawIndex) => {
       const index = Number(rawIndex);
       const item = evidence[kind][index];
       if (!Number.isSafeInteger(index) || index < 0 || !item) {
         throw new Error('result_agent_ungrounded_analysis');
       }
-      if (kind === 'fact' && /^\d{4}-\d{2}-\d{2}(?:$|[ T])/u.test(item.value)
-        && /^\s*(?:次|户|个|元|行|倍|%)/u.test(line.slice(offset + _placeholder.length))) {
-        throw new Error('result_agent_invalid_fact_semantics');
-      }
-      evidenceCount += 1;
       return item.value;
     });
     if (replaced.includes('{{')) throw new Error('result_agent_ungrounded_analysis');
     return replaced;
   });
-  if (evidenceCount === 0 && !(Array.isArray(args.table_columns) && args.table_columns.length)) {
-    throw new Error('result_agent_evidence_required');
-  }
   return rendered;
 }
 
@@ -898,13 +783,13 @@ function conciseNarrative(lines) {
 function composeResultCard(analysis, artifacts, envelope) {
   const charts = artifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown);
   const summary = analysis?.summary;
-  const context = [...queryContextLines(envelope)];
+  const context = [...renderQueryContext(envelope.manifest.context)];
   const notice = scopeNotice(envelope.manifest);
   if (notice) context.push('', `数据范围说明：${notice}`);
   return [
     analysis?.details,
     ...charts,
-    summary ? `## 分析总结\n\n${summary}` : null,
+    summary || null,
     !analysis && !charts.length ? '查询结果文件见附件。' : null,
     context.join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -920,17 +805,22 @@ function executeAnalysis(args, envelope, question = '') {
   }
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
   if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_table');
+  let authoredTable = false;
+  stripModelAuthoredMarkdownTables(args.analysis_markdown, () => { authoredTable = true; });
   const analysis = {
     type: 'analysis',
-    summary: conciseNarrative(renderAuthoredAnalysis(args, envelope, question))
-      || SUMMARY_UNAVAILABLE,
-    details: detailTableLines(args, envelope, maxRows).join('\n').trim(),
+    summary: conciseNarrative(renderAuthoredAnalysis(args, envelope, question)),
+    details: detailTableLines(
+      !args.table_columns?.length && authoredTable
+        ? { ...args, table_columns: envelope.columns } : args,
+      envelope, maxRows,
+    ).join('\n').trim(),
   };
   return { ...analysis, markdown: composeResultCard(analysis, [], envelope) };
 }
 
 function documentLines(args, envelope, maxRows) {
-  const lines = ['查询结果', '', ...computedClaims(args, envelope), '', ...queryContextLines(envelope), ''];
+  const lines = ['查询结果', '', ...computedClaims(args, envelope), '', ...renderQueryContext(envelope.manifest.context), ''];
   if (Array.isArray(args.table_columns) && args.table_columns.length) {
     const columns = selectedColumns(args, envelope.columns, 'table_columns');
     lines.push(columns.join(' | '));
@@ -1019,7 +909,7 @@ function toolDefinitions() {
   const analysisProperties = {
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 8000,
-      description: 'Complete concise analysis, normally one or two sentences. No headings, tables, repeated scope, or repetition of every row. Bind source values with {{fact_0}}, aggregates with {{claim_0}}, arithmetic with {{calc_0}}, or references in computed_facts.',
+      description: 'Complete concise analysis, normally one or two sentences. No headings, tables, repeated scope, or repetition of every row. Numbers, calculations and estimates are allowed; distinguish observed facts from hypotheses. Fact/claim/calc/stat references are optional.',
     },
     facts: {
       type: 'array', maxItems: 50,
@@ -1155,15 +1045,10 @@ export async function runInternalResultAgent(options) {
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
         'create_analysis 的 Markdown 由你自由组织，不要套最大值、最小值、平均值等固定模板。围绕用户问题提炼现象、问题、风险或机会、业务影响和可执行建议。',
         '默认只写一至两句完整的分析总结：概括主要变化和需要关注的点，句子必须完整收尾。仅当用户明确要求详细/深入分析时才展开。不要写标题、重复明细、口径或“可信数据”等栏目；宿主会统一按明细、图表、分析总结、数据口径的顺序排版。',
-        '默认简短总结可直接用自然语言概括变化，无需重复罗列日期和数值；如用户明确要求总数等指标，使用可信引用回答，不得遗漏。',
-        '任何需要准确展示的原始字段值都通过 facts 选择，并在 Markdown 中引用从零开始编号的 {{fact_0}}、{{fact_1}}；facts 可以引用字符串、布尔值、数字、日期、账号和权限等任意返回字段。',
-        '只有确有业务意义时才选择 claims 计算聚合，并引用从零开始编号的 {{claim_0}}、{{claim_1}}。不要为了满足格式机械增加聚合字段。列表或明细结果优先选择 table_columns。',
-        '选择 table_columns 后，宿主会从可信 rows 统一渲染一次明细表；analysis_markdown 只写分析正文，不要再构造 Markdown 表格。',
-        '差值、比值、变化率等派生数字使用 calculations，由宿主精确计算，并引用从零开始编号的 {{calc_0}}、{{calc_1}}；percent_change 的 operands 顺序是 [基准值, 当前值]，占位符只返回数值，正文需要自行补 %；不要在正文里自行填写派生数字。',
-        '自由 Markdown 中不得直接写任何精确数字，即使数字来自 rows、用户问题或 context；原始值必须用 facts，聚合用 claims，跨行算术用 calculations。自然语言趋势、风险和建议可以自由表达。',
-        '分析判断可以发散，但不得把推测写成已证实事实；可能原因应明确标注需要结合业务信息核查。',
-        'computed_numeric_evidence 是工具精确计算的校对依据，不是固定输出模板。平均值使用对应列的 average claim，最低/最高值的日期从对应 row_indices 选择 fact；不要把 count 或其他列的值称为日均。趋势依据相邻变化核对，存在反弹不得说连续回落。结果行顺序不代表时间顺序时，不推断时间趋势。',
-        'computed_facts 已提供带 reference 的可信统计值，可直接把 reference（如 {{stat_0}}）放入正文，无需另建 facts。相邻上升/下降次数只能引用 adjacent_up_count/adjacent_down_count 的 reference，不能引用日期或某日业务值。',
+        '分析正文允许直接书写数字、日期、计算结果和新的估算值，不强制占位符，不使用数字白名单。结合 rows 和 computed_numeric_evidence 自行核对事实；推算、预测、原因假设和建议须明确标注，不能冒充已查询到的事实。',
+        'facts、claims、calculations 和 computed_facts 的 reference 均为可选能力；需要精确计算时可以使用，不要求为了格式机械调用。',
+        '列表或明细结果请选择 table_columns；宿主只从原始 rows 渲染一次表格，analysis_markdown 不再重复明细表。',
+        '分析内容和结论由你自由组织；不得修改明细、图表或文件中的原始数据，也不要新增用户未要求的文件或数据字段。',
         '数据口径由宿主根据可信 context 生成自然段；不得输出 SQL、身份凭据或本机路径。',
       ].join('\n'),
     },
@@ -1221,52 +1106,6 @@ export async function runInternalResultAgent(options) {
         try { unlinkSync(artifact.path); } catch { /* best effort */ }
       }
       const analysisCall = calls?.find(call => call.name === 'create_analysis');
-      if (analysisCall
-        && error.message === 'result_agent_ungrounded_analysis'
-        && repairAttempt >= 2) {
-        const sanitizedArtifacts = [];
-        try {
-          let analysis;
-          for (const call of calls) {
-            const safeCall = call.name === 'create_analysis'
-              ? {
-                  ...call,
-                  args: {
-                    ...call.args,
-                    analysis_markdown: redactUngroundedNumbers(
-                      call.args.analysis_markdown,
-                      envelope,
-                      options.question,
-                      call.args,
-                    ),
-                  },
-                }
-              : call;
-            const artifact = executeTool(safeCall, envelope, options.pluginHome, options.question);
-            if (artifact.type === 'analysis') analysis = artifact;
-            else sanitizedArtifacts.push(artifact);
-          }
-          return {
-            markdown: composeResultCard(analysis, sanitizedArtifacts, envelope),
-            files: sanitizedArtifacts.filter(artifact => artifact.path).map(artifact => ({
-              path: artifact.path, filename: artifact.filename, type: artifact.type,
-            })),
-            artifactTypes: sanitizedArtifacts.map(artifact => artifact.type),
-            manifest: envelope.manifest,
-            audit: {
-              ...baseAudit,
-              ...modelResponse.trace,
-              status: 'succeeded',
-              analysisRedactionUsed: true,
-            },
-          };
-        } catch (sanitizedError) {
-          for (const artifact of sanitizedArtifacts) {
-            try { unlinkSync(artifact.path); } catch { /* best effort */ }
-          }
-          throw attachAudit(sanitizedError, { ...baseAudit, ...modelResponse.trace });
-        }
-      }
       if (!analysisCall || !repairableAnalysisError(error) || repairAttempt >= 2) {
         throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
       }
@@ -1285,13 +1124,9 @@ export async function runInternalResultAgent(options) {
             error_code: error.message,
             instruction: [
               '请重新调用所有 requested_outputs 对应工具。',
-              '分析结构和建议可自由组织，但所有精确字段值必须通过从零开始编号的 {{fact_0}}、{{fact_1}} 引用 facts。',
-              '聚合数字必须通过从零开始编号的 {{claim_0}}、{{claim_1}} 引用 claims；不要在自由 Markdown 中自行填写派生数字。',
-              '差值、比值、变化率等跨行派生数字必须通过 {{calc_0}} 引用 calculations；percent_change 的 operands 顺序是 [基准值, 当前值]，并在占位符后补 %。',
-              '占位符可以嵌入自然语言或表格单元格，但编号必须与 facts/claims/calculations 数组的零基位置一致。',
-              '自由 Markdown 不得直接写任何精确数字；原始数字也必须用 fact，聚合交给 claim，跨行算术交给 calculation。',
-              '纯文本或单行结果直接使用 facts，不要强行创建数值 claims。',
-              'computed_facts 的 reference 可直接引用统计值，尤其上升/下降次数；不要用日期事实或原始行数值冒充变化次数。',
+              '请根据 error_code 修正工具参数或无效引用；数字和估算可以直接写在 analysis_markdown 中，不必改为占位符。',
+              '如果选择了 fact/claim/calc/stat 引用，编号及对应的列、操作必须有效；也可直接用自然语言写分析。',
+              '实际观察、推算和假设要区分，保持一至两句完整总结；深入分析仅在用户要求时展开。',
             ].join(''),
           }),
         },

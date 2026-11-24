@@ -1,12 +1,12 @@
 {
   "name": "@ksher/plugin-data-mcp",
-  "version": "0.4.19",
+  "version": "0.4.20",
   "description": "Private Botmux plugin for trusted Data MCP access.",
   "type": "module",
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "validate": "node ./scripts/validate.mjs",
-    "test": "npm run build && npm run validate && node ./scripts/test-result-agent.mjs && node ./scripts/test-direct-lark-reply.mjs && node ./scripts/test-result-delivery.mjs && node ./scripts/test-result-followup.mjs && node ./scripts/test-delivery-state.mjs && node ./scripts/test-signed-app-profile.mjs",
+    "test": "npm run build && npm run validate && node ./scripts/test-query-context.mjs && node ./scripts/test-result-agent.mjs && node ./scripts/test-direct-lark-reply.mjs && node ./scripts/test-result-delivery.mjs && node ./scripts/test-result-followup.mjs && node ./scripts/test-delivery-state.mjs && node ./scripts/test-signed-app-profile.mjs",
     "prepublishOnly": "npm test"
   },
   "devDependencies": {

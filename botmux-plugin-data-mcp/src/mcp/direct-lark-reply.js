@@ -144,7 +144,7 @@ function prepareCardText(text) {
   const chartBytes = Buffer.byteLength(chartText);
   // Never cut a JSON fence in half: a malformed fence loses the native chart.
   if (chartBytes > MAX_DIRECT_REPLY_TEXT_BYTES - 128) throw fixedError('direct_reply_text_too_large');
-  const footerIndex = text.lastIndexOf('\n## 数据口径\n');
+  const footerIndex = Math.max(text.lastIndexOf('\n## 数据口径\n'), text.lastIndexOf('\n---\n\n**数据口径**：'));
   const footer = footerIndex < 0 ? '' : text.slice(footerIndex);
   const footerBytes = Buffer.byteLength(footer);
   if (chartBytes + footerBytes > MAX_DIRECT_REPLY_TEXT_BYTES - 128) throw fixedError('direct_reply_text_too_large');

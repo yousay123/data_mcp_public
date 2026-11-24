@@ -103,7 +103,7 @@ const modelServer = createServer((req, res) => {
             function: {
               name: 'create_analysis',
               arguments: JSON.stringify({
-                analysis_markdown: '# 查询结果\n\n{{claim_0}}\n\n错误估计 999999。',
+                analysis_markdown: '# 查询结果\n\n{{claim_0}}\n\n假设未来可能达到 999999，需进一步验证。',
                 claims: [{ operation: 'sum', column: 'amount' }],
               }),
             },
@@ -323,16 +323,16 @@ const analysisFallbackCard = latestSend()?.content || '';
 if (!analysisFallbackCard.includes('result_agent_http_503')
   || !analysisFallbackCard.includes('2026-03-01')
   || !analysisFallbackCard.includes('可信原始结果')
-  || !analysisFallbackCard.includes('## 数据口径')) {
+  || !analysisFallbackCard.includes('**数据口径**：')) {
   throw new Error('analysis model failure hid the successful trusted query result');
 }
 
-ungroundedResponsesRemaining = 3;
+ungroundedResponsesRemaining = 1;
 const redactedAnalysis = await runPlugin([{
   name: 'deliver_query_result_for_user',
   arguments: {
     sql: 'SELECT amount FROM fixture', query_plan_id: 'redacted-analysis',
-    output_mode: 'analysis', question: '验证未绑定数字剔除',
+    output_mode: 'analysis', question: '验证自由推算与情景分析',
   },
   _meta: {
     botmuxTrustedCaller: {
@@ -344,9 +344,9 @@ const redactedAnalysis = await runPlugin([{
   },
 }]);
 if (toolPayload(redactedAnalysis[0]).status !== 'delivered'
-  || latestSend()?.content?.includes('999999')
+  || !latestSend()?.content?.includes('999999')
   || !latestSend()?.content?.includes('amount（合计）')) {
-  throw new Error('redacted analysis did not preserve trusted evidence while removing the unbound number');
+  throw new Error('free scenario analysis was censored or lost optional source evidence');
 }
 
 modelFailuresRemaining = 1;
@@ -406,7 +406,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v5'
+  && row.prompt_template_version === 'result-agent-tool-contract-v6'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -416,15 +416,15 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   throw new Error('successful result Agent call did not emit the complete privacy-safe audit trace');
 }
 if (!auditRows.some(row => row.status === 'result_agent_succeeded'
-  && row.analysis_redaction_used === true
-  && row.model_attempt_count === 3
-  && row.model_repair_count === 2)) {
-  throw new Error('redacted result Agent success did not persist its retry and redaction audit semantics');
+  && row.model_attempt_count === 1
+  && row.model_repair_count === 0
+  && row.analysis_redaction_used !== true)) {
+  throw new Error('free analysis should succeed without numeric censorship or repair retries');
 }
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v5'
+  && row.prompt_template_version === 'result-agent-tool-contract-v6'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

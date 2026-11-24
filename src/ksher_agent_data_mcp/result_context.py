@@ -53,6 +53,7 @@ def canonical_result_context(
         "grouping_columns": grouping,
         "unit": {"status": "not_inferred_from_sql"},
         "timezone": {"status": "database_session_default"},
+        "query_semantics": _query_semantics(expression, tables),
     }
     context["integrity"] = {
         "algorithm": "sha256",
@@ -88,6 +89,73 @@ def _flatten_and(expression: exp.Expression) -> list[exp.Expression]:
     if isinstance(expression, exp.And):
         return [*_flatten_and(expression.left), *_flatten_and(expression.right)]
     return [expression]
+
+
+def _query_semantics(expression: exp.Expression, tables: list[str]) -> dict[str, Any]:
+    """Keep inner query scopes separate; CTE filters are not outer WHERE clauses."""
+    physical = set(tables)
+    blocks: list[dict[str, Any]] = []
+    covered: set[int] = set()
+    for select in expression.find_all(exp.Select):
+        sources = sorted({
+            ".".join(part for part in [table.catalog, table.db, table.name] if part)
+            for table in select.find_all(exp.Table)
+            if table.find_ancestor(exp.Select) is select
+        } & physical)
+        if not sources:
+            continue
+        covered.add(id(select))
+        where = select.args.get("where")
+        filters = [] if where is None else [_natural_filter(item) for item in _flatten_and(where.this)]
+        time_groups: list[dict[str, str]] = []
+        aggregates: list[dict[str, str]] = []
+        for function in select.find_all(exp.Func):
+            if function.find_ancestor(exp.Select) is not select:
+                continue
+            name = (function.name if isinstance(function, (exp.Anonymous, exp.AnonymousAggFunc))
+                    else function.sql_name()).lower()
+            columns = list(function.find_all(exp.Column))
+            if len(columns) != 1:
+                continue
+            column = columns[0].name
+            if name in {"todate", "date", "ts_or_ds_to_date"}:
+                time_groups.append({"column": column, "grain": "day"})
+            if name in {"uniqexact", "countdistinct", "sum", "avg", "min", "max", "count"}:
+                distinct = name in {"uniqexact", "countdistinct"} or function.find(exp.Distinct) is not None
+                aggregates.append({"column": column, "operation": "count_distinct" if distinct else name})
+        blocks.append({"tables": sources, "filters": filters,
+                       "time_groupings": time_groups, "aggregations": aggregates})
+    zero_fill = any(
+        isinstance(function, exp.Coalesce)
+        and any(isinstance(item, exp.Literal) and not item.is_string and item.this == "0"
+                for item in function.iter_expressions())
+        for function in expression.find_all(exp.Func)
+    )
+    left_join = any(str(join.args.get("side", "")).upper() == "LEFT"
+                    for join in expression.find_all(exp.Join))
+    complete = all(
+        (select.args.get("where") is None or id(select) in covered)
+        and select.args.get("having") is None and select.args.get("qualify") is None
+        for select in expression.find_all(exp.Select)
+    )
+    return {"source_blocks": blocks, "unmatched_records_zero_filled": zero_fill and left_join,
+            "filter_coverage_complete": complete}
+
+
+def _natural_filter(item: exp.Expression) -> dict[str, Any]:
+    operators = {exp.GTE: "gte", exp.GT: "gt", exp.LTE: "lte", exp.LT: "lt",
+                 exp.EQ: "eq", exp.NEQ: "neq"}
+    operator = operators.get(type(item))
+    if operator and isinstance(item.this, exp.Column):
+        value = item.expression
+        if isinstance(value, exp.Func):
+            name = (value.name if isinstance(value, exp.Anonymous) else value.sql_name()).lower()
+            if name in {"todate", "todatetime", "todatetime64", "cast", "ts_or_ds_to_date"}:
+                value = value.find(exp.Literal)
+        if isinstance(value, exp.Literal):
+            return {"column": item.this.name, "operator": operator, "value": value.this,
+                    "is_time": bool(_TIME_COLUMN.search(item.this.name))}
+    return {"status": "not_simplified"}
 
 
 def _digest(value: dict[str, Any]) -> str:

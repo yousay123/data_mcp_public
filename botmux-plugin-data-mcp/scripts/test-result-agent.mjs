@@ -172,7 +172,7 @@ const modelServer = createServer((req, res) => {
       const repairing = payload.messages.some(message => message.role === 'tool');
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
         id: 'stat-evidence', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
-          analysis_markdown: repairing ? `相邻上升 ${reference} 次。` : '相邻上升 {{fact_0}} 次。',
+          analysis_markdown: repairing ? `相邻上升 ${reference} 次。` : '相邻上升 {{stat_9999}} 次。',
           ...(repairing ? {} : { facts: [{ row_index: 0, column: 'stat_date' }] }),
         }) },
       }] } }] }));
@@ -216,48 +216,18 @@ const modelServer = createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
       return;
     }
-    if (responseMode === 'stubborn-ungrounded') {
-      const call = {
-        id: 'stubborn-ungrounded', type: 'function',
-        function: {
-          name: 'create_analysis',
-          arguments: JSON.stringify({
-            analysis_markdown: [
-              '# 趋势判断',
-              '',
-              '{{fact_0}}',
-              '',
-              '{{calc_0}}',
-              '',
-              '旧期 18.75，新期 12.5，查询结果已经达到 999999。',
-              '两行结果意味着查询金额为 2。',
-              '预计影响九十九万。',
-              'Unicode 估算为 ١٢٣٤٥。',
-              '增长百分之五。',
-              '达到四分之一。',
-              '金额为壹佰万元。',
-              '已有过半商户完成。',
-              'Roman 估算为 Ⅻ 万。',
-              '# 999999. 总金额已达',
-            ].join('\n'),
-            facts: [{ row_index: 1, column: 'amount', label: '模型宣称 999999' }],
-            calculations: [{
-              operation: 'add', label: '虚构总额 999999',
-              operands: [
-                { row_index: 0, column: 'amount' },
-                { row_index: 1, column: 'amount' },
-              ],
-            }],
-          }),
-        },
-      };
-      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+    if (responseMode === 'free-numeric-analysis') {
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
+        id: 'free-analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
+          analysis_markdown: '本次覆盖 2 天，金额有所变化；假设未来增长 25.6%，可能达到 999999，此为情景推算而非已发生事实。\n\n| stat_date | amount |\n| --- | --- |\n| 2026-03-02 | 999999 |',
+        }) },
+      }] } }] }));
       return;
     }
     if (responseMode === 'redacted-dates-in-detail') {
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
         id: 'lost-summary', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
-          analysis_markdown: '错误估计 999999。',
+          analysis_markdown: '本次覆盖 2 天，建议结合业务背景观察变化。',
           facts: [{ row_index: 0, column: 'stat_date' }], table_columns: ['stat_date', 'amount'],
         }) },
       }] } }] }));
@@ -269,7 +239,7 @@ const modelServer = createServer((req, res) => {
         function: {
           name: 'create_analysis',
           arguments: JSON.stringify({
-            analysis_markdown: '# 关键金额\n\n关键金额 {{fact_0}}，错误估计 999999。',
+            analysis_markdown: '# 关键金额\n\n关键金额 {{fact_0}}；假设情景估计 999999，尚待验证。',
             facts: [{ row_index: 1, column: 'amount', label: '关键金额' }],
             table_columns: ['stat_date'],
           }),
@@ -281,7 +251,7 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'repair-once') {
       repairResponses += 1;
       const args = repairResponses === 1
-        ? { analysis_markdown: '# 趋势判断\n\n较前期增长 33.3%，建议继续观察。' }
+        ? { analysis_markdown: '# 趋势判断\n\n较前期增长 {{calc_999}}%，建议继续观察。' }
         : {
             analysis_markdown: '# 趋势判断\n\n较前期增长 {{calc_0}}%，建议结合业务活动继续观察。',
             calculations: [{
@@ -331,6 +301,13 @@ const result = {
     filter_predicates: ["stat_date >= '2026-03-01'", "stat_date < '2026-04-01'"],
     time_range_predicates: ["stat_date >= '2026-03-01'", "stat_date < '2026-04-01'"],
     grouping_columns: ['stat_date'],
+    query_semantics: {
+      source_blocks: [{ tables: ['synthetic.events'], filters: [
+        { column: 'stat_date', operator: 'gte', value: '2026-03-01', is_time: true },
+        { column: 'stat_date', operator: 'lt', value: '2026-04-01', is_time: true },
+      ], time_groupings: [{ column: 'stat_date', grain: 'day' }], aggregations: [{ column: 'amount', operation: 'sum' }] }],
+      unmatched_records_zero_filled: false, filter_coverage_complete: true,
+    },
   }),
 };
 
@@ -341,9 +318,9 @@ const delivered = await runInternalResultAgent({
   runtimeConfig,
   pluginHome,
 });
-if (!delivered.markdown.includes('## 数据口径')
+if (!delivered.markdown.includes('**数据口径**：')
   || !delivered.markdown.includes('synthetic.events')
-  || !delivered.markdown.includes("stat_date &gt;= '2026-03-01'")) {
+  || !delivered.markdown.includes("2026-03-31")) {
   throw new Error('analysis did not combine result and query scope');
 }
 if (delivered.files.length !== 3 || delivered.artifactTypes.join(',') !== 'excel,chart,pdf,document') {
@@ -364,7 +341,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -407,11 +384,10 @@ const rowCountDelivery = await runInternalResultAgent({
 });
 for (const expected of [
   '**数据量：1,261,699 行**',
-  '## 数据口径',
+  '**数据口径**：',
   'DLC',
   'ksher_dim.dim_kgp_va_account',
-  'COUNT(*) AS row_count',
-  "ds = '20261027'",
+  '查询计划未完整提供',
 ]) {
   if (!rowCountDelivery.markdown.includes(expected)) {
     throw new Error(`beautified count delivery missing ${expected}`);
@@ -472,12 +448,12 @@ const layout = await runInternalResultAgent({
 });
 const detailPosition = layout.markdown.indexOf('## 数据明细');
 const chartPosition = layout.markdown.indexOf('```vega-lite');
-const analysisPosition = layout.markdown.indexOf('## 分析总结');
-const scopePosition = layout.markdown.indexOf('## 数据口径');
+const analysisPosition = layout.markdown.indexOf('累计为 31.25');
+const scopePosition = layout.markdown.indexOf('**数据口径**：');
 if (!(detailPosition >= 0 && chartPosition > detailPosition && analysisPosition > chartPosition && scopePosition > analysisPosition)
   || layout.markdown.includes('MODEL_SCOPE_DUPLICATE') || layout.markdown.includes('# 查询结果')
   || layout.markdown.match(/累计为 31.25/gu)?.length !== 1
-  || layout.markdown.match(/## 数据口径/gu)?.length !== 1
+  || layout.markdown.match(/\*\*数据口径\*\*：/gu)?.length !== 1 || layout.markdown.includes('## 分析总结')
   || layout.files.length !== 1 || layout.files[0].type !== 'excel') {
   throw new Error('result card layout must deduplicate and place scope after chart and summary');
 }
@@ -488,7 +464,7 @@ const statDelivery = await runInternalResultAgent({
 });
 if (!statDelivery.markdown.includes('相邻上升 1 次。')
   || statDelivery.markdown.includes('2026-03-01 次') || statDelivery.audit.modelRepairCount !== 1) {
-  throw new Error('date/count type mismatch was not repaired using trusted statistics');
+  throw new Error('invalid optional reference was not repaired using trusted statistics');
 }
 
 responseMode = 'summary-detail';
@@ -525,55 +501,33 @@ if (requests.length !== 2
   throw new Error('analysis repair did not replace an ungrounded number with a host-computed calculation');
 }
 
-responseMode = 'stubborn-ungrounded';
+responseMode = 'free-numeric-analysis';
 requests = [];
-const redactedDelivery = await runInternalResultAgent({
-  result,
-  question: '分析变化并给出建议',
-  requestedOutputs: ['analysis'],
-  runtimeConfig,
-  pluginHome,
+const freeAnalysis = await runInternalResultAgent({
+  result, question: '自由分析并提供假设情景', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (requests.length !== 3
-  || redactedDelivery.audit?.modelRepairCount !== 2
-  || redactedDelivery.audit?.analysisRedactionUsed !== true
-  || !redactedDelivery.markdown.includes('**amount**：18.75')
-  || !redactedDelivery.markdown.includes('**相加结果**：31.25')
-  || [
-    '999999', '查询金额为 2', '九十九万', '١٢٣٤٥', '百分之五', '四分之一',
-    '壹佰万元', '过半', 'Ⅻ 万', '模型宣称', '虚构总额',
-  ]
-    .some(value => redactedDelivery.markdown.includes(value))) {
-  throw new Error(`final analysis repair did not redact only the ungrounded numeric literal: ${JSON.stringify({
-    requests: requests.length,
-    audit: redactedDelivery.audit,
-    markdown: redactedDelivery.markdown,
-  })}`);
+if (requests.length !== 1 || !freeAnalysis.markdown.includes('25.6%') || !freeAnalysis.markdown.includes('999999')
+  || !freeAnalysis.markdown.includes('情景推算而非已发生事实')
+  || !freeAnalysis.markdown.includes('| 2026-03-02 | 18.75 |') || freeAnalysis.markdown.includes('| 2026-03-02 | 999999 |')
+  || freeAnalysis.audit.analysisRedactionUsed) {
+  throw new Error('free numeric analysis must not be censored or rewrite source-bound rows');
 }
-
 responseMode = 'redacted-fact-with-partial-table';
 requests = [];
 const partialTableDelivery = await runInternalResultAgent({
-  result,
-  question: '返回关键金额和日期明细',
-  requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  result, question: '返回关键金额和日期明细', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-if (requests.length !== 3
-  || partialTableDelivery.audit?.analysisRedactionUsed !== true
-  || !partialTableDelivery.markdown.includes('**amount**：18.75')
-  || !partialTableDelivery.markdown.includes('2026-03-02')
-  || partialTableDelivery.markdown.includes('999999')) {
-  throw new Error('redaction lost a trusted fact that was absent from the selected detail table');
+if (requests.length !== 1 || !partialTableDelivery.markdown.includes('18.75')
+  || !partialTableDelivery.markdown.includes('2026-03-02') || !partialTableDelivery.markdown.includes('999999')) {
+  throw new Error('optional references and free estimates must coexist with exact detail data');
 }
-
 responseMode = 'redacted-dates-in-detail';
-const lostSummary = await runInternalResultAgent({
+const duration = await runInternalResultAgent({
   result, question: '明细和简短总结', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
 });
-const summaryOnly = lostSummary.markdown.split('## 分析总结')[1].split('## 数据口径')[0].trim();
-if (!summaryOnly.endsWith('。') || summaryOnly.includes('2026-03-01') || summaryOnly.includes('999999')
-  || lostSummary.markdown.includes('可信数据') || !lostSummary.audit.analysisRedactionUsed) {
-  throw new Error('failed analysis must produce a complete notice rather than orphan duplicate fields');
+if (!duration.markdown.includes('本次覆盖 2 天') || duration.markdown.includes('## 分析总结')
+  || duration.audit.analysisRedactionUsed || duration.audit.modelAttemptCount !== 1) {
+  throw new Error('natural duration text must succeed without forced placeholders or summary headings');
 }
 
 responseMode = 'string-fact';
@@ -758,7 +712,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });
