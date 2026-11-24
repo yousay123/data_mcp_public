@@ -291,11 +291,16 @@ accepts SQL, table names, identity, or task fields from model arguments.
 
 ## Current Status
 
-### Result delivery (0.4.18)
+### Result delivery (0.4.19)
 
 - Analysis, the source-bound detail table, and the native Vega-Lite chart share
   one primary card. Charts are not SVG file attachments; Excel remains an XLSX
   attachment in the same send operation. The host must support Vega-Lite cards.
+- The card orders detail, chart, concise analysis, then one scope paragraph at
+  the bottom. Model-authored duplicate headings and repeated paragraphs are
+  removed. The default analysis is one or two complete sentences; detailed
+  analysis remains available when requested. Oversized cards omit complete
+  paragraphs instead of cutting a sentence or chart in half.
 - Follow-ups reserve requested output types separately for each trusted turn.
   The same output is not retried automatically; a different missing output may
   be delivered through the auxiliary lane after the primary reply. An ambiguous

@@ -23,7 +23,8 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v4';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v5';
+const SUMMARY_UNAVAILABLE = '本次未生成可用的分析总结，请以结果明细为准。';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -764,6 +765,7 @@ function redactUngroundedNumbers(markdown, envelope, question, analysisArgs) {
   }).join('');
   const missingEvidence = [];
   for (let index = 0; index < (analysisArgs.facts?.length || 0); index += 1) {
+    if (analysisArgs.table_columns?.includes(analysisArgs.facts[index]?.column)) continue;
     const placeholder = `{{fact_${index}}}`;
     if (!restored.includes(placeholder)) missingEvidence.push(placeholder);
   }
@@ -776,8 +778,8 @@ function redactUngroundedNumbers(markdown, envelope, question, analysisArgs) {
       if (!restored.includes(placeholder)) missingEvidence.push(placeholder);
     }
   }
-  if (!missingEvidence.length) return restored;
-  return `${restored.trim()}\n\n## 可信数据\n\n${missingEvidence.join('\n\n')}`;
+  if (!missingEvidence.length) return restored.trim() || SUMMARY_UNAVAILABLE;
+  return `${restored.trim()}\n\n${missingEvidence.join('\n\n')}`;
 }
 
 function markdownTableCells(line) {
@@ -874,12 +876,38 @@ function detailTableLines(args, envelope, maxRows) {
   return [...lines, ''];
 }
 
-function narrativeLines(args, envelope, question = '') {
-  const lines = renderAuthoredAnalysis(args, envelope, question);
-  const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
-  if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_table');
-  lines.push('', ...detailTableLines(args, envelope, maxRows), ...queryContextLines(envelope), '');
-  return lines;
+function conciseNarrative(lines) {
+  const retained = [];
+  let skipSection = false;
+  for (const line of lines) {
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*$/u);
+    if (heading) {
+      skipSection = /^(?:数据口径|统计口径|数据明细|按日明细|趋势图)$/u.test(heading[1].trim());
+      continue;
+    }
+    if (!skipSection) retained.push(line);
+  }
+  const seen = new Set();
+  return retained.join('\n').split(/\n\s*\n/u).map(part => part.trim()).filter(part => {
+    if (!part || seen.has(part)) return false;
+    seen.add(part);
+    return true;
+  }).join('\n\n');
+}
+
+function composeResultCard(analysis, artifacts, envelope) {
+  const charts = artifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown);
+  const summary = analysis?.summary;
+  const context = [...queryContextLines(envelope)];
+  const notice = scopeNotice(envelope.manifest);
+  if (notice) context.push('', `数据范围说明：${notice}`);
+  return [
+    analysis?.details,
+    ...charts,
+    summary ? `## 分析总结\n\n${summary}` : null,
+    !analysis && !charts.length ? '查询结果文件见附件。' : null,
+    context.join('\n'),
+  ].filter(Boolean).join('\n\n');
 }
 
 function executeAnalysis(args, envelope, question = '') {
@@ -890,10 +918,15 @@ function executeAnalysis(args, envelope, question = '') {
   if (args.calculations !== undefined && !Array.isArray(args.calculations)) {
     throw new Error('result_agent_invalid_calculations');
   }
-  const lines = narrativeLines(args, envelope, question);
-  const notice = scopeNotice(envelope.manifest);
-  if (notice) lines.push(`数据范围说明：${notice}`);
-  return { type: 'analysis', markdown: `${lines.join('\n')}\n` };
+  const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
+  if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_analysis_table');
+  const analysis = {
+    type: 'analysis',
+    summary: conciseNarrative(renderAuthoredAnalysis(args, envelope, question))
+      || SUMMARY_UNAVAILABLE,
+    details: detailTableLines(args, envelope, maxRows).join('\n').trim(),
+  };
+  return { ...analysis, markdown: composeResultCard(analysis, [], envelope) };
 }
 
 function documentLines(args, envelope, maxRows) {
@@ -986,7 +1019,7 @@ function toolDefinitions() {
   const analysisProperties = {
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 8000,
-      description: 'Model-authored Markdown. Organize findings freely. Bind source values with {{fact_0}}, aggregates with {{claim_0}}, arithmetic with {{calc_0}}, or use the exact reference provided in computed_facts ({{stat_0}}, etc.).',
+      description: 'Complete concise analysis, normally one or two sentences. No headings, tables, repeated scope, or repetition of every row. Bind source values with {{fact_0}}, aggregates with {{claim_0}}, arithmetic with {{calc_0}}, or references in computed_facts.',
     },
     facts: {
       type: 'array', maxItems: 50,
@@ -1121,6 +1154,8 @@ export async function runInternalResultAgent(options) {
         '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
         'create_analysis 的 Markdown 由你自由组织，不要套最大值、最小值、平均值等固定模板。围绕用户问题提炼现象、问题、风险或机会、业务影响和可执行建议。',
+        '默认只写一至两句完整的分析总结：概括主要变化和需要关注的点，句子必须完整收尾。仅当用户明确要求详细/深入分析时才展开。不要写标题、重复明细、口径或“可信数据”等栏目；宿主会统一按明细、图表、分析总结、数据口径的顺序排版。',
+        '默认简短总结可直接用自然语言概括变化，无需重复罗列日期和数值；如用户明确要求总数等指标，使用可信引用回答，不得遗漏。',
         '任何需要准确展示的原始字段值都通过 facts 选择，并在 Markdown 中引用从零开始编号的 {{fact_0}}、{{fact_1}}；facts 可以引用字符串、布尔值、数字、日期、账号和权限等任意返回字段。',
         '只有确有业务意义时才选择 claims 计算聚合，并引用从零开始编号的 {{claim_0}}、{{claim_1}}。不要为了满足格式机械增加聚合字段。列表或明细结果优先选择 table_columns。',
         '选择 table_columns 后，宿主会从可信 rows 统一渲染一次明细表；analysis_markdown 只写分析正文，不要再构造 Markdown 表格。',
@@ -1170,13 +1205,8 @@ export async function runInternalResultAgent(options) {
         if (artifact.type === 'analysis') analysis = artifact;
         else artifacts.push(artifact);
       }
-      const notice = scopeNotice(envelope.manifest);
-      const markdown = analysis?.markdown || [
-        `已按同一份受控查询结果生成 ${artifacts.length} 个产物。`,
-        notice ? `数据范围说明：${notice}` : null,
-      ].filter(Boolean).join('\n\n');
       return {
-        markdown: [markdown, ...artifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown)].join('\n\n'),
+        markdown: composeResultCard(analysis, artifacts, envelope),
         files: artifacts.filter(artifact => artifact.path).map(artifact => ({ path: artifact.path, filename: artifact.filename, type: artifact.type })),
         artifactTypes: artifacts.map(artifact => artifact.type),
         manifest: envelope.manifest,
@@ -1216,12 +1246,8 @@ export async function runInternalResultAgent(options) {
             if (artifact.type === 'analysis') analysis = artifact;
             else sanitizedArtifacts.push(artifact);
           }
-          const notice = scopeNotice(envelope.manifest);
           return {
-            markdown: [analysis?.markdown || [
-              `已按同一份受控查询结果生成 ${sanitizedArtifacts.length} 个产物。`,
-              notice ? `数据范围说明：${notice}` : null,
-            ].filter(Boolean).join('\n\n'), ...sanitizedArtifacts.filter(artifact => artifact.type === 'chart').map(artifact => artifact.markdown)].join('\n\n'),
+            markdown: composeResultCard(analysis, sanitizedArtifacts, envelope),
             files: sanitizedArtifacts.filter(artifact => artifact.path).map(artifact => ({
               path: artifact.path, filename: artifact.filename, type: artifact.type,
             })),

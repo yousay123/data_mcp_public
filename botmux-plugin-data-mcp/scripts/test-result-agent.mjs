@@ -178,6 +178,18 @@ const modelServer = createServer((req, res) => {
       }] } }] }));
       return;
     }
+    if (responseMode === 'layout') {
+      const calls = [
+        ['layout-analysis', 'create_analysis', {
+          analysis_markdown: '# 查询结果\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 分析总结\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 数据口径\n\nMODEL_SCOPE_DUPLICATE',
+          claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'],
+        }],
+        ['layout-chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
+        ['layout-excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
+      ].map(([id, name, args]) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }));
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: calls } }] }));
+      return;
+    }
     if (responseMode === 'summary-detail') {
       const call = {
         id: 'summary-detail', type: 'function',
@@ -240,6 +252,15 @@ const modelServer = createServer((req, res) => {
         },
       };
       res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [call] } }] }));
+      return;
+    }
+    if (responseMode === 'redacted-dates-in-detail') {
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
+        id: 'lost-summary', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({
+          analysis_markdown: '错误估计 999999。',
+          facts: [{ row_index: 0, column: 'stat_date' }], table_columns: ['stat_date', 'amount'],
+        }) },
+      }] } }] }));
       return;
     }
     if (responseMode === 'redacted-fact-with-partial-table') {
@@ -343,7 +364,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -445,6 +466,22 @@ if (calculationDelivery.markdown.includes('NaN') || calculationDelivery.markdown
   throw new Error(`generic row-bound calculations were not rendered exactly: ${calculationDelivery.markdown}`);
 }
 
+responseMode = 'layout';
+const layout = await runInternalResultAgent({
+  result, question: '明细、图表、简短总结和 Excel', requestedOutputs: ['analysis', 'chart', 'excel'], runtimeConfig, pluginHome,
+});
+const detailPosition = layout.markdown.indexOf('## 数据明细');
+const chartPosition = layout.markdown.indexOf('```vega-lite');
+const analysisPosition = layout.markdown.indexOf('## 分析总结');
+const scopePosition = layout.markdown.indexOf('## 数据口径');
+if (!(detailPosition >= 0 && chartPosition > detailPosition && analysisPosition > chartPosition && scopePosition > analysisPosition)
+  || layout.markdown.includes('MODEL_SCOPE_DUPLICATE') || layout.markdown.includes('# 查询结果')
+  || layout.markdown.match(/累计为 31.25/gu)?.length !== 1
+  || layout.markdown.match(/## 数据口径/gu)?.length !== 1
+  || layout.files.length !== 1 || layout.files[0].type !== 'excel') {
+  throw new Error('result card layout must deduplicate and place scope after chart and summary');
+}
+
 responseMode = 'stat-evidence';
 const statDelivery = await runInternalResultAgent({
   result, question: '解释相邻变化', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
@@ -527,6 +564,16 @@ if (requests.length !== 3
   || !partialTableDelivery.markdown.includes('2026-03-02')
   || partialTableDelivery.markdown.includes('999999')) {
   throw new Error('redaction lost a trusted fact that was absent from the selected detail table');
+}
+
+responseMode = 'redacted-dates-in-detail';
+const lostSummary = await runInternalResultAgent({
+  result, question: '明细和简短总结', requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+});
+const summaryOnly = lostSummary.markdown.split('## 分析总结')[1].split('## 数据口径')[0].trim();
+if (!summaryOnly.endsWith('。') || summaryOnly.includes('2026-03-01') || summaryOnly.includes('999999')
+  || lostSummary.markdown.includes('可信数据') || !lostSummary.audit.analysisRedactionUsed) {
+  throw new Error('failed analysis must produce a complete notice rather than orphan duplicate fields');
 }
 
 responseMode = 'string-fact';
@@ -711,7 +758,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v4') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v5') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

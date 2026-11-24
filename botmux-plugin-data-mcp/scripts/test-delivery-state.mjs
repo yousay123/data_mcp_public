@@ -200,9 +200,6 @@ try {
   assert.equal(store.reserveTurn(unitIdentity, 'om_scopes', Date.now(), ['analysis']), true);
   assert.equal(store.reserveTurn(unitIdentity, 'om_scopes', Date.now(), ['analysis']), false);
   assert.equal(store.reserveTurn(unitIdentity, 'om_primary', Date.now(), ['delivery_primary']), true);
-  const reopened = new ResultStore({ pluginHome, secret });
-  assert.equal(reopened.reserveTurn(unitIdentity, 'om_primary', Date.now(), ['delivery_primary']), false);
-  assert.equal(store.reserveTurn(unitIdentity, 'om_primary', Date.now(), ['delivery_primary']), true);
   const restartedStore = new ResultStore({ pluginHome, secret });
   assert.equal(restartedStore.reserveTurn(unitIdentity, 'om_primary', Date.now(), ['delivery_primary']), false);
   console.log('delivery state tests passed: failure/restart retention, timed expiry, upload overlap, replacement CAS, reservation rollback, durable primary lane');

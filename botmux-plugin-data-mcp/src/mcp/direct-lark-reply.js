@@ -110,26 +110,6 @@ async function verifyBoundSession(appId) {
   return sessionId;
 }
 
-function truncateUtf8(text, maxBytes = MAX_DIRECT_REPLY_TEXT_BYTES) {
-  const encoded = Buffer.from(text);
-  if (encoded.length <= maxBytes) return { text, bytes: encoded.length, truncated: false };
-  const suffix = '\n\n[结果过长，已截断]';
-  const suffixBytes = Buffer.byteLength(suffix);
-  const budget = Math.max(0, maxBytes - suffixBytes);
-  let end = budget;
-  let prefix = '';
-  while (end > 0) {
-    try {
-      prefix = new TextDecoder('utf-8', { fatal: true }).decode(encoded.subarray(0, end));
-      break;
-    } catch {
-      end -= 1;
-    }
-  }
-  const truncated = `${prefix}${suffix}`;
-  return { text: truncated, bytes: Buffer.byteLength(truncated), truncated: true };
-}
-
 function assertOutboundFile(path, pluginHome) {
   if (typeof path !== 'string' || !path || typeof pluginHome !== 'string' || !pluginHome) {
     throw fixedError('direct_reply_attachment_failed');
@@ -156,15 +136,32 @@ function assertOutboundFile(path, pluginHome) {
 }
 
 function prepareCardText(text) {
+  if (Buffer.byteLength(text) <= MAX_DIRECT_REPLY_TEXT_BYTES) {
+    return { text, bytes: Buffer.byteLength(text), truncated: false };
+  }
   const charts = [...text.matchAll(/```(?:vega-lite|vegalite)[ \t]*\r?\n[\s\S]*?\n```/gu)].map(match => match[0]);
-  if (!charts.length) return truncateUtf8(text);
   const chartText = `\n\n${charts.join('\n\n')}`;
   const chartBytes = Buffer.byteLength(chartText);
   // Never cut a JSON fence in half: a malformed fence loses the native chart.
   if (chartBytes > MAX_DIRECT_REPLY_TEXT_BYTES - 128) throw fixedError('direct_reply_text_too_large');
-  const narrative = text.replace(/```(?:vega-lite|vegalite)[ \t]*\r?\n[\s\S]*?\n```/gu, '').trim();
-  const prepared = truncateUtf8(narrative, MAX_DIRECT_REPLY_TEXT_BYTES - chartBytes);
-  return { text: prepared.text + chartText, bytes: prepared.bytes + chartBytes, truncated: prepared.truncated };
+  const footerIndex = text.lastIndexOf('\n## 数据口径\n');
+  const footer = footerIndex < 0 ? '' : text.slice(footerIndex);
+  const footerBytes = Buffer.byteLength(footer);
+  if (chartBytes + footerBytes > MAX_DIRECT_REPLY_TEXT_BYTES - 128) throw fixedError('direct_reply_text_too_large');
+  const body = footerIndex < 0 ? text : text.slice(0, footerIndex);
+  const protectedBlock = /(```(?:vega-lite|vegalite)[ \t]*\r?\n[\s\S]*?\n```)/gu;
+  const budget = MAX_DIRECT_REPLY_TEXT_BYTES - chartBytes - footerBytes - Buffer.byteLength('\n\n[正文较长，部分段落未展示]');
+  let remaining = budget; let omitted = false;
+  const parts = body.split(protectedBlock).map(part => {
+    if (/^```(?:vega-lite|vegalite)/u.test(part)) return part;
+    return part.split(/\n\s*\n/u).filter(paragraph => {
+      const bytes = Buffer.byteLength(paragraph) + 4;
+      if (bytes > remaining) { omitted = true; return false; }
+      remaining -= bytes; return true;
+    }).join('\n\n');
+  }).filter(Boolean);
+  const prepared = parts.join('\n\n') + (omitted ? '\n\n[正文较长，部分段落未展示]' : '') + footer;
+  return { text: prepared, bytes: Buffer.byteLength(prepared), truncated: omitted };
 }
 
 function successfulSend(result) {

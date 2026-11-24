@@ -78,12 +78,26 @@ if (!twoFiles?.content.trim() || twoFiles.args.filter(arg => arg === '--files').
 const longReceipt = await deliverDirectLarkReply(caller('om_long'), { markdown: '数'.repeat(30_000) }, pluginHome);
 if (!longReceipt.truncated || longReceipt.textBytes > 20_000) throw new Error('UTF-8 truncation limit failed');
 const chartSpec = { data: { values: [{ x: 'a', y: 1 }, { x: 'b', y: 2 }] }, mark: 'line' };
+const orderedCard = '| 日期 | 数量 |\n| --- | --- |\n| a | 1 |\n| b | 2 |\n\n```vega-lite\n'
+  + JSON.stringify(chartSpec) + '\n```\n\n## 分析总结\n\n数量有所上升，建议持续观察。\n\n## 数据口径\n\n仅使用合成数据。';
+await deliver('om_ordered_chart', { markdown: orderedCard });
+records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+if (records.find(row => row.args[0] === 'send' && row.args.includes('om_ordered_chart')).content !== orderedCard) {
+  throw new Error('transport must preserve detail/chart/summary/scope order');
+}
 await deliver('om_long_chart', { markdown: '数'.repeat(30_000) + '\n\n```vega-lite\n' + JSON.stringify(chartSpec) + '\n```' });
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
 const longChart = records.find(row => row.args[0] === 'send' && row.args.includes('om_long_chart'));
 const preservedSpec = longChart.content.match(/```vega-lite\n([^]*?)\n```/u)?.[1];
 if (!preservedSpec || JSON.parse(preservedSpec).data.values.length !== 2 || Buffer.byteLength(longChart.content) > 20_000) {
   throw new Error('truncation corrupted the native chart');
+}
+await deliver('om_oversize_scope', { markdown: '长'.repeat(30_000) + '\n\n' + orderedCard });
+records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+const scoped = records.find(row => row.args[0] === 'send' && row.args.includes('om_oversize_scope')).content;
+if (!scoped.endsWith('仅使用合成数据。') || !scoped.includes('数量有所上升，建议持续观察。')
+  || scoped.includes('长长长') || scoped.indexOf('```vega-lite') > scoped.indexOf('## 分析总结')) {
+  throw new Error('oversized card must preserve complete paragraphs and keep scope last');
 }
 
 for (const rejected of [
