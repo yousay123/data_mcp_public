@@ -233,6 +233,7 @@ export class ResultStore {
       safeDetail.receipt_generation = /^[a-f0-9-]{36}$/.test(detail.generationId ?? '') ? detail.generationId : null;
       safeDetail.delivery_receipt = {
         deliveryId: receipt.deliveryId, status: receipt.status,
+        ...(receipt.authority === 'host' ? { authority: 'host' } : {}),
         ...(receipt.messageId ? { messageId: receipt.messageId } : {}),
         attachmentMessageIds: [...(receipt.attachmentMessageIds || [])],
         attachmentCount: receipt.attachmentMessageIds?.length || 0,
@@ -351,6 +352,10 @@ export class ResultStore {
             .some(value => typeof value !== 'string' || !/^om_[A-Za-z0-9_-]{1,200}$/.test(value))) {
           return { status: 'delivery_status_unavailable' };
         }
+        if (receipt.authority === 'host') return {
+          status: 'host_status_required', pluginId: 'data-mcp', deliveryId: receipt.deliveryId,
+          next_action: 'botmux_result_delivery_status', observedAt: record.at,
+        };
         return {
           status: receipt.status, deliveryId: receipt.deliveryId,
           ...(receipt.messageId ? { messageId: receipt.messageId } : {}),

@@ -1045,6 +1045,8 @@ try {
       ...mismatchedScheduleToolCalls,
       deliveryWithoutHostCapabilityCall,
     ].map(message => JSON.stringify(message)).join('\n') + '\n';
+    const probeHostEnv = join(cleanRoot, 'probe-host.env');
+    writeFileSync(probeHostEnv, 'DATA_MCP_RESULT_BINDING_HMAC_KEY=synthetic_probe_binding_0123456789abcdef\n', { mode: 0o600 });
     const probe = spawnSync(process.execPath, [join(cleanRoot, 'mcp', 'server.js')], {
       cwd: cleanRoot,
       input,
@@ -1053,6 +1055,10 @@ try {
       env: {
         ...process.env,
         BOTMUX_SESSION_ID: 'session_validate_probe',
+        BOTMUX_PLUGIN_HOME: cleanRoot,
+        KSHER_AGENT_DATA_MCP_ENV_FILE: probeHostEnv,
+        DATA_MCP_RESULT_DELIVERY_READ_POLICY: 'legacy',
+        DATA_MCP_RUN_QUERY_ENDPOINT: 'data:application/json,%7B%22status%22%3A%22error%22%7D',
         BOTMUX_TRUSTED_TURN_FILE: '',
         SESSION_DATA_DIR: '',
         DATA_MCP_SERVICE_SOCKET_PATH: 'disabled',
@@ -1304,7 +1310,7 @@ try {
     }
     const deliveryWithoutCapabilityText = byId.get(40)?.result?.content?.[0]?.text ?? '';
     if (!deliveryWithoutCapabilityText.includes('isolated_data_operation_failed')) {
-      fail('direct result delivery must reach data execution without the retired host capability');
+      fail('direct result delivery must reach data execution without the retired host capability; actual=' + JSON.stringify({ error: byId.get(40)?.error?.message, status: JSON.parse(deliveryWithoutCapabilityText || '{}').status, code: JSON.parse(deliveryWithoutCapabilityText || '{}').error_code }));
     }
 
     const missingSessionCall = {

@@ -1,3 +1,4 @@
+import { useProtectedHostDelivery, prepareHostResultDelivery } from './host-result-delivery.js';
 import { renderQueryContext } from '../result-agent/query-context.js';
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
@@ -1264,6 +1265,14 @@ async function sendPreparedDirectReply(caller, prepared) {
       observeReceipt({ status: 'pending' });
       const responseKind = guard && !guard.store.reserveTurn(guard.identity, caller.turnId, Date.now(), ['delivery_primary'])
         ? 'auxiliary' : 'final';
+      if (useProtectedHostDelivery(caller, nonBlankProcessEnv('DATA_MCP_RESULT_DELIVERY_READ_POLICY'))) {
+        const envelope = prepareHostResultDelivery(caller, { ...prepared.delivery, responseKind },
+          nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'));
+        // Custody transfer is not a provider success. The host is authoritative;
+        // pending metadata directs later status queries to its trusted tool.
+        observeReceipt({ status: 'pending', authority: 'host' });
+        return envelope;
+      }
       const receipt = await deliverDirectLarkReply(
         caller,
         { ...prepared.delivery, responseKind },
@@ -1768,13 +1777,16 @@ async function handleToolCall(request) {
       ok(request.id, jsonTool(policyIssue));
       return;
     }
+    try { useProtectedHostDelivery(caller, nonBlankProcessEnv('DATA_MCP_RESULT_DELIVERY_READ_POLICY')); }
+    catch (issue) { ok(request.id, jsonTool(directReplyFailure(issue))); return; }
     let prepared;
     try {
       prepared = await deliverQueryResult(caller, argsFrom(request), runtimeConfig);
     } catch {
       prepared = { error: isolatedDeliveryFailure() };
     }
-    ok(request.id, jsonTool(await sendPreparedDirectReply(caller, prepared)));
+    const result = await sendPreparedDirectReply(caller, prepared);
+    ok(request.id, result?._meta?.botmuxHostDelivery ? result : jsonTool(result));
     return;
   }
 
@@ -1788,13 +1800,16 @@ async function handleToolCall(request) {
       ok(request.id, jsonTool(policyIssue));
       return;
     }
+    try { useProtectedHostDelivery(caller, nonBlankProcessEnv('DATA_MCP_RESULT_DELIVERY_READ_POLICY')); }
+    catch (issue) { ok(request.id, jsonTool(directReplyFailure(issue))); return; }
     let prepared;
     try {
       prepared = await continueQueryResult(caller, argsFrom(request), runtimeConfig);
     } catch {
       prepared = { error: fixedFollowupResult('delivery_failed') };
     }
-    ok(request.id, jsonTool(await sendPreparedDirectReply(caller, prepared)));
+    const result = await sendPreparedDirectReply(caller, prepared);
+    ok(request.id, result?._meta?.botmuxHostDelivery ? result : jsonTool(result));
     return;
   }
 
@@ -1910,7 +1925,7 @@ function toolSchemas() {
     },
     {
       name: 'get_query_delivery_status_for_user',
-      description: 'Read only the current trusted caller/app/session bound delivery status and provider message IDs. No SQL/model call, result text, rows, filenames or local paths. Pending/unknown is not permission to resend.',
+      description: 'Read only the current trusted caller/app/session bound delivery status and provider message IDs. No SQL/model call, result text, rows, filenames or local paths. In protected mode host_status_required delegates final state to botmux_result_delivery_status. Pending/unknown is not permission to resend.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     },
     {

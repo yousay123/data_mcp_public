@@ -66,7 +66,10 @@ When the user describes a metric, topic, or business object instead of a table:
      receipt. After `delivered=true`, do not send a second result, summary,
      table or attachment. Do not read the result with history, quoted, raw IM
      APIs, cached files or other tools: this would put business data back in
-     the orchestration context. A successful receipt completes the delivery;
+     the orchestration context. A successful receipt completes the delivery.
+     In protected mode, `host_status_required` means custody transfer, not
+     successful delivery: query `botmux_result_delivery_status` using its plugin
+     ID and delivery ID. Pending/unknown is not permission to resend;
    - when it is absent, this Bot is explicitly configured for single-model
      operation: use `run_query_for_user`; the calling model must create any
      requested file with its own artifact skill/tool. In this mode query rows

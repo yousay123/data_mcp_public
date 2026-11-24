@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "validate": "node ./scripts/validate.mjs",
-    "test": "npm run build && npm run validate && node ./scripts/test-query-context.mjs && node ./scripts/test-result-agent.mjs && node ./scripts/test-model-budget.mjs && node ./scripts/test-result-capabilities.mjs && node ./scripts/test-direct-lark-reply.mjs && node ./scripts/test-result-delivery.mjs && node ./scripts/test-result-followup.mjs && node ./scripts/test-delivery-state.mjs && node ./scripts/test-signed-app-profile.mjs",
+    "test": "npm run build && npm run validate && node ./scripts/test-query-context.mjs && node ./scripts/test-result-agent.mjs && node ./scripts/test-model-budget.mjs && node ./scripts/test-result-capabilities.mjs && node ./scripts/test-direct-lark-reply.mjs && node ./scripts/test-host-result-delivery.mjs && node ./scripts/test-result-delivery.mjs && node ./scripts/test-result-followup.mjs && node ./scripts/test-delivery-state.mjs && node ./scripts/test-signed-app-profile.mjs",
     "prepublishOnly": "npm test"
   },
   "devDependencies": {

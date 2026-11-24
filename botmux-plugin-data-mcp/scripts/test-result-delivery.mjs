@@ -110,7 +110,10 @@ const modelServer = createServer((req, res) => {
           }
         : { id: 'analysis', type: 'function', function: { name: 'create_analysis', arguments: JSON.stringify({ analysis_markdown: '# 查询结果\n\n{{claim_0}}', claims: [{ operation: 'sum', column: 'amount' }] }) } };
       if (ungroundedResponsesRemaining > 0) ungroundedResponsesRemaining -= 1;
-      const calls = internalResult.requested_outputs.includes('analysis') ? [analysisCall] : fileCalls;
+      const calls = [
+        ...(internalResult.requested_outputs.includes('analysis') ? [analysisCall] : []),
+        ...fileCalls.filter(call => internalResult.requested_outputs.includes(call.id)),
+      ];
       res.end(JSON.stringify({
         id: 'resp_delivery_fixture', model: 'internal-test-model-resolved',
         choices: [{ message: { content: null, tool_calls: calls } }],
@@ -174,6 +177,13 @@ const caller = {
   requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test',
   requestLarkAppId: 'cli_synthetic', senderType: 'user', turnId: 'om_delivery',
 };
+const rejectedHost = await runPlugin([{
+  name: 'deliver_query_result_for_user', arguments: { sql: 'SELECT amount FROM fixture', query_plan_id: 'unsupported-host' },
+  _meta: { botmuxTrustedCaller: caller },
+}], { DATA_MCP_RESULT_DELIVERY_READ_POLICY: 'receipt-only' });
+if (queryCount !== 0 || !JSON.stringify(rejectedHost).includes('protected_result_host_required')) {
+  throw new Error('unsupported protected host must reject before SQL/model access');
+}
 const responses = await runPlugin([
   {
     name: 'deliver_query_result_for_user',
@@ -460,6 +470,27 @@ if (!latestSend()?.content?.includes('result_agent_not_configured')
   || JSON.stringify(missingModel[0]).includes('CONFIDENTIAL_BUSINESS_ROW_7319')) {
   throw new Error('missing-model reply did not explain the safe error or exposed raw rows');
 }
+
+modelFailuresRemaining = 0; ungroundedResponsesRemaining = 0;
+const protectedCaller = { ...caller, requestUserUnionId: 'on_host_protected', turnId: 'om_host_protected',
+  hostCapabilities: ['result_delivery_v1', 'result_delivery_receipt_only_v1'] };
+const sendsBeforeHost = botmuxRecords().length;
+const protectedReplies = await runPlugin([{
+  name: 'deliver_query_result_for_user', arguments: { sql: 'SELECT amount FROM fixture', query_plan_id: 'protected-host-plan',
+    requested_outputs: ['analysis', 'excel', 'chart'], question: 'return the synthetic analysis and file' },
+  _meta: { botmuxTrustedCaller: protectedCaller },
+}], { DATA_MCP_RESULT_DELIVERY_READ_POLICY: 'receipt-only' });
+const envelope = protectedReplies[0]?.result?._meta?.botmuxHostDelivery;
+if (envelope?.readPolicy !== 'receipt-only' || envelope.schemaVersion !== 1 || !envelope.markdown
+  || !envelope.files?.some(file => file.path.endsWith('.xlsx'))) throw new Error('protected result did not enter host protocol: ' + JSON.stringify({ status: toolPayload(protectedReplies[0]).status, error_code: toolPayload(protectedReplies[0]).error_code, envelope: !!envelope, files: envelope?.files?.length }));
+if (botmuxRecords().length !== sendsBeforeHost) throw new Error('protected handoff spawned legacy observe/send');
+if (JSON.stringify(protectedReplies[0].result.content).includes(modelOutput)
+  || JSON.stringify(protectedReplies[0].result.content).includes(sentinel)) throw new Error('MCP public content exposed private result');
+if (envelope.files.some(file => !existsSync(file.path))) throw new Error('plugin deleted files before host custody transfer');
+const hostStatus = toolPayload((await runPlugin([{ name: 'get_query_delivery_status_for_user', arguments: {},
+  _meta: { botmuxTrustedCaller: protectedCaller } }], { DATA_MCP_RESULT_DELIVERY_READ_POLICY: 'receipt-only' }))[0]);
+if (hostStatus.status !== 'host_status_required' || hostStatus.deliveryId !== envelope.deliveryId
+  || hostStatus.next_action !== 'botmux_result_delivery_status') throw new Error('plugin confused handoff with provider success');
 
 modelServer.close();
 serviceServer.close();

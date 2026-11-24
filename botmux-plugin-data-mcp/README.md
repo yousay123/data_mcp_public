@@ -377,3 +377,26 @@ This plugin expects a Data MCP HTTP service to be reachable from the host. If
 the service is absent, identity-bound tools return a structured
 `Data MCP 服务不可达` error instead of falling back to model-supplied identity or
 local SQL execution.
+
+### Protected host delivery (local candidate)
+
+When Gateway advertises `result_delivery_receipt_only_v1`, the plugin hands
+one `botmuxHostDelivery` MCP envelope to the host with `readPolicy: receipt-only`.
+It does not start a second send CLI. Enable the host's `protectedResults` and
+supported sandbox profile for the bot, and set its `pluginRuntime.data-mcp.env`
+`DATA_MCP_RESULT_DELIVERY_READ_POLICY=receipt-only`. Unsupported hosts are then
+rejected before SQL/model access. New clean sessions are required; restarting
+an old context cannot erase data it has already seen. Existing unprotected
+bots retain the legacy path; explicit receipt-only never falls back to it.
+Single-model query behavior is unchanged.
+
+Gateway consumes host-only `_meta` and returns the authoritative receipt.
+Plugin status `host_status_required` delegates provider state to
+`botmux_result_delivery_status`; custody transfer is not delivery success.
+Do not inspect result bodies via history/quoted, blindly retry uncertain
+sends, or repeat a business query to recover delivery.
+
+Unclaimed source files keep the existing 15-minute private stale-artifact TTL,
+covering the supported 600-second overall tool deadline. After that TTL an
+expired envelope cannot recover the original source. Once the host takes its
+durable snapshot, its artifacts and status are authoritative.

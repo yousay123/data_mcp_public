@@ -110,7 +110,7 @@ async function verifyBoundSession(appId) {
   return sessionId;
 }
 
-function assertOutboundFile(path, pluginHome) {
+export function assertOutboundFile(path, pluginHome) {
   if (typeof path !== 'string' || !path || typeof pluginHome !== 'string' || !pluginHome) {
     throw fixedError('direct_reply_attachment_failed');
   }
@@ -135,7 +135,7 @@ function assertOutboundFile(path, pluginHome) {
   }
 }
 
-function prepareCardText(text) {
+export function prepareCardText(text) {
   if (Buffer.byteLength(text) <= MAX_DIRECT_REPLY_TEXT_BYTES) {
     return { text, bytes: Buffer.byteLength(text), truncated: false };
   }
