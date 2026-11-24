@@ -341,7 +341,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6'
+  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -588,10 +588,8 @@ if (rowLimitError?.message !== 'result_agent_artifact_row_limit') {
 }
 
 for (const [mode, output] of [
-  ['free-text-chinese', 'document'],
   ['free-text-english', 'document'],
   ['free-text-multiplier', 'document'],
-  ['free-text-chart', 'chart'],
 ]) {
   responseMode = mode;
   requests = [];
@@ -604,6 +602,13 @@ for (const [mode, output] of [
   if (freeTextError?.message !== 'result_agent_free_text_not_allowed') {
     throw new Error(`${mode} must fail closed, got ${freeTextError?.message}`);
   }
+}
+
+for (const [mode, output] of [['free-text-chinese', 'document'], ['free-text-chart', 'chart']]) {
+  responseMode = mode;
+  const authored = await runInternalResultAgent({ result, question: '自由组织产物标题', requestedOutputs: [output], runtimeConfig, pluginHome });
+  if (output === 'document' && !readFileSync(authored.files[0].path, 'utf8').includes('九十九万')) throw new Error('document title was not model-authored');
+  if (output === 'chart' && !authored.markdown.includes('总金额 999999')) throw new Error('chart title was not model-authored');
 }
 
 responseMode = 'precision';
@@ -639,7 +644,7 @@ for (const claim of exactClaims) {
   const document = precision.files.find(file => file.type === 'document');
   if (!readFileSync(document.path, 'utf8').includes(claim)) throw new Error(`missing exact document claim: ${claim}`);
   const pdf = precision.files.find(file => file.type === 'pdf');
-  const utf16 = Buffer.from(`\ufeff${claim}`, 'utf16le').swap16().toString('hex').toUpperCase();
+  const utf16 = Buffer.from(`\ufeff${claim.replace(/\*\*/gu, '')}`, 'utf16le').swap16().toString('hex').toUpperCase();
   if (!readFileSync(pdf.path).toString().includes(utf16)) throw new Error(`missing exact PDF claim: ${claim}`);
 }
 if (!precision.markdown.includes('```vega-lite') || !precision.markdown.includes('9007199254740993.00')) {
@@ -712,7 +717,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v6') {
+  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7') {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

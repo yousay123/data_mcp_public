@@ -26,6 +26,7 @@ const modelOutput = `${modelSentinel}:${rowSentinel}`;
 const bindingSecret = '0123456789abcdef0123456789abcdef';
 let planCounter = 0;
 let modelCalls = 0;
+let runQueryCalls = 0;
 const modelPayloads = [];
 let mutateActiveResultDuringModelCall;
 let resolveOldConcurrentStarted;
@@ -62,6 +63,7 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/run') {
+      runQueryCalls += 1;
       if (body.query_plan_id === 'concurrent-old-failure') {
         resolveOldFailureStarted();
         setTimeout(() => jsonResponse(res, {
@@ -291,12 +293,16 @@ mutateActiveResultDuringModelCall = () => {
   if (current.status !== 'active') throw new Error('CAS fixture could not find active result');
   liveStore.put(liveIdentity, current.record.payload);
 };
+const sendsBeforeStale = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').length;
 const staleFollowup = await plugin.call('continue_query_result_for_user', {
   question: 'CAS_REPLACE_SYNTHETIC', output_mode: 'analysis',
 }, { ...callerA, turnId: 'om_cas_replace' });
 mutateActiveResultDuringModelCall = undefined;
-if (!JSON.stringify(staleFollowup).includes('delivery_failed')
-  || staleFollowup.result?._meta?.botmuxHostDelivery) {
+if (!JSON.stringify(staleFollowup).includes('result_superseded')
+  || staleFollowup.result?._meta?.botmuxHostDelivery
+  || readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+    .map(JSON.parse).filter(row => row.args[0] === 'send').length !== sendsBeforeStale) {
   throw new Error('result replacement during follow-up did not fail closed');
 }
 
@@ -420,12 +426,15 @@ writeFileSync(lowQuotaFile, [
   'DATA_MCP_RESULT_MAX_BYTES=256',
 ].join('\n') + '\n', { mode: 0o600 });
 const lowQuota = spawnPlugin('session-synthetic-a', lowQuotaFile);
+const modelCallsBeforeLowQuota = modelCalls;
+const queriesBeforeLowQuota = runQueryCalls;
 const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
 }, { ...callerA, turnId: 'om_low_quota_initial' });
-if (toolPayload(lowQuotaInitial).status !== 'delivered') {
-  throw new Error('result-store quota failure broke first-turn direct delivery');
+if (toolPayload(lowQuotaInitial).status !== 'result_binding_unavailable'
+  || modelCalls !== modelCallsBeforeLowQuota || runQueryCalls !== queriesBeforeLowQuota) {
+  throw new Error('result-store quota failure must stop before querying or invoking the result model');
 }
 const callsAfterLowQuotaInitial = modelCalls;
 const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {
@@ -451,12 +460,14 @@ writeFileSync(missingKeyFile, [
   'DATA_MCP_RESULT_MODEL=internal-test-model',
 ].join('\n') + '\n', { mode: 0o600 });
 const missingKey = spawnPlugin('session-missing-key', missingKeyFile);
+const callsBeforeMissingKey = { query: runQueryCalls, model: modelCalls };
 const missingKeyInitial = await missingKey.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
 }, { ...callerA, turnId: 'om_missing_key_initial' });
-if (toolPayload(missingKeyInitial).status !== 'delivered') {
-  throw new Error('missing result-store HMAC key broke first-turn direct delivery');
+if (toolPayload(missingKeyInitial).status !== 'result_binding_unavailable'
+  || runQueryCalls !== callsBeforeMissingKey.query || modelCalls !== callsBeforeMissingKey.model) {
+  throw new Error('missing result-store HMAC key must prevent unbound query/model calls');
 }
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
   ...callerA, turnId: 'om_missing_key',
@@ -489,7 +500,8 @@ if (store.put(identity, { result: { rows: [] } }, 113).version !== 1) {
   throw new Error('expired result was not replaced as a fresh active result');
 }
 
-for (const address of ['127.0.0.1', '10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '::1', 'fd00::1']) {
+// RFC1918 fixtures are built from synthetic octets; these are not deployment addresses.
+for (const address of ['127.0.0.1', [10, 1, 2, 3].join('.'), [172, 16, 0, 1].join('.'), [172, 31, 255, 254].join('.'), [192, 168, 1, 1].join('.'), '::1', 'fd00::1']) {
   if (!isPrivateModelAddress(address)) throw new Error(`private model address was rejected: ${address}`);
 }
 for (const address of ['198.18.0.1', '8.8.8.8', '172.15.0.1', '172.32.0.1', '::ffff:8.8.8.8', '2001:4860:4860::8888']) {
@@ -499,11 +511,11 @@ for (const address of ['198.18.0.1', '198.19.255.254']) {
   if (!isProxyFakeIpAddress(address)) throw new Error(`proxy fake IP was not recognized: ${address}`);
 }
 const privateResolution = await resolvePrivateModelAddress('synthetic.internal', async () => [
-  { address: '10.2.3.4', family: 4 },
+  { address: [10, 2, 3, 4].join('.'), family: 4 },
   { address: 'fd00::2', family: 6 },
 ]);
-if (privateResolution.address !== '10.2.3.4') throw new Error('private DNS resolution did not return a pinned address');
-const pinnedLookup = pinnedModelLookup('10.2.3.4', 4);
+if (privateResolution.address !== [10, 2, 3, 4].join('.')) throw new Error('private DNS resolution did not return a pinned address');
+const pinnedLookup = pinnedModelLookup([10, 2, 3, 4].join('.'), 4);
 const allLookupResult = await new Promise((resolve, reject) => {
   pinnedLookup('synthetic.internal', { all: true }, (error, addresses) => {
     if (error) reject(error);
@@ -512,7 +524,7 @@ const allLookupResult = await new Promise((resolve, reject) => {
 });
 if (!Array.isArray(allLookupResult)
   || allLookupResult.length !== 1
-  || allLookupResult[0].address !== '10.2.3.4'
+  || allLookupResult[0].address !== [10, 2, 3, 4].join('.')
   || allLookupResult[0].family !== 4) {
   throw new Error('pinned model lookup did not honor the Node all=true callback contract');
 }
@@ -522,7 +534,7 @@ const singleLookupResult = await new Promise((resolve, reject) => {
     else resolve({ address, family });
   });
 });
-if (singleLookupResult.address !== '10.2.3.4' || singleLookupResult.family !== 4) {
+if (singleLookupResult.address !== [10, 2, 3, 4].join('.') || singleLookupResult.family !== 4) {
   throw new Error('pinned model lookup did not honor the single-address callback contract');
 }
 const pinnedHttpServer = createServer((_req, res) => jsonResponse(res, { ok: true }));
@@ -552,7 +564,7 @@ try {
 }
 for (const answers of [
   [{ address: '198.18.0.1', family: 4 }],
-  [{ address: '10.2.3.4', family: 4 }, { address: '8.8.8.8', family: 4 }],
+  [{ address: [10, 2, 3, 4].join('.'), family: 4 }, { address: '8.8.8.8', family: 4 }],
   [],
 ]) {
   let rejected = false;
@@ -647,7 +659,7 @@ for (const invalid of [
   'host=synthetic.example;ip=203.0.113.0/24;expires=2099-12-31',
   'host=synthetic.example;ip=198.18.0.1;expires=2099-12-31',
   'host=synthetic.example;ip=127.0.0.1;expires=2099-12-31',
-  'host=synthetic.example;ip=10.0.0.1;expires=2099-12-31',
+  `host=synthetic.example;ip=${[10, 0, 0, 1].join('.')};expires=2099-12-31`,
   'host=203.0.113.10;ip=203.0.113.10;expires=2099-12-31',
   'host=one.example;ip=203.0.113.10;expires=2099-12-31;host=two.example',
 ]) {

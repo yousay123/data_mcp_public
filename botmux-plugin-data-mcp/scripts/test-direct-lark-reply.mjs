@@ -48,8 +48,11 @@ if (observes.length !== 3 || observes.some(row => !row.args.includes('session_sy
 const workbook = join(outbound, 'synthetic.xlsx');
 writeFileSync(workbook, 'SYNTHETIC_WORKBOOK_BYTES', { mode: 0o600 });
 const receipt = await deliverDirectLarkReply(caller('om_file'), {
-  markdown: 'SYNTHETIC_SUMMARY', files: [{ path: workbook }],
+  deliveryId: 'data-result-synthetic', markdown: 'SYNTHETIC_SUMMARY', files: [{ path: workbook }],
 }, pluginHome);
+if (receipt.deliveryId !== 'data-result-synthetic' || receipt.messageId !== 'om_fixture_reply'
+  || receipt.attachmentMessageIds?.[0] !== 'om_file_0') throw new Error('safe correlated receipt missing');
+if (/SYNTHETIC_SUMMARY|plugin-home|outbound/.test(JSON.stringify(receipt))) throw new Error('receipt leaked body or local paths');
 if (!receipt.delivered || receipt.attachmentCount !== 1) throw new Error('attachment receipt mismatch');
 records = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
 const fileSend = records.find(row => row.args[0] === 'send' && row.args.includes('--files'));
