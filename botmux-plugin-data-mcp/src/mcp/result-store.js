@@ -1,10 +1,12 @@
 import {
   chmodSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   statSync,
@@ -17,6 +19,11 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 
 const SCHEMA_VERSION = 1;
+function matchesRevision(record, expected) {
+  return expected && typeof expected === 'object'
+    ? record.version === expected.version && record.generationId === expected.generationId
+    : record.version === expected;
+}
 const DEFAULT_IDLE_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_RESULT_BYTES = 5 * 1024 * 1024;
@@ -37,17 +44,6 @@ function privateDirectory(path) {
 
 function safeUnlink(path) {
   try { unlinkSync(path); } catch { /* already removed */ }
-}
-
-export function clearAllStoredResults(pluginHome) {
-  if (typeof pluginHome !== 'string' || !pluginHome.trim()) return;
-  const records = resolve(pluginHome, 'active-results-v1', 'records');
-  if (!existsSync(records)) return;
-  const stat = lstatSync(records);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('result_store_unsafe_directory');
-  for (const name of readdirSync(records)) {
-    if (/^[a-f0-9]{64}\.json$/.test(name)) safeUnlink(join(records, name));
-  }
 }
 
 export class ResultStore {
@@ -132,6 +128,7 @@ export class ResultStore {
       schemaVersion: SCHEMA_VERSION,
       bindingKey,
       ownerKey,
+      generationId: randomUUID(),
       version: (previous?.version ?? 0) + 1,
       createdAt,
       updatedAt: now,
@@ -149,7 +146,7 @@ export class ResultStore {
 
   replaceIfVersion(identity, expectedVersion, payload, now = Date.now()) {
     const current = this.read(identity, now);
-    if (current.status !== 'active' || current.record.version !== expectedVersion) {
+    if (current.status !== 'active' || !matchesRevision(current.record, expectedVersion)) {
       throw new Error('result_store_version_changed');
     }
     const record = {
@@ -175,14 +172,14 @@ export class ResultStore {
 
   clearIfVersion(identity, expectedVersion, now = Date.now()) {
     const current = this.read(identity, now);
-    if (current.status !== 'active' || current.record.version !== expectedVersion) return false;
+    if (current.status !== 'active' || !matchesRevision(current.record, expectedVersion)) return false;
     safeUnlink(this.recordPath(current.record.bindingKey));
     return true;
   }
 
   assertVersion(identity, expectedVersion, now = Date.now()) {
     const current = this.read(identity, now);
-    if (current.status !== 'active' || current.record.version !== expectedVersion) {
+    if (current.status !== 'active' || !matchesRevision(current.record, expectedVersion)) {
       throw new Error('result_store_version_changed');
     }
     return current.record;
@@ -222,6 +219,25 @@ export class ResultStore {
   audit(identity, turnId, question, version, status, now = Date.now(), detail = {}) {
     const { bindingKey } = this.binding(identity);
     const safeDetail = {};
+    if (detail.deliveryReceipt && typeof detail.deliveryReceipt === 'object') {
+      const receipt = detail.deliveryReceipt;
+      if (!/^data-(?:result(?:-error)?|followup)-[a-f0-9-]{36}$/.test(receipt.deliveryId ?? '')
+        || !['pending', 'delivered', 'failed', 'unknown'].includes(receipt.status)) {
+        throw new Error('result_store_invalid_delivery_receipt');
+      }
+      const ids = [receipt.messageId, ...(receipt.attachmentMessageIds || [])].filter(value => value !== undefined);
+      if (ids.length > 7 || ids.some(value => typeof value !== 'string' || !/^om_[A-Za-z0-9_-]{1,200}$/.test(value))) {
+        throw new Error('result_store_invalid_delivery_receipt');
+      }
+      safeDetail.receipt_binding = bindingKey;
+      safeDetail.receipt_generation = /^[a-f0-9-]{36}$/.test(detail.generationId ?? '') ? detail.generationId : null;
+      safeDetail.delivery_receipt = {
+        deliveryId: receipt.deliveryId, status: receipt.status,
+        ...(receipt.messageId ? { messageId: receipt.messageId } : {}),
+        attachmentMessageIds: [...(receipt.attachmentMessageIds || [])],
+        attachmentCount: receipt.attachmentMessageIds?.length || 0,
+      };
+    }
     if (detail?.stage === 'result_agent') safeDetail.stage = detail.stage;
     if (typeof detail?.action === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(detail.action)) {
       safeDetail.action = detail.action;
@@ -277,11 +293,21 @@ export class ResultStore {
       ['modelAttemptCount', 'model_attempt_count'],
       ['modelRetriesUsed', 'model_retries_used'],
       ['modelRepairCount', 'model_repair_count'],
+      ['modelBudgetExpansions', 'model_budget_expansions'],
+      ['modelPlanningRounds', 'model_planning_rounds'],
+      ['modelMaxTokens', 'model_max_tokens'], ['modelTokenCap', 'model_token_cap'],
+      ['promptTokens', 'prompt_tokens'], ['completionTokens', 'completion_tokens'],
+      ['reasoningTokens', 'reasoning_tokens'],
     ]) {
       if (Number.isSafeInteger(detail?.[source]) && detail[source] >= 0) {
         safeDetail[target] = detail[source];
       }
     }
+    if (typeof detail?.modelEnableThinking === 'boolean') safeDetail.model_enable_thinking = detail.modelEnableThinking;
+    if (Number.isFinite(detail?.modelTemperature) && detail.modelTemperature >= 0 && detail.modelTemperature <= 2) {
+      safeDetail.model_temperature = detail.modelTemperature;
+    }
+    if (typeof detail?.finishReason === 'string' && /^[a-z_]{1,32}$/.test(detail.finishReason)) safeDetail.finish_reason = detail.finishReason;
     const event = {
       at: new Date(now).toISOString(),
       binding: bindingKey.slice(0, 16),
@@ -293,6 +319,50 @@ export class ResultStore {
     };
     appendFileSync(this.auditPath, `${JSON.stringify(event)}\n`, { encoding: 'utf8', mode: 0o600 });
     chmodSync(this.auditPath, 0o600);
+  }
+
+  deliveryStatus(identity, now = Date.now()) {
+    const active = this.read(identity, now);
+    if (active.status !== 'active') return { status: active.status };
+    if (!/^[a-f0-9-]{36}$/.test(active.record.generationId ?? '')) return { status: 'delivery_status_unknown' };
+    const { bindingKey } = this.binding(identity);
+    let descriptor;
+    try {
+      descriptor = openSync(this.auditPath, 'r');
+      const size = fstatSync(descriptor).size;
+      const start = Math.max(0, size - 1024 * 1024);
+      const buffer = Buffer.alloc(size - start);
+      const bytes = readSync(descriptor, buffer, 0, buffer.length, start);
+      const lines = buffer.subarray(0, bytes).toString('utf8').split('\n');
+      if (start) lines.shift();
+      for (const line of lines.reverse()) {
+        if (!line.trim()) continue;
+        const record = JSON.parse(line);
+        if (record.receipt_binding !== bindingKey || record.version !== active.record.version
+          || record.receipt_generation !== active.record.generationId) continue;
+        const receipt = record.delivery_receipt;
+        if (!receipt) continue;
+        // Reconstruct the allowlist; never return arbitrary persisted fields.
+        if (!/^data-(?:result(?:-error)?|followup)-[a-f0-9-]{36}$/.test(receipt.deliveryId ?? '')
+          || typeof record.at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(record.at)
+          || !['pending', 'delivered', 'failed', 'unknown'].includes(receipt.status)
+          || !Array.isArray(receipt.attachmentMessageIds) || receipt.attachmentMessageIds.length > 6
+          || [receipt.messageId, ...receipt.attachmentMessageIds].filter(value => value !== undefined)
+            .some(value => typeof value !== 'string' || !/^om_[A-Za-z0-9_-]{1,200}$/.test(value))) {
+          return { status: 'delivery_status_unavailable' };
+        }
+        return {
+          status: receipt.status, deliveryId: receipt.deliveryId,
+          ...(receipt.messageId ? { messageId: receipt.messageId } : {}),
+          attachmentMessageIds: receipt.attachmentMessageIds,
+          attachmentCount: receipt.attachmentMessageIds.length,
+          observedAt: record.at,
+        };
+      }
+      return { status: 'delivery_status_unknown' };
+    } catch {
+      return { status: 'delivery_status_unavailable' };
+    } finally { if (descriptor !== undefined) closeSync(descriptor); }
   }
 
   auditModelEndpointException(hostname, now = Date.now()) {

@@ -230,6 +230,31 @@ if (!modelSawSentinel || !modelSawAuth || !modelSawLimitEvidence) {
   throw new Error('internal result model did not receive the protected result, credential, and limit evidence');
 }
 if (queryCount !== 2) throw new Error(`each delivery must query exactly once; got ${queryCount} queries for 2 deliveries`);
+const statusReads = await runPlugin([
+  { name: 'get_query_delivery_status_for_user', arguments: {}, _meta: { botmuxTrustedCaller: caller } },
+  { name: 'get_query_delivery_status_for_user', arguments: {}, _meta: { botmuxTrustedCaller: { ...caller, requestUserUnionId: 'on_other' } } },
+  { name: 'get_query_delivery_status_for_user', arguments: {}, _meta: { botmuxTrustedCaller: { ...caller, senderType: 'bot' } } },
+]);
+const status = toolPayload(statusReads[0]);
+if (status.status !== 'delivered' || status.messageId !== toolPayload(byId.get(1)).messageId
+  || status.deliveryId !== toolPayload(byId.get(1)).deliveryId) throw new Error('receipt status did not survive process restart');
+if (toolPayload(statusReads[1]).status !== 'no_active_result'
+  || toolPayload(statusReads[2]).status !== 'delivery_status_unavailable') throw new Error('receipt status crossed trusted identity boundary');
+if ([sentinel, modelOutput, root, 'amount'].some(value => JSON.stringify(statusReads).includes(value))) {
+  throw new Error('receipt status leaked business result or local paths');
+}
+if (queryCount !== 2) throw new Error('delivery status must not execute SQL');
+const noBindingEnv = join(root, 'no-binding.env');
+writeFileSync(noBindingEnv, readFileSync(hostEnvFile, 'utf8').replace(/^DATA_MCP_RESULT_BINDING_HMAC_KEY=.*\n/gm, ''), { mode: 0o600 });
+const unbound = await runPlugin([{
+  name: 'deliver_query_result_for_user', arguments: { sql: 'SELECT amount FROM fixture', query_plan_id: 'must_not_run', question: 'must fail closed', requested_outputs: ['analysis'] },
+  _meta: { botmuxTrustedCaller: caller },
+}], { KSHER_AGENT_DATA_MCP_ENV_FILE: noBindingEnv });
+if (toolPayload(unbound[0]).status !== 'result_binding_unavailable' || queryCount !== 2) {
+  throw new Error('missing result binding must stop before executing SQL');
+}
+const preserved = await runPlugin([{ name: 'get_query_delivery_status_for_user', arguments: {}, _meta: { botmuxTrustedCaller: caller } }]);
+if (toolPayload(preserved[0]).deliveryId !== status.deliveryId) throw new Error('binding failure must not clear another active result');
 const initialBotmuxRecords = botmuxRecords();
 if (!initialBotmuxRecords.some(row => row.content?.includes('amount（合计）') && row.content.includes('30'))) {
   throw new Error('source-bound analysis was not sent to Feishu');
@@ -406,7 +431,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v6'
+  && row.prompt_template_version === 'result-agent-tool-contract-v7'
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -424,7 +449,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v6'
+  && row.prompt_template_version === 'result-agent-tool-contract-v7'
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503

@@ -26,6 +26,7 @@ const modelOutput = `${modelSentinel}:${rowSentinel}`;
 const bindingSecret = '0123456789abcdef0123456789abcdef';
 let planCounter = 0;
 let modelCalls = 0;
+let runQueryCalls = 0;
 const modelPayloads = [];
 let mutateActiveResultDuringModelCall;
 let resolveOldConcurrentStarted;
@@ -62,6 +63,7 @@ const service = createServer((req, res) => {
       return;
     }
     if (req.url === '/run') {
+      runQueryCalls += 1;
       if (body.query_plan_id === 'concurrent-old-failure') {
         resolveOldFailureStarted();
         setTimeout(() => jsonResponse(res, {
@@ -291,12 +293,16 @@ mutateActiveResultDuringModelCall = () => {
   if (current.status !== 'active') throw new Error('CAS fixture could not find active result');
   liveStore.put(liveIdentity, current.record.payload);
 };
+const sendsBeforeStale = readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+  .map(JSON.parse).filter(row => row.args[0] === 'send').length;
 const staleFollowup = await plugin.call('continue_query_result_for_user', {
   question: 'CAS_REPLACE_SYNTHETIC', output_mode: 'analysis',
 }, { ...callerA, turnId: 'om_cas_replace' });
 mutateActiveResultDuringModelCall = undefined;
-if (!JSON.stringify(staleFollowup).includes('delivery_failed')
-  || staleFollowup.result?._meta?.botmuxHostDelivery) {
+if (!JSON.stringify(staleFollowup).includes('result_superseded')
+  || staleFollowup.result?._meta?.botmuxHostDelivery
+  || readFileSync(botmuxLog, 'utf8').trim().split('\n').filter(Boolean)
+    .map(JSON.parse).filter(row => row.args[0] === 'send').length !== sendsBeforeStale) {
   throw new Error('result replacement during follow-up did not fail closed');
 }
 
@@ -420,12 +426,15 @@ writeFileSync(lowQuotaFile, [
   'DATA_MCP_RESULT_MAX_BYTES=256',
 ].join('\n') + '\n', { mode: 0o600 });
 const lowQuota = spawnPlugin('session-synthetic-a', lowQuotaFile);
+const modelCallsBeforeLowQuota = modelCalls;
+const queriesBeforeLowQuota = runQueryCalls;
 const lowQuotaInitial = await lowQuota.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-low-quota-plan', output_mode: 'analysis', question: 'low quota first turn',
 }, { ...callerA, turnId: 'om_low_quota_initial' });
-if (toolPayload(lowQuotaInitial).status !== 'delivered') {
-  throw new Error('result-store quota failure broke first-turn direct delivery');
+if (toolPayload(lowQuotaInitial).status !== 'result_binding_unavailable'
+  || modelCalls !== modelCallsBeforeLowQuota || runQueryCalls !== queriesBeforeLowQuota) {
+  throw new Error('result-store quota failure must stop before querying or invoking the result model');
 }
 const callsAfterLowQuotaInitial = modelCalls;
 const lowQuotaFollowup = await lowQuota.call('continue_query_result_for_user', {
@@ -451,12 +460,14 @@ writeFileSync(missingKeyFile, [
   'DATA_MCP_RESULT_MODEL=internal-test-model',
 ].join('\n') + '\n', { mode: 0o600 });
 const missingKey = spawnPlugin('session-missing-key', missingKeyFile);
+const callsBeforeMissingKey = { query: runQueryCalls, model: modelCalls };
 const missingKeyInitial = await missingKey.call('deliver_query_result_for_user', {
   sql: 'SELECT synthetic_value FROM synthetic.events', datasource: 'tchouse-c',
   query_plan_id: 'synthetic-missing-key-plan', output_mode: 'analysis', question: 'missing key first turn',
 }, { ...callerA, turnId: 'om_missing_key_initial' });
-if (toolPayload(missingKeyInitial).status !== 'delivered') {
-  throw new Error('missing result-store HMAC key broke first-turn direct delivery');
+if (toolPayload(missingKeyInitial).status !== 'result_binding_unavailable'
+  || runQueryCalls !== callsBeforeMissingKey.query || modelCalls !== callsBeforeMissingKey.model) {
+  throw new Error('missing result-store HMAC key must prevent unbound query/model calls');
 }
 const missingKeyResponse = await missingKey.call('continue_query_result_for_user', { question: 'missing key' }, {
   ...callerA, turnId: 'om_missing_key',

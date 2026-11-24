@@ -162,7 +162,7 @@ const chart = deliveredText.match(/```vega-lite\n([^]*?)\n```/u)?.[1] || '';
 const workbook = zipEntries(captured.xlsx).get('xl/worksheets/sheet1.xml')?.toString('utf8') || '';
 for (const claim of exactClaims) {
   if (!document.includes(claim)) throw new Error(`document lost exact claim: ${claim}`);
-  const utf16 = Buffer.from(`\ufeff${claim}`, 'utf16le').swap16().toString('hex').toUpperCase();
+  const utf16 = Buffer.from(`\ufeff${claim.replace(/\*\*/gu, '')}`, 'utf16le').swap16().toString('hex').toUpperCase();
   if (!pdfText.includes(utf16)) throw new Error(`PDF lost exact claim: ${claim}`);
 }
 for (const sourceValue of ['9007199254740993.00', '18446744073709551615', '-3.50']) {

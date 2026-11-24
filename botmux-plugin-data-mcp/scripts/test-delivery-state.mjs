@@ -135,6 +135,15 @@ function start() {
       } })}\n`);
       return response;
     },
+    async status(override = {}) {
+      const requestId = ++id; const response = wait(pending, requestId);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method: 'tools/call', params: {
+        name: 'get_query_delivery_status_for_user', arguments: {},
+        _meta: { botmuxTrustedCaller: { ...caller, turnId: 'om_status', ...override } },
+      } })}\n`);
+      const result = await response;
+      return JSON.parse(result.result.content[0].text);
+    },
     async advance(ms) {
       const requestId = ++id; const response = wait(advances, requestId);
       child.send({ kind: 'advance', id: requestId, ms }); return response;
@@ -164,12 +173,19 @@ try {
   server = start(); await server.list();
   const failedSend = server.excel('om_retained');
   const retained = await sendingFile();
+  assert.equal((await server.status()).status, 'pending');
+  assert.equal((await server.status({ requestUserUnionId: 'on_other' })).status, 'no_active_result');
+  assert.equal((await server.status({ senderType: 'bot' })).status, 'delivery_status_unavailable');
   writeFileSync(release, 'release');
   assert.match(JSON.stringify(await failedSend), /direct_reply_partial_delivery/);
+  const terminalReceipt = await server.status();
+  assert.equal(terminalReceipt.status, 'unknown', 'a terminated partial send must not stay pending');
+  assert.equal(terminalReceipt.messageId, 'om_state_card');
   assert(existsSync(retained), 'failed upload must preserve its private artifact');
   await server.close(); server = null;
   assert(existsSync(retained), 'normal shutdown must retain a failed artifact');
   server = start(); await server.list();
+  assert.deepEqual(await server.status(), terminalReceipt, 'safe receipt must survive process restart');
   assert(existsSync(retained), 'restart must retain an unexpired failed artifact');
   await server.advance(20 * 60_000);
   assert(!existsSync(retained), 'periodic sweep must remove expired retained artifacts');
@@ -192,6 +208,25 @@ try {
   const unitIdentity = { ...identity, sessionId: 'session_unit' };
   const first = store.put(unitIdentity, { marker: 'old' });
   const second = store.put(unitIdentity, { marker: 'replacement' });
+  const receipt = { deliveryId: 'data-result-00000000-0000-4000-8000-000000000001', status: 'delivered', messageId: 'om_old' };
+  store.audit(unitIdentity, 'om_receipt', '', first.version, 'delivery_receipt', Date.now(), { generationId: first.generationId, deliveryReceipt: receipt });
+  assert.equal(store.deliveryStatus(unitIdentity).status, 'delivery_status_unknown', 'old version receipts cannot attach to replacement results');
+  const abaIdentity = { ...identity, sessionId: 'session_aba' };
+  const clock = Date.now();
+  const beforeClear = store.put(abaIdentity, { marker: 'old' }, clock);
+  const oldRevision = { version: beforeClear.version, generationId: beforeClear.generationId };
+  store.audit(abaIdentity, 'om_before_clear', '', beforeClear.version, 'delivery_receipt', clock, { generationId: beforeClear.generationId, deliveryReceipt: receipt });
+  assert.equal(store.deliveryStatus(abaIdentity, clock).status, 'delivered');
+  store.clear(abaIdentity);
+  const afterClear = store.put(abaIdentity, { marker: 'new' }, clock);
+  assert.equal(afterClear.version, beforeClear.version, 'exercise numeric version reuse at the same timestamp');
+  assert.notEqual(afterClear.generationId, beforeClear.generationId);
+  assert.equal(store.deliveryStatus(abaIdentity, clock).status, 'delivery_status_unknown');
+  assert.throws(() => store.assertVersion(abaIdentity, oldRevision, clock), /version_changed/);
+  assert.throws(() => store.replaceIfVersion(abaIdentity, oldRevision, { marker: 'stale' }, clock), /version_changed/);
+  assert.throws(() => store.touch(abaIdentity, oldRevision, clock), /version_changed/);
+  assert.equal(store.clearIfVersion(abaIdentity, oldRevision, clock), false);
+  assert.equal(store.read(abaIdentity, clock).record.payload.marker, 'new');
   assert.throws(() => store.assertVersion(unitIdentity, first.version), /version_changed/);
   assert.equal(store.clearIfVersion(unitIdentity, first.version), false);
   assert.equal(store.read(unitIdentity).record.version, second.version);

@@ -293,6 +293,57 @@ accepts SQL, table names, identity, or task fields from model arguments.
 
 ## Current Status
 
+### Result-agent configuration and receipts (0.4.21)
+
+Only the isolated result Agent reads these host-only settings from
+`~/.config/ksher-agent-data-mcp/env`. Keep the existing endpoint, hostname
+allowlist, exact model name and raw API token settings. Never copy a real key
+to a model-visible environment or deployment guide.
+
+```sh
+DATA_MCP_RESULT_MODEL_MAX_TOKENS=8192
+DATA_MCP_RESULT_MODEL_MAX_TOKENS_CAP=16384
+DATA_MCP_RESULT_MODEL_ENABLE_THINKING=false
+DATA_MCP_RESULT_MODEL_TEMPERATURE=0
+```
+
+The first two values bound each model response, not the total tokens across a
+multi-tool planning conversation. A truncated response may expand once to the
+cap before any artifact executes. Retry/repair/planning remain bounded and
+cancellation discards unfinished plans. Safe audit records include actual
+request limits, thinking/temperature, finish reason and reported token usage.
+Synthetic five-output long-report acceptance truncated with a 2048 cap, but
+completed at 8192 with 2809 completion tokens across two responses. This is a
+capacity example, not a guarantee for arbitrary reports.
+
+Chart tools support bar, line, area, scatter, pie and donut. PDF and Markdown
+tools accept model-authored titles and narrative, while source tables remain
+tool-owned. `table_formats` chooses exact decimal display and grouping without
+changing stored source values; `claims.row_indices` allows aggregates over
+selected rows so totals need not be counted again. Automatic statistics cover
+all returned rows and are not automatically valid business aggregates.
+
+Direct-delivery receipts include `deliveryId`, the primary `messageId`, and
+`attachmentMessageIds`, plus status/counts and the trusted turn/session. A
+successful receipt completes delivery; the orchestration model must not
+resend a summary or inspect the result with history/quoted/raw APIs. There is
+also a metadata-only `get_query_delivery_status_for_user` lookup. It reads the
+current caller/app/session/version-bound observation from the audit window;
+missing, corrupt or out-of-window evidence returns unknown/unavailable, never
+an invented success. A terminated uncertain send becomes `unknown` rather
+than staying indefinitely `pending`. This lookup does not itself enforce IM
+read isolation. Receipts and result mutations are guarded by both numeric
+version and a random generation ID, so clearing/expiring and rebuilding a
+result cannot resurrect an old receipt or authorize a late old operation.
+
+**Isolation limitation:** current metadata-only tool replies protect that
+reply channel only. They do not enforce a global prohibition on IM history,
+quoted/forwarded messages, filesystem or alternative authenticated API reads.
+Host-enforced read protection and restricted credential/tool access must be
+verified before describing the deployment as end-to-end isolated. See
+`../docs/dual-model-review-20261124.md`. Do not accept business-result readback
+through the orchestration model as evidence of isolation.
+
 ### Result delivery (0.4.20)
 
 - Analysis, the source-bound detail table, and the native Vega-Lite chart share

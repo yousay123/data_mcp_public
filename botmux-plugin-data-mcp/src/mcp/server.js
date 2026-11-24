@@ -6,7 +6,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { clearAllStoredResults, ResultStore } from './result-store.js';
+import { ResultStore } from './result-store.js';
 import { runIsolatedResultAgent } from './result-agent-client.js';
 import { resolveSignedAppTestProfile, TEST_PROFILE_ALLOWED_KEYS } from './signed-app-profile.js';
 import { deliverDirectLarkReply, DirectReplyError } from './direct-lark-reply.js';
@@ -739,6 +739,11 @@ function resultAgentAuditDetail(trace, result) {
     modelRepairCount: Number.isSafeInteger(detail.modelRepairCount)
       ? detail.modelRepairCount
       : Number.isSafeInteger(detail.modelAttemptCount) ? 0 : undefined,
+    modelBudgetExpansions: detail.modelBudgetExpansions, modelPlanningRounds: detail.modelPlanningRounds,
+    modelMaxTokens: detail.modelMaxTokens, modelTokenCap: detail.modelTokenCap,
+    modelEnableThinking: detail.modelEnableThinking, modelTemperature: detail.modelTemperature,
+    promptTokens: detail.promptTokens, completionTokens: detail.completionTokens,
+    reasoningTokens: detail.reasoningTokens, finishReason: detail.finishReason,
     analysisRedactionUsed: detail.analysisRedactionUsed,
   };
 }
@@ -746,6 +751,7 @@ function resultAgentAuditDetail(trace, result) {
 function resultAgentAuditStatus(error) {
   const code = error instanceof Error ? error.message : '';
   const safeCodes = new Set([
+    'result_agent_output_truncated', 'result_agent_invalid_model_config', 'result_agent_invalid_retry_config',
     'result_agent_not_configured',
     'result_agent_endpoint_not_allowed',
     'result_agent_payload_too_large',
@@ -776,10 +782,10 @@ function resultAgentAuditStatus(error) {
 }
 
 function resultAgentAuditAction(errorCode) {
-  if (errorCode === 'result_agent_not_configured') return 'model_config';
+  if (['result_agent_not_configured', 'result_agent_invalid_model_config', 'result_agent_invalid_retry_config'].includes(errorCode)) return 'model_config';
   if (errorCode === 'result_agent_endpoint_not_allowed'
     || errorCode === 'result_model_network_not_private') return 'endpoint_validation';
-  if (errorCode === 'result_agent_timeout' || errorCode.startsWith('result_agent_http_')) return 'model_request';
+  if (errorCode === 'result_agent_timeout' || errorCode === 'result_agent_output_truncated' || errorCode.startsWith('result_agent_http_')) return 'model_request';
   if (errorCode.includes('context') || errorCode.includes('schema') || errorCode.includes('rows')) {
     return 'result_validation';
   }
@@ -994,19 +1000,30 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
   let identity;
   let store;
   let reservedVersion;
+  let reservedGeneration;
+  let previousRevision;
+  const reservedRevision = () => ({ version: reservedVersion, generationId: reservedGeneration });
   if (caller.senderType === 'user') {
     try {
       identity = activeResultIdentity(caller);
       store = resultStoreFor(caller);
+      const previous = store.read(identity);
+      if (previous.status === 'active') previousRevision = {
+        version: previous.record.version, generationId: previous.record.generationId,
+      };
       // Reserve a monotonically increasing generation before any asynchronous
       // work. A slower earlier query may finish later, but it cannot overwrite
       // or deliver after a newer first-turn query has superseded it.
-      reservedVersion = store.put(identity, { state: 'pending' }).version;
+      const reservation = store.put(identity, { state: 'pending' });
+      reservedVersion = reservation.version;
+      reservedGeneration = reservation.generationId;
     } catch {
-      try { clearAllStoredResults(nonBlankProcessEnv('BOTMUX_PLUGIN_HOME')); }
-      catch { /* fail safe: follow-up store creation still remains unavailable */ }
-      identity = undefined;
-      store = undefined;
+      // A missing binding is not permission to execute an unbound query or
+      // clear other callers' active results.
+      if (store && identity && previousRevision) {
+        try { store.clearIfVersion(identity, previousRevision); } catch { /* no unbound query follows */ }
+      }
+      return { error: fixedFollowupResult('result_binding_unavailable') };
     }
   }
   let result;
@@ -1014,7 +1031,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     result = await callDataMcpService('run', caller, args, runtimeConfig);
   } catch (error) {
     if (store && Number.isSafeInteger(reservedVersion)) {
-      store.clearIfVersion(identity, reservedVersion);
+      store.clearIfVersion(identity, reservedRevision());
     }
     throw error;
   }
@@ -1022,7 +1039,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     const failure = deterministicDlcFailure(result, args);
     if (!failure) {
       if (store && Number.isSafeInteger(reservedVersion)) {
-        store.clearIfVersion(identity, reservedVersion);
+        store.clearIfVersion(identity, reservedRevision());
       }
       return { error: isolatedDeliveryFailure() };
     }
@@ -1039,6 +1056,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
               store,
               identity,
               version: reservedVersion,
+              generationId: reservedGeneration,
               clearAfterDelivery: true,
             },
           }
@@ -1082,7 +1100,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
     try {
       committedVersion = store.replaceIfVersion(
         identity,
-        reservedVersion,
+        reservedRevision(),
         storedPayload(args, result),
       ).version;
       if (authoredAudit) {
@@ -1112,7 +1130,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
         } catch { /* best-effort non-sensitive audit */ }
         return { error: fixedFollowupResult('result_superseded') };
       }
-      store.clearIfVersion(identity, reservedVersion);
+      store.clearIfVersion(identity, reservedRevision());
       try { store.audit(identity, caller.turnId || 'initial', args.question || '', null, 'storage_failed'); }
       catch { /* best-effort non-sensitive audit */ }
     }
@@ -1125,7 +1143,7 @@ async function deliverQueryResult(caller, args, runtimeConfig) {
       ...(authored.files.length ? { files: authored.files } : {}),
       responseKind: 'final',
     },
-    ...(committedVersion ? { resultGuard: { store, identity, version: committedVersion } } : {}),
+    ...(committedVersion ? { resultGuard: { store, identity, version: committedVersion, generationId: reservedGeneration } } : {}),
   };
 }
 
@@ -1156,6 +1174,7 @@ async function continueQueryResult(caller, args, runtimeConfig) {
     return { error: fixedFollowupResult('rate_limited') };
   }
   const expectedVersion = active.record.version;
+  const expectedRevision = { version: expectedVersion, generationId: active.record.generationId };
   const payload = active.record.payload;
   try {
     if (!payload.result) throw new Error('followup_result_unavailable');
@@ -1173,8 +1192,8 @@ async function continueQueryResult(caller, args, runtimeConfig) {
       resultAgentAuditDetail(authored.audit, payload.result),
     );
     delete authored.audit;
-    store.assertVersion(identity, expectedVersion);
-    store.touch(identity, expectedVersion);
+    store.assertVersion(identity, expectedRevision);
+    store.touch(identity, expectedRevision);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_requested');
     return {
       delivery: {
@@ -1184,9 +1203,13 @@ async function continueQueryResult(caller, args, runtimeConfig) {
         ...(authored.files.length ? { files: authored.files } : {}),
         responseKind: 'final',
       },
-      resultGuard: { store, identity, version: expectedVersion },
+      resultGuard: { store, identity, ...expectedRevision },
     };
   } catch (error) {
+    if (error?.message === 'result_store_version_changed') {
+      store.audit(identity, caller.turnId, question, expectedVersion, 'result_superseded');
+      return { error: fixedFollowupResult('result_superseded') };
+    }
     const errorCode = resultAgentAuditStatus(error);
     store.audit(identity, caller.turnId, question, expectedVersion, 'delivery_failed', Date.now(), {
       ...resultAgentAuditDetail(error?.resultAgentAudit, payload.result),
@@ -1232,8 +1255,13 @@ async function sendPreparedDirectReply(caller, prepared) {
   const previous = queueKey ? directDeliveryQueues.get(queueKey) || Promise.resolve() : Promise.resolve();
   const operation = previous.catch(() => {}).then(async () => {
     let delivered = false;
+    const observeReceipt = receipt => {
+      if (guard) guard.store.audit(guard.identity, caller.turnId, '', guard.version,
+        'delivery_receipt', Date.now(), { generationId: guard.generationId, deliveryReceipt: { deliveryId: prepared.delivery.deliveryId, ...receipt } });
+    };
     try {
-      if (guard) guard.store.assertVersion(guard.identity, guard.version);
+      if (guard) guard.store.assertVersion(guard.identity, guard);
+      observeReceipt({ status: 'pending' });
       const responseKind = guard && !guard.store.reserveTurn(guard.identity, caller.turnId, Date.now(), ['delivery_primary'])
         ? 'auxiliary' : 'final';
       const receipt = await deliverDirectLarkReply(
@@ -1242,15 +1270,27 @@ async function sendPreparedDirectReply(caller, prepared) {
         nonBlankProcessEnv('BOTMUX_PLUGIN_HOME'),
       );
       delivered = receipt.delivered === true;
-      return { status: 'delivered', ...receipt };
+      // A provider success remains success if recording metadata fails. Never
+      // turn it into a retryable transport failure and duplicate the result.
+      try { observeReceipt({ ...receipt, status: delivered ? 'delivered' : 'unknown' }); } catch { /* receipt query remains pending */ }
+      return {
+        status: 'delivered', ...receipt,
+        sessionId: process.env.BOTMUX_SESSION_ID,
+        turnId: caller.turnId,
+        next_action: 'complete_without_resending; do_not_read_result_via_history_or_quoted',
+      };
     } catch (error) {
       if (error?.message === 'result_store_version_changed') {
         return fixedFollowupResult('result_superseded');
       }
+      // The operation has terminated, but a provider may have accepted part
+      // of it. Unknown is deliberately not an invitation to retry.
+      try { observeReceipt({ ...(error instanceof DirectReplyError ? error.receipt : {}), status: 'unknown' }); }
+      catch { /* preserve the last conservative observation if audit fails */ }
       return directReplyFailure(error);
     } finally {
       if (delivered && guard?.clearAfterDelivery) {
-        guard.store.clearIfVersion(guard.identity, guard.version);
+        guard.store.clearIfVersion(guard.identity, guard);
       }
       for (const path of paths) {
         if (delivered) discardStagedOutboundArtifact(path);
@@ -1645,6 +1685,19 @@ async function handleToolCall(request) {
   }
 
   const name = request.params?.name;
+  if (name === 'get_query_delivery_status_for_user') {
+    if (dataMcpModelMode() !== 'dual' || Object.keys(argsFrom(request)).length) {
+      ok(request.id, jsonTool(fixedFollowupResult('invalid_delivery_status_request')));
+      return;
+    }
+    try {
+      const identity = activeResultIdentity(caller);
+      ok(request.id, jsonTool(resultStoreFor(caller).deliveryStatus(identity)));
+    } catch {
+      ok(request.id, jsonTool(fixedFollowupResult('delivery_status_unavailable')));
+    }
+    return;
+  }
   if (name === 'data_mcp_identity_probe') {
     ok(request.id, jsonTool({
       ok: true,
@@ -1674,7 +1727,9 @@ async function handleToolCall(request) {
         'look up metadata dictionary for candidate tables and metric definitions on Data MCP service side',
         'ask user to confirm ambiguous scope/date/region',
         'generate read-only SQL only after scope is clear',
-        'call validate_sql_for_user, then run_query_for_user when validation succeeds',
+        dataMcpModelMode() === 'dual'
+          ? 'call validate_sql_for_user, then deliver_query_result_for_user when validation succeeds; use continue_query_result_for_user for the bound result; do not resend delivered contents'
+          : 'call validate_sql_for_user, then run_query_for_user when validation succeeds',
       ],
       request: argsFrom(request),
     }));
@@ -1854,6 +1909,11 @@ function toolSchemas() {
       },
     },
     {
+      name: 'get_query_delivery_status_for_user',
+      description: 'Read only the current trusted caller/app/session bound delivery status and provider message IDs. No SQL/model call, result text, rows, filenames or local paths. Pending/unknown is not permission to resend.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    },
+    {
       name: 'continue_query_result_for_user',
       description: 'Continue from the caller-bound stored result through the internal result Agent without re-querying or exposing result data to the calling model.',
       inputSchema: {
@@ -1955,6 +2015,7 @@ function toolSchemas() {
     return tools.filter(tool => ![
       'deliver_query_result_for_user',
       'continue_query_result_for_user',
+      'get_query_delivery_status_for_user',
     ].includes(tool.name));
   }
   return tools;
