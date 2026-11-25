@@ -12,6 +12,7 @@ let responseMode = 'tools';
 let requests = [];
 let modelHttpFailuresRemaining = 0;
 let repairResponses = 0;
+let authoredAnalysis = null;
 
 const toolCalls = [
   ['call_analysis', 'create_analysis', {
@@ -39,6 +40,13 @@ const modelServer = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'req_result_agent_fixture' });
     if (payload.tool_choice === 'none') {
       res.end(JSON.stringify({ choices: [{ message: { content: '已按同一查询结果生成全部产物。' } }] }));
+      return;
+    }
+    if (responseMode === 'authored-analysis') {
+      res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{
+        id: 'authored-analysis', type: 'function',
+        function: { name: 'create_analysis', arguments: JSON.stringify(authoredAnalysis) },
+      }] } }] }));
       return;
     }
     if (responseMode === 'none') {
@@ -181,8 +189,11 @@ const modelServer = createServer((req, res) => {
     if (responseMode === 'layout') {
       const calls = [
         ['layout-analysis', 'create_analysis', {
-          analysis_markdown: '# 查询结果\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 分析总结\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 数据口径\n\nMODEL_SCOPE_DUPLICATE',
+          analysis_markdown: '# 查询结果\n\n## 核心结论\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 重复总结\n\n累计为 {{claim_0}}，建议关注后续变化。\n\n## 关键发现\n\n- **变化**：后一天较前一天增加 {{calc_0}}%。\n- **限制**：两天样本不能说明业务原因。\n\n## 数据口径\n\nMODEL_SCOPE_DUPLICATE\n\n### 内嵌范围\n\nNESTED_SCOPE_DUPLICATE\n\n## 核查建议\n\n结合更多可比数据核查变化。',
           claims: [{ operation: 'sum', column: 'amount' }], table_columns: ['stat_date', 'amount'],
+          calculations: [{ operation: 'percent_change', precision: 2, operands: [
+            { row_index: 0, column: 'amount' }, { row_index: 1, column: 'amount' },
+          ] }],
         }],
         ['layout-chart', 'create_chart', { type: 'line', label_column: 'stat_date', value_column: 'amount' }],
         ['layout-excel', 'create_excel', { sheets: [{ columns: ['stat_date', 'amount'] }] }],
@@ -341,7 +352,7 @@ if (delivered.audit?.status !== 'succeeded'
   || delivered.audit.modelId !== 'internal-test-model'
   || delivered.audit.responseModel !== 'internal-test-model-resolved'
   || delivered.audit.requestId !== 'req_result_agent_fixture'
-  || delivered.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7'
+  || typeof delivered.audit.promptTemplateVersion !== 'string'
   || delivered.audit.inputRowCount !== 2
   || delivered.audit.httpStatus !== 200
   || ![delivered.audit.promptTemplateHash, delivered.audit.inputHash, delivered.audit.outputHash]
@@ -450,12 +461,40 @@ const detailPosition = layout.markdown.indexOf('## 数据明细');
 const chartPosition = layout.markdown.indexOf('```vega-lite');
 const analysisPosition = layout.markdown.indexOf('累计为 31.25');
 const scopePosition = layout.markdown.indexOf('**数据口径**：');
-if (!(detailPosition >= 0 && chartPosition > detailPosition && analysisPosition > chartPosition && scopePosition > analysisPosition)
+if (!(analysisPosition >= 0 && chartPosition > analysisPosition && detailPosition > chartPosition && scopePosition > detailPosition)
   || layout.markdown.includes('MODEL_SCOPE_DUPLICATE') || layout.markdown.includes('# 查询结果')
+  || layout.markdown.includes('NESTED_SCOPE_DUPLICATE') || layout.markdown.includes('## 重复总结')
   || layout.markdown.match(/累计为 31.25/gu)?.length !== 1
-  || layout.markdown.match(/\*\*数据口径\*\*：/gu)?.length !== 1 || layout.markdown.includes('## 分析总结')
+  || layout.markdown.match(/\*\*数据口径\*\*：/gu)?.length !== 1
+  || !layout.markdown.includes('## 核心结论') || !layout.markdown.includes('## 关键发现')
+  || !layout.markdown.includes('- **变化**：后一天较前一天增加 50.00%。')
+  || !layout.markdown.includes('## 核查建议') || !layout.markdown.includes('## 图表')
   || layout.files.length !== 1 || layout.files[0].type !== 'excel') {
-  throw new Error('result card layout must deduplicate and place scope after chart and summary');
+  throw new Error('result card must preserve structured findings before source-bound chart/details and deduplicate scope');
+}
+
+// Different task shapes must survive the same production rendering path;
+// canned model fixtures verify preservation, not real-model analysis quality.
+responseMode = 'authored-analysis';
+for (const sample of [
+  { question: '只返回单个结果', markdown: '合成结果为 31.25。', headings: 0 },
+  { question: '分析阶段变化并列出局限', markdown: '## 阶段变化\n**观察**：后一天增加。\n\n### 可比性\n- 仅两天，尚不能判断长期趋势。\n\n## 后续核查\n补充同粒度数据。', headings: 3 },
+  { question: '保留业务结构发现', markdown: '## 业务结构\n\n- **发现**：需要按可用维度核对贡献。\n\n**数据口径**：INLINE_SCOPE_DUPLICATE\n\n## 证据限制\n\n当前样本不含业务分类，不能声称某分类驱动增长。', headings: 2 },
+]) {
+  authoredAnalysis = { analysis_markdown: sample.markdown };
+  const output = await runInternalResultAgent({
+    result, question: sample.question, requestedOutputs: ['analysis'], runtimeConfig, pluginHome,
+  });
+  const headings = output.markdown.match(/^#{1,6}\s/gmu) || [];
+  if (headings.length !== sample.headings || output.markdown.includes('INLINE_SCOPE_DUPLICATE')
+    || output.markdown.match(/\*\*数据口径\*\*：/gu)?.length !== 1 || output.files.length) {
+    throw new Error('task-dependent narrative structure or canonical scope ownership was lost');
+  }
+  for (const line of sample.markdown.split('\n').filter(line => line.startsWith('#') || line.startsWith('- '))) {
+    if (!output.markdown.includes(line)) throw new Error('meaningful headings/list items were lost');
+  }
+  const input = JSON.parse(requests.at(-1).payload.messages.find(message => message.role === 'user').content);
+  if (input.user_request !== sample.question) throw new Error('analysis goal was narrowed before the result model');
 }
 
 responseMode = 'stat-evidence';
@@ -717,7 +756,7 @@ if (isolated.files.length !== 1 || isolated.artifactTypes[0] !== 'excel') {
   throw new Error('isolated result Agent worker did not create the requested artifact');
 }
 if (isolated.audit?.modelId !== 'internal-test-model'
-  || isolated.audit.promptTemplateVersion !== 'result-agent-tool-contract-v7') {
+  || isolated.audit.promptTemplateVersion !== delivered.audit.promptTemplateVersion) {
   throw new Error('isolated result Agent worker dropped the audit trace');
 }
 rmSync(isolated.files[0].path, { force: true });

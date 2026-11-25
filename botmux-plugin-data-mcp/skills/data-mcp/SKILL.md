@@ -112,6 +112,21 @@ When the user names a table directly:
    must call `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or
    `create_document` itself. A requested output with no matching tool call
    fails closed.
+   Pass the user's analysis task and confirmed scope faithfully in `question`.
+   Preserve the user's purpose, requested depth, comparison periods and output
+   requirements. Do not replace an open analysis request with a self-selected
+   checklist of totals, averages or extremes, or add an "only report" restriction
+   that the user did not request. A request for a brief answer limits length,
+   not the analysis goal. For follow-ups, preserve the user's follow-up intent
+   and use the caller-bound result without querying again.
+   Preserve requested presentation as well: put the answer/conclusion first,
+   then evidence and findings with meaningful headings, short paragraphs,
+   bold key points and lists as appropriate. Choose comparisons from the
+   question and available dimensions, not a mandatory statistics checklist.
+   Do not impose "brief explanation only" when the user did not request it.
+   Simple single-value questions may stay short; multi-period/multi-dimension
+   questions may need several findings. Do not invent dimensions, causal
+   explanations, chart features or workbook sheets to imitate an example.
 3. If a result exceeds an artifact-tool limit, ask the user to narrow the query.
 4. Results are replied to the original trusted Feishu conversation. In a group
    or topic, all members of that conversation can see the result and it remains
@@ -119,11 +134,16 @@ When the user names a table directly:
    quoted-message tools, so direct delivery is limited to synthetic test data
    until host-side filtering or the protected result-page flow is restored.
 5. All artifacts from one request must bind values to the same protected rows
-   and schema. The Agent chooses columns, aggregations, chart type, and layout,
-   but tool arguments accept no free-text titles, paragraphs, labels,
-   annotations, sheet names, filenames, or rewritten raw values. Controlled
-   templates render all wording, and source-bound numeric claims use
-   arbitrary-precision decimal computation.
+   and schema. The result Agent writes the analysis narrative freely for the
+   user's question; it is not restricted to a fixed statistics template. It may
+   use the available exact aggregates and arithmetic, including changes and
+   ratios, when relevant to the requested analysis. Observed facts, estimates
+   and hypotheses must be distinguished; missing evidence for business causes
+   must be stated rather than invented. The Agent selects columns, chart type
+   and supported layout options, while tools bind table/chart/file data to the
+   protected rows and schema. Source-bound numeric claims use arbitrary-precision
+   decimal computation. Free narrative does not permit rewriting source values
+   or supplying unsupported artifact fields.
 6. When the user asks for one or more files, use `requested_outputs` in
    dual-model mode. In single-model mode, use the calling model's own artifact
    skill/tool after `run_query_for_user`.

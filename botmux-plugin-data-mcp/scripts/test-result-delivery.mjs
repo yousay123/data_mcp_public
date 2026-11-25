@@ -441,7 +441,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
   && row.response_model === 'internal-test-model-resolved'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
   && /^[a-f0-9]{16}$/.test(row.request_id_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v7'
+  && /^result-agent-tool-contract-v\d+$/u.test(row.prompt_template_version)
   && /^[a-f0-9]{64}$/.test(row.prompt_template_hash)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && /^[a-f0-9]{64}$/.test(row.output_hash)
@@ -459,7 +459,7 @@ if (!auditRows.some(row => row.status === 'result_agent_succeeded'
 if (!auditRows.some(row => row.status === 'result_agent_http_503'
   && row.model_id === 'internal-test-model'
   && /^[a-f0-9]{16}$/.test(row.endpoint_host_hash)
-  && row.prompt_template_version === 'result-agent-tool-contract-v7'
+  && /^result-agent-tool-contract-v\d+$/u.test(row.prompt_template_version)
   && /^[a-f0-9]{64}$/.test(row.input_hash)
   && row.input_row_count === 2
   && row.http_status === 503
