@@ -8,10 +8,14 @@ to multiple workers requires a shared store before enabling this contract.
 import secrets
 import threading
 import time
+from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 
-QUERY_PLAN_TTL_SECONDS = 300
+QUERY_PLAN_TTL_SECONDS = 10 * 60
+QUERY_PLAN_TTL_MAX_SECONDS = 15 * 60
 QUERY_PLAN_COMPARE_TTL_MAX_SECONDS = 15 * 60
+REPAIR_CHAIN_TTL_SECONDS = 5 * 60
 EXECUTION_MODE_SINGLE = "single"
 EXECUTION_MODE_COMPARE = "compare"
 EXECUTION_MODE_MAX_RUNS = {
@@ -32,6 +36,7 @@ class QueryPlan:
     ttl_seconds: int
     execution_mode: str
     max_runs: int
+    result_context: dict[str, object]
     repair_chain_id: str | None = None
     runs_used: int = 0
 
@@ -42,6 +47,7 @@ class QueryPlanRun:
     execution_mode: str
     run_index: int
     max_runs: int
+    result_context: dict[str, object]
 
 
 class QueryPlanStore:
@@ -49,15 +55,19 @@ class QueryPlanStore:
         self,
         ttl_seconds: int = QUERY_PLAN_TTL_SECONDS,
         compare_ttl_seconds: int = QUERY_PLAN_COMPARE_TTL_MAX_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("query plan TTL must be positive")
+        if ttl_seconds > QUERY_PLAN_TTL_MAX_SECONDS:
+            raise ValueError("query plan TTL exceeds the server-side maximum")
         if compare_ttl_seconds <= 0:
             raise ValueError("compare query plan TTL must be positive")
         if compare_ttl_seconds > QUERY_PLAN_COMPARE_TTL_MAX_SECONDS:
             raise ValueError("compare query plan TTL exceeds the server-side maximum")
         self.ttl_seconds = ttl_seconds
         self.compare_ttl_seconds = compare_ttl_seconds
+        self._clock = clock
         self._plans: dict[str, QueryPlan] = {}
         self._lock = threading.Lock()
 
@@ -73,6 +83,7 @@ class QueryPlanStore:
         lark_app_id: str | None = None,
         task_id: str | None = None,
         execution_mode: str = EXECUTION_MODE_SINGLE,
+        result_context: dict[str, object] | None = None,
     ) -> str:
         if not session_id.strip():
             raise ValueError("query plan session_id must not be empty")
@@ -86,7 +97,7 @@ class QueryPlanStore:
         )
         plan_id = f"qplan_{secrets.token_urlsafe(24)}"
         with self._lock:
-            self._purge_expired(time.time())
+            self._purge_expired(self._clock())
             self._plans[plan_id] = QueryPlan(
                 session_id=session_id,
                 union_id=union_id,
@@ -94,10 +105,11 @@ class QueryPlanStore:
                 datasource=datasource,
                 trust_domain=domain,
                 task_id=task_id,
-                issued_at=time.time(),
+                issued_at=self._clock(),
                 ttl_seconds=ttl_seconds,
                 execution_mode=execution_mode,
                 max_runs=EXECUTION_MODE_MAX_RUNS[execution_mode],
+                result_context=deepcopy(result_context or {}),
                 repair_chain_id=repair_chain_id,
             )
         return plan_id
@@ -140,7 +152,7 @@ class QueryPlanStore:
     ) -> tuple[bool, str, QueryPlanRun | None]:
         domain = _resolve_trust_domain(trust_domain, lark_app_id)
         with self._lock:
-            now = time.time()
+            now = self._clock()
             self._purge_expired(now)
             plan = self._plans.get(plan_id)
             if plan is None:
@@ -178,6 +190,7 @@ class QueryPlanStore:
                     execution_mode=plan.execution_mode,
                     run_index=plan.runs_used,
                     max_runs=plan.max_runs,
+                    result_context=deepcopy(plan.result_context),
                 ),
             )
 
@@ -235,9 +248,15 @@ class RepairChain:
 
 
 class RepairChainStore:
-    def __init__(self, max_failures: int, ttl_seconds: int = QUERY_PLAN_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        max_failures: int,
+        ttl_seconds: int = REPAIR_CHAIN_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.max_failures = max_failures
         self.ttl_seconds = ttl_seconds
+        self._clock = clock
         self._chains: dict[str, RepairChain] = {}
         self._active_by_scope: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
@@ -249,7 +268,7 @@ class RepairChainStore:
         scope_id: str | None = None,
     ) -> tuple[bool, str, str]:
         with self._lock:
-            self._purge_expired(time.time())
+            self._purge_expired(self._clock())
             effective_scope = scope_id or union_id
             scope_key = (union_id, effective_scope)
             if not chain_id:
@@ -263,7 +282,7 @@ class RepairChainStore:
                 self._chains[issued] = RepairChain(
                     union_id=union_id,
                     scope_id=effective_scope,
-                    issued_at=time.time(),
+                    issued_at=self._clock(),
                 )
                 self._active_by_scope[scope_key] = issued
                 return True, "ok", issued
