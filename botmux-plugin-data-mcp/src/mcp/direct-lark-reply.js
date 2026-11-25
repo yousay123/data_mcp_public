@@ -110,7 +110,7 @@ async function verifyBoundSession(appId) {
   return sessionId;
 }
 
-function assertOutboundFile(path, pluginHome) {
+export function assertOutboundFile(path, pluginHome) {
   if (typeof path !== 'string' || !path || typeof pluginHome !== 'string' || !pluginHome) {
     throw fixedError('direct_reply_attachment_failed');
   }
@@ -135,7 +135,7 @@ function assertOutboundFile(path, pluginHome) {
   }
 }
 
-function prepareCardText(text) {
+export function prepareCardText(text) {
   if (Buffer.byteLength(text) <= MAX_DIRECT_REPLY_TEXT_BYTES) {
     return { text, bytes: Buffer.byteLength(text), truncated: false };
   }
@@ -207,10 +207,16 @@ export async function deliverDirectLarkReply(caller, delivery, pluginHome) {
     if (attachmentCount !== files.length || textResult.failedAttachments?.length > 0) {
       throw fixedError('direct_reply_partial_delivery', {
         delivered: false, textBytes: prepared.bytes, attachmentCount, truncated: prepared.truncated,
+        messageId: textResult.messageId,
+        attachmentMessageIds: Array.isArray(textResult.attachmentMessageIds) ? textResult.attachmentMessageIds : [],
       });
     }
     return {
       delivered: true,
+      deliveryId: delivery?.deliveryId,
+      messageId: textResult.messageId,
+      attachmentMessageIds: Array.isArray(textResult.attachmentMessageIds)
+        ? textResult.attachmentMessageIds.filter(id => /^om_[A-Za-z0-9_-]+$/.test(id)) : [],
       textBytes: prepared.bytes,
       attachmentCount,
       truncated: prepared.truncated,

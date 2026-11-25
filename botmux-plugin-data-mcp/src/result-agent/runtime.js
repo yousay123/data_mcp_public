@@ -24,7 +24,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v6';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v7';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -57,10 +57,20 @@ function modelConfig(runtimeConfig) {
     }
     return parsed;
   };
+  const maxTokens = boundedInteger('DATA_MCP_RESULT_MODEL_MAX_TOKENS', 8192, 256, 32768);
+  const tokenCap = boundedInteger('DATA_MCP_RESULT_MODEL_MAX_TOKENS_CAP', Math.max(maxTokens, 16384), maxTokens, 32768);
+  const thinking = runtimeConfig.value('DATA_MCP_RESULT_MODEL_ENABLE_THINKING');
+  if (thinking !== undefined && !['true', 'false', '1', '0'].includes(String(thinking).toLowerCase())) {
+    throw new Error('result_agent_invalid_model_config');
+  }
+  const temperature = Number(runtimeConfig.value('DATA_MCP_RESULT_MODEL_TEMPERATURE') ?? 0);
+  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) throw new Error('result_agent_invalid_model_config');
   return {
     endpoint,
     model,
     apiKey: runtimeConfig.value('DATA_MCP_RESULT_MODEL_API_KEY'),
+    maxTokens, tokenCap, temperature,
+    enableThinking: ['true', '1'].includes(String(thinking).toLowerCase()),
     maxAttempts: boundedInteger('DATA_MCP_RESULT_MODEL_MAX_ATTEMPTS', DEFAULT_MODEL_MAX_ATTEMPTS, 1, 4),
     retryBaseDelayMs: boundedInteger(
       'DATA_MCP_RESULT_MODEL_RETRY_BASE_DELAY_MS',
@@ -143,6 +153,22 @@ async function postModelAttempt(config, body, runtimeConfig, onTestExceptionUsed
     throw error;
   }
   const message = parsed?.choices?.[0]?.message;
+  const finishReason = parsed?.choices?.[0]?.finish_reason;
+  const optionalInteger = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  const trace = {
+    requestId: responseTrace.requestId || parsed?.id,
+    responseModel: typeof parsed?.model === 'string' ? parsed.model : null,
+    latencyMs: responseTrace.latencyMs, httpStatus: responseTrace.httpStatus,
+    finishReason: typeof finishReason === 'string' ? finishReason : undefined,
+    promptTokens: optionalInteger(parsed?.usage?.prompt_tokens),
+    completionTokens: optionalInteger(parsed?.usage?.completion_tokens),
+    reasoningTokens: optionalInteger(parsed?.usage?.completion_tokens_details?.reasoning_tokens),
+  };
+  if (finishReason === 'length') {
+    const error = new Error('result_agent_output_truncated');
+    error.modelTrace = trace;
+    throw error;
+  }
   if (!message || typeof message !== 'object') {
     const error = new Error('result_agent_invalid_response');
     error.modelTrace = responseTrace;
@@ -151,45 +177,51 @@ async function postModelAttempt(config, body, runtimeConfig, onTestExceptionUsed
   return {
     message,
     trace: {
-      requestId: responseTrace.requestId || parsed?.id,
-      responseModel: typeof parsed?.model === 'string' ? parsed.model : null,
+      ...trace,
       outputHash: sha256(stableJson(message)),
-      latencyMs: responseTrace.latencyMs,
-      httpStatus: responseTrace.httpStatus,
     },
   };
 }
 
 async function postModel(config, payload, runtimeConfig, onTestExceptionUsed) {
-  const body = JSON.stringify(payload);
-  if (Buffer.byteLength(body) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const startedAt = Date.now();
-  for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
+  const current = { ...payload };
+  let attempts = 0; let retries = 0; let expansions = 0;
+  const usage = {};
+  const collect = trace => {
+    for (const key of ['promptTokens', 'completionTokens', 'reasoningTokens']) {
+      if (Number.isSafeInteger(trace?.[key])) usage[key] = (usage[key] || 0) + trace[key];
+    }
+  };
+  const decorate = trace => ({
+    ...trace, ...usage, latencyMs: Date.now() - startedAt,
+    modelAttemptCount: attempts, modelRetriesUsed: retries, modelBudgetExpansions: expansions,
+    modelMaxTokens: current.max_tokens, modelTokenCap: config.tokenCap,
+    modelEnableThinking: config.enableThinking, modelTemperature: config.temperature,
+  });
+  for (;;) {
+    const body = JSON.stringify(current);
+    if (Buffer.byteLength(body) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
+    attempts += 1;
     try {
       const response = await postModelAttempt(config, body, runtimeConfig, onTestExceptionUsed);
-      return {
-        ...response,
-        trace: {
-          ...response.trace,
-          latencyMs: Date.now() - startedAt,
-          modelAttemptCount: attempt,
-          modelRetriesUsed: attempt - 1,
-        },
-      };
+      collect(response.trace);
+      return { ...response, trace: decorate(response.trace) };
     } catch (error) {
-      if (error instanceof Error) {
-        error.modelTrace = {
-          ...(error.modelTrace || {}),
-          latencyMs: Date.now() - startedAt,
-          modelAttemptCount: attempt,
-          modelRetriesUsed: attempt - 1,
-        };
+      collect(error?.modelTrace);
+      if (error?.message === 'result_agent_output_truncated' && expansions === 0 && current.max_tokens < config.tokenCap) {
+        expansions += 1;
+        current.max_tokens = config.tokenCap;
+        continue;
       }
-      if (!modelRequestRetryable(error) || attempt >= config.maxAttempts) throw error;
-      await retryDelay(config.retryBaseDelayMs * (2 ** (attempt - 1)));
+      if (!modelRequestRetryable(error) || retries >= config.maxAttempts - 1) {
+        if (error instanceof Error) error.modelTrace = decorate(error.modelTrace || {});
+        throw error;
+      }
+      retries += 1;
+      await retryDelay(config.retryBaseDelayMs * (2 ** (retries - 1)));
     }
   }
-  throw new Error('result_agent_network_error');
 }
 
 function columnNames(result) {
@@ -352,30 +384,43 @@ function executeExcel(args, envelope, pluginHome) {
 }
 
 function executeChart(args, envelope) {
-  assertOnlyKeys(args, new Set(['type', 'label_column', 'value_column', 'max_points']));
+  assertOnlyKeys(args, new Set(['type', 'label_column', 'value_column', 'series_column', 'title', 'max_points']));
   const label = boundedString(args.label_column, 200, 'result_agent_invalid_chart_plan');
   const value = boundedString(args.value_column, 200, 'result_agent_invalid_chart_plan');
-  if (!envelope.columns.includes(label) || !envelope.columns.includes(value) || !['bar', 'line'].includes(args.type)) {
+  if (!envelope.columns.includes(label) || !envelope.columns.includes(value)
+    || !['bar', 'line', 'area', 'scatter', 'pie', 'donut'].includes(args.type)) {
     throw new Error('result_agent_invalid_chart_plan');
   }
   const maxPoints = Number.isSafeInteger(args.max_points) ? args.max_points : 100;
   if (maxPoints < 2 || maxPoints > 200) throw new Error('result_agent_invalid_chart_plan');
+  if (args.series_column !== undefined && !envelope.columns.includes(args.series_column)) throw new Error('result_agent_invalid_chart_plan');
+  if (['pie', 'donut'].includes(args.type) && args.series_column) throw new Error('result_agent_invalid_chart_plan');
+  const scalar = decimal => decimal.scale === 0 && Number.isSafeInteger(Number(decimal.coefficient))
+    ? Number(decimal.coefficient) : formatDecimal(decimal.coefficient, decimal.scale, decimal.scale);
   const points = envelope.rows.slice(0, maxPoints).map(row => ({
-    label: String(row[label] ?? ''),
+    label: args.type === 'scatter' ? parseDecimal(row[label], 'result_agent_invalid_chart_value') : String(row[label] ?? ''),
     value: parseDecimal(row[value], 'result_agent_invalid_chart_value'),
-  })).filter(point => point.value !== null);
+    ...(args.series_column ? { series: String(row[args.series_column] ?? '') } : {}),
+  })).filter(point => point.value !== null && point.label !== null);
   if (points.length < 2) throw new Error('result_agent_invalid_chart_plan');
+  if (['pie', 'donut'].includes(args.type)
+    && (points.some(point => point.value.coefficient < 0n) || !points.some(point => point.value.coefficient > 0n))) {
+    throw new Error('result_agent_invalid_chart_value');
+  }
   const spec = {
+    ...(args.title ? { title: boundedString(args.title, 100, 'result_agent_invalid_chart_plan') } : {}),
     data: { values: points.map(point => ({
-      category: point.label,
-      value: point.value.scale === 0 && Number.isSafeInteger(Number(point.value.coefficient))
-        ? Number(point.value.coefficient)
-        : formatDecimal(point.value.coefficient, point.value.scale, point.value.scale),
+      category: args.type === 'scatter' ? scalar(point.label) : point.label,
+      value: scalar(point.value),
+      ...(args.series_column ? { series: point.series } : {}),
     })) },
-    mark: args.type,
-    encoding: {
-      x: { field: 'category', type: 'ordinal', title: label },
+    mark: ({ scatter: 'point', pie: 'arc', donut: { type: 'arc', innerRadius: 0.5 } })[args.type] || args.type,
+    encoding: ['pie', 'donut'].includes(args.type) ? {
+      theta: { field: 'value', type: 'quantitative' }, color: { field: 'category', type: 'nominal', title: label },
+    } : {
+      x: { field: 'category', type: args.type === 'scatter' ? 'quantitative' : 'ordinal', title: label },
       y: { field: 'value', type: 'quantitative', title: value },
+      ...(args.series_column ? { color: { field: 'series', type: 'nominal', title: args.series_column } } : {}),
     },
   };
   const notice = envelope.rows.length > points.length
@@ -478,18 +523,28 @@ function computedClaimEvidence(args, envelope) {
   const claims = Array.isArray(args.claims) ? args.claims : [];
   if (claims.length > 20) throw new Error('result_agent_invalid_claims');
   return claims.map(claim => {
-    assertOnlyKeys(claim, new Set(['operation', 'column']));
+    assertOnlyKeys(claim, new Set(['operation', 'column', 'row_indices']));
+    let rows = envelope.rows;
+    if (claim.row_indices !== undefined) {
+      const indices = claim.row_indices;
+      if (!Array.isArray(indices) || !indices.length || indices.length > envelope.rows.length
+        || new Set(indices).size !== indices.length
+        || indices.some(index => !Number.isSafeInteger(index) || index < 0 || index >= envelope.rows.length)) {
+        throw new Error('result_agent_invalid_claim_rows');
+      }
+      rows = indices.map(index => envelope.rows[index]);
+    }
     const operation = claim?.operation;
     if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(operation)) {
       throw new Error('result_agent_invalid_claim_operation');
     }
     if (operation === 'count') {
-      const value = groupedNumber(envelope.rows.length);
+      const value = groupedNumber(rows.length);
       return { value, display: `**返回记录数：${value} 行**` };
     }
     const column = boundedString(claim?.column, 200, 'result_agent_invalid_claim_column');
     if (!envelope.columns.includes(column)) throw new Error('result_agent_invalid_claim_column');
-    const values = envelope.rows.map(row => parseDecimal(row[column])).filter(value => value !== null);
+    const values = rows.map(row => parseDecimal(row[column])).filter(value => value !== null);
     if (!values.length) throw new Error('result_agent_invalid_claim_value');
     const inferredScale = Math.max(...values.map(value => value.scale));
     const scale = declaredDecimalScale(column, envelope) ?? inferredScale;
@@ -697,6 +752,7 @@ function stripModelAuthoredMarkdownTables(markdown, onTable) {
       && header.length === separator.length
       && separator.every(cell => /^:?-{3,}:?$/u.test(cell));
     if (!isTable) {
+      if (/^\|.*\|$/u.test(lines[index].trim())) { onTable?.(); continue; }
       retained.push(lines[index]);
       continue;
     }
@@ -711,8 +767,8 @@ function stripModelAuthoredMarkdownTables(markdown, onTable) {
   return retained.join('\n').replace(/\n{3,}/gu, '\n\n').trim();
 }
 
-function renderAuthoredAnalysis(args, envelope, question) {
-  const authoredMarkdown = boundedString(args.analysis_markdown, 8_000, 'result_agent_invalid_analysis_markdown');
+function renderAuthoredAnalysis(args, envelope, question, maxChars = 8_000) {
+  const authoredMarkdown = boundedString(args.analysis_markdown, maxChars, 'result_agent_invalid_analysis_markdown');
   const markdown = stripModelAuthoredMarkdownTables(authoredMarkdown);
   validateAuthoredNarrative(markdown);
   const evidence = {
@@ -748,13 +804,40 @@ function renderAuthoredAnalysis(args, envelope, question) {
 function detailTableLines(args, envelope, maxRows) {
   if (!Array.isArray(args.table_columns) || !args.table_columns.length) return [];
   const columns = selectedColumns(args, envelope.columns, 'table_columns');
+  const formats = new Map();
+  if (args.table_formats !== undefined) {
+    if (!Array.isArray(args.table_formats) || args.table_formats.length > columns.length) {
+      throw new Error('result_agent_invalid_analysis_table');
+    }
+    for (const format of args.table_formats) {
+      assertOnlyKeys(format, new Set(['column', 'decimals', 'grouping']));
+      if (!columns.includes(format.column) || formats.has(format.column)
+        || !Number.isSafeInteger(format.decimals) || format.decimals < 0 || format.decimals > 12
+        || (format.grouping !== undefined && typeof format.grouping !== 'boolean')) {
+        throw new Error('result_agent_invalid_analysis_table');
+      }
+      formats.set(format.column, format);
+    }
+  }
+  const cell = (row, column) => {
+    const value = row[column];
+    const format = formats.get(column);
+    if (!format || value === null || value === undefined || value === '') return markdownTableCell(value ?? '');
+    const decimal = parseDecimal(value, 'result_agent_invalid_analysis_table');
+    if (decimal === null) return '';
+    const coefficient = decimal.scale > format.decimals
+      ? roundedDivide(decimal.coefficient, powerOfTen(decimal.scale - format.decimals))
+      : decimal.coefficient * powerOfTen(format.decimals - decimal.scale);
+    const display = formatDecimal(coefficient, format.decimals, format.decimals);
+    return markdownTableCell(format.grouping ? groupedNumber(display) : display);
+  };
   const lines = [
     '## 数据明细',
     '',
     `| ${columns.map(markdownTableCell).join(' | ')} |`,
     `| ${columns.map(() => '---').join(' | ')} |`,
     ...envelope.rows.slice(0, maxRows).map(row => (
-      `| ${columns.map(column => markdownTableCell(row[column] ?? '')).join(' | ')} |`
+      `| ${columns.map(column => cell(row, column)).join(' | ')} |`
     )),
   ];
   if (envelope.rows.length > maxRows) lines.push('', `仅展示前 ${maxRows} 行，共 ${envelope.rows.length} 行。`);
@@ -764,10 +847,20 @@ function detailTableLines(args, envelope, maxRows) {
 function conciseNarrative(lines) {
   const retained = [];
   let skipSection = false;
+  let inlineScope = false;
   for (const line of lines) {
+    // Model-authored scope can be a heading, a bold inline label, or plain
+    // prose. The canonical context has one owner: the renderer below.
+    if (/^\s*(?:[-*]\s+)?(?:\*\*)?(?:数据口径|统计口径|口径说明)(?:\*\*)?\s*[：:]/u.test(line)) {
+      skipSection = true;
+      inlineScope = true;
+      continue;
+    }
+    if (inlineScope && !line.trim()) { skipSection = false; inlineScope = false; continue; }
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*$/u);
     if (heading) {
-      skipSection = /^(?:数据口径|统计口径|数据明细|按日明细|趋势图)$/u.test(heading[1].trim());
+      inlineScope = false;
+      skipSection = /^(?:数据口径|统计口径|口径说明|数据明细|按日明细|趋势图)$/u.test(heading[1].trim());
       continue;
     }
     if (!skipSection) retained.push(line);
@@ -797,7 +890,7 @@ function composeResultCard(analysis, artifacts, envelope) {
 
 function executeAnalysis(args, envelope, question = '') {
   assertOnlyKeys(args, new Set([
-    'analysis_markdown', 'facts', 'claims', 'calculations', 'table_columns', 'table_max_rows',
+    'analysis_markdown', 'facts', 'claims', 'calculations', 'table_columns', 'table_max_rows', 'table_formats',
   ]));
   if (args.claims !== undefined && !Array.isArray(args.claims)) throw new Error('result_agent_invalid_claims');
   if (args.calculations !== undefined && !Array.isArray(args.calculations)) {
@@ -820,22 +913,26 @@ function executeAnalysis(args, envelope, question = '') {
 }
 
 function documentLines(args, envelope, maxRows) {
-  const lines = ['查询结果', '', ...computedClaims(args, envelope), '', ...renderQueryContext(envelope.manifest.context), ''];
-  if (Array.isArray(args.table_columns) && args.table_columns.length) {
-    const columns = selectedColumns(args, envelope.columns, 'table_columns');
-    lines.push(columns.join(' | '));
-    lines.push(columns.map(() => '---').join(' | '));
-    for (const row of envelope.rows.slice(0, maxRows)) lines.push(columns.map(column => String(row[column] ?? '')).join(' | '));
-    if (envelope.rows.length > maxRows) lines.push(`仅展示前 ${maxRows} 行，共 ${envelope.rows.length} 行。`);
-    lines.push('');
+  const title = args.title ? boundedString(args.title, 120, 'result_agent_invalid_document_plan') : '查询结果';
+  validateAuthoredNarrative(title);
+  const content = args.content_markdown
+    ? renderAuthoredAnalysis({ ...args, analysis_markdown: args.content_markdown }, envelope, '', 30_000)
+    : computedClaims(args, envelope);
+  const lines = [title, '', ...content, ''];
+  let authoredTable = false;
+  stripModelAuthoredMarkdownTables(args.content_markdown || '', () => { authoredTable = true; });
+  const tableArgs = !args.table_columns?.length && authoredTable ? { ...args, table_columns: envelope.columns } : args;
+  if (Array.isArray(tableArgs.table_columns) && tableArgs.table_columns.length) {
+    lines.push(...detailTableLines(tableArgs, envelope, maxRows));
   }
+  lines.push(...renderQueryContext(envelope.manifest.context));
   const notice = scopeNotice(envelope.manifest);
   if (notice) lines.push(`数据范围说明：${notice}`);
   return lines;
 }
 
 function executeDocument(args, envelope, pluginHome) {
-  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
+  assertOnlyKeys(args, new Set(['title', 'content_markdown', 'facts', 'claims', 'calculations', 'table_columns', 'table_max_rows', 'table_formats']));
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 50;
   if (maxRows < 1 || maxRows > 200) throw new Error('result_agent_invalid_document_plan');
   const lines = documentLines(args, envelope, maxRows);
@@ -852,8 +949,22 @@ function utf16Hex(text) {
 }
 
 function simplePdf(lines) {
+  const wrapped = lines.flatMap((line, index) => {
+    const heading = index === 0 ? [line, '#', line] : line.match(/^(#{1,6})\s+(.+)$/u);
+    const size = heading ? Math.max(12, 18 - heading[1].length * 2) : 11;
+    const text = (heading ? heading[2] : line).replace(/\*\*/gu, '').replace(/`/gu, '');
+    const output = []; let current = ''; let width = 0;
+    const maxWidth = Math.floor(495 / size);
+    for (const character of text) {
+      const units = 1;
+      if (width + units > maxWidth && current) { output.push({ text: current, size }); current = ''; width = 0; }
+      current += character; width += units;
+    }
+    output.push({ text: current, size });
+    return output;
+  });
   const pages = [];
-  for (let index = 0; index < lines.length; index += 42) pages.push(lines.slice(index, index + 42));
+  for (let index = 0; index < wrapped.length; index += 42) pages.push(wrapped.slice(index, index + 42));
   const objects = [];
   const pageIds = pages.map((_, index) => 3 + index * 2);
   const fontId = 3 + pages.length * 2;
@@ -861,7 +972,7 @@ function simplePdf(lines) {
   objects[2] = `<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(' ')}] /Count ${pages.length} >>`;
   pages.forEach((page, index) => {
     const pageId = pageIds[index]; const contentId = pageId + 1;
-    const stream = `BT /F1 11 Tf 50 790 Td 17 TL ${page.map(line => `<${utf16Hex(line.slice(0, 90))}> Tj T*`).join(' ')} ET`;
+    const stream = `q 1 1 1 rg 0 0 595 842 re f Q BT 50 790 Td 17 TL ${page.map(line => `/F1 ${line.size} Tf <${utf16Hex(line.text)}> Tj T*`).join(' ')} ET`;
     objects[pageId] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`;
     objects[contentId] = `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
   });
@@ -880,7 +991,7 @@ function simplePdf(lines) {
 }
 
 function executePdf(args, envelope, pluginHome) {
-  assertOnlyKeys(args, new Set(['claims', 'table_columns', 'table_max_rows']));
+  assertOnlyKeys(args, new Set(['title', 'content_markdown', 'facts', 'claims', 'calculations', 'table_columns', 'table_max_rows', 'table_formats']));
   const maxRows = Number.isSafeInteger(args.table_max_rows) ? args.table_max_rows : 30;
   if (maxRows < 1 || maxRows > 100) throw new Error('result_agent_invalid_document_plan');
   const bytes = simplePdf(documentLines(args, envelope, maxRows));
@@ -891,20 +1002,16 @@ function executePdf(args, envelope, pluginHome) {
 function toolDefinitions() {
   const claims = {
     type: 'array', maxItems: 20,
-    description: 'Optional numeric facts computed exactly by the host from protected rows.',
+    description: 'Optional exact arithmetic over protected rows. Select row_indices when subtotals/totals coexist with details. Omitting indices includes every returned row; this is not automatically a business total.',
     items: {
       type: 'object', additionalProperties: false,
       properties: {
         operation: { type: 'string', enum: ['count', 'sum', 'average', 'minimum', 'maximum'] },
         column: { type: 'string' },
+        row_indices: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'integer', minimum: 0 } },
       },
       required: ['operation'],
     },
-  };
-  const documentProperties = {
-    claims,
-    table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
-    table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
   };
   const analysisProperties = {
     analysis_markdown: {
@@ -951,13 +1058,21 @@ function toolDefinitions() {
     },
     table_columns: { type: 'array', maxItems: 100, items: { type: 'string' } },
     table_max_rows: { type: 'integer', minimum: 1, maximum: 200 },
+    table_formats: { type: 'array', maxItems: 100, description: 'Display-only exact decimal rounding and thousands grouping for selected numeric columns. Follow the user request; never change source rows or format identifier/date columns as amounts.', items: { type: 'object', additionalProperties: false, properties: { column: { type: 'string' }, decimals: { type: 'integer', minimum: 0, maximum: 12 }, grouping: { type: 'boolean' } }, required: ['column', 'decimals'] } },
+  };
+  const documentProperties = {
+    title: { type: 'string', minLength: 1, maxLength: 120 },
+    content_markdown: { type: 'string', minLength: 1, maxLength: 30000, description: 'Model-authored report with headings, findings, estimates and recommendations. Actual result tables are generated separately from table_columns.' },
+    facts: analysisProperties.facts, claims, calculations: analysisProperties.calculations,
+    table_columns: analysisProperties.table_columns, table_max_rows: analysisProperties.table_max_rows,
+    table_formats: analysisProperties.table_formats,
   };
   return [
     { type: 'function', function: { name: 'create_analysis', description: 'Write a question-specific analysis and choose generic source facts, exact aggregates, generic arithmetic, and optional detail columns. The model owns narrative and structure; the host binds or computes every exact value.', parameters: { type: 'object', additionalProperties: false, properties: analysisProperties, required: ['analysis_markdown'] } } },
     { type: 'function', function: { name: 'create_excel', description: 'Create an Excel workbook from the exact protected query rows. Select sheets and columns; the tool owns names and cell data.', parameters: { type: 'object', additionalProperties: false, properties: { sheets: { type: 'array', minItems: 1, maxItems: 4, items: { type: 'object', additionalProperties: false, properties: { columns: { type: 'array', minItems: 1, maxItems: 100, items: { type: 'string' } } }, required: ['columns'] } } }, required: ['sheets'] } } },
-    { type: 'function', function: { name: 'create_chart', description: 'Create a native inline chart in the same result card from exact source columns. The tool binds all data; this output is not a downloadable file.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
-    { type: 'function', function: { name: 'create_document', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
-    { type: 'function', function: { name: 'create_pdf', description: 'Select source-bound claims and table structure. The tool owns every rendered word and value; no free text is accepted.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
+    { type: 'function', function: { name: 'create_chart', description: 'Choose a native chart type, axes and optional series/title. All plotted values are bound to source columns. Scatter needs numeric axes; pie/donut needs nonnegative values.', parameters: { type: 'object', additionalProperties: false, properties: { type: { type: 'string', enum: ['bar', 'line', 'area', 'scatter', 'pie', 'donut'] }, label_column: { type: 'string' }, value_column: { type: 'string' }, series_column: { type: 'string' }, title: { type: 'string', maxLength: 100 }, max_points: { type: 'integer', minimum: 2, maximum: 200 } }, required: ['type', 'label_column', 'value_column'] } } },
+    { type: 'function', function: { name: 'create_document', description: 'Author a Markdown report freely using title and content_markdown. Choose source-bound table columns and optional exact references; the tool writes the file and exact row data.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
+    { type: 'function', function: { name: 'create_pdf', description: 'Author a paginated PDF report using title and content_markdown, with findings and recommendations. Original data tables come only from table_columns.', parameters: { type: 'object', additionalProperties: false, properties: documentProperties } } },
   ];
 }
 
@@ -987,14 +1102,15 @@ function normalizedOutputs(requestedOutputs) {
   return outputs;
 }
 
-function validatedToolCalls(message, outputs) {
+function validatedToolCalls(message, outputs, requireAll = true) {
   const calls = Array.isArray(message?.tool_calls) ? message.tool_calls.map(parseToolCall) : [];
   if (!calls.length) throw new Error('result_agent_tool_call_required');
   if (calls.length > MAX_ARTIFACTS || calls.some(call => !outputs.includes(call.output))) {
     throw new Error('result_agent_unrequested_tool');
   }
   for (const output of outputs) {
-    if (calls.filter(call => call.output === output).length !== 1) {
+    const count = calls.filter(call => call.output === output).length;
+    if (count > 1 || (requireAll && count !== 1)) {
       throw new Error('result_agent_tool_call_mismatch');
     }
   }
@@ -1009,16 +1125,25 @@ function repairableAnalysisError(error) {
     || error.message.startsWith('result_agent_invalid_fact_')
     || error.message.startsWith('result_agent_invalid_claim_')
     || error.message.startsWith('result_agent_invalid_calculation_')
+    || error.message.startsWith('result_agent_invalid_chart_')
+    || error.message === 'result_agent_invalid_document_plan'
+    || error.message === 'result_agent_invalid_column_selection'
   );
 }
 
-function combinedModelTrace(previous, next) {
+function combinedModelTrace(previous, next, repair = true) {
+  const usage = Object.fromEntries(['promptTokens', 'completionTokens', 'reasoningTokens'].flatMap(key => (
+    Number.isSafeInteger(previous[key]) || Number.isSafeInteger(next[key])
+      ? [[key, (previous[key] || 0) + (next[key] || 0)]] : []
+  )));
   return {
-    ...next,
+    ...next, ...usage,
     latencyMs: (previous.latencyMs || 0) + (next.latencyMs || 0),
     modelAttemptCount: (previous.modelAttemptCount || 0) + (next.modelAttemptCount || 0),
     modelRetriesUsed: (previous.modelRetriesUsed || 0) + (next.modelRetriesUsed || 0),
-    modelRepairCount: (previous.modelRepairCount || 0) + 1,
+    modelRepairCount: (previous.modelRepairCount || 0) + (repair ? 1 : 0),
+    modelPlanningRounds: (previous.modelPlanningRounds || 0) + (next.modelPlanningRounds || 0),
+    modelBudgetExpansions: (previous.modelBudgetExpansions || 0) + (next.modelBudgetExpansions || 0),
   };
 }
 
@@ -1033,6 +1158,7 @@ export async function runInternalResultAgent(options) {
     rows: envelope.rows,
     computed_numeric_evidence: numericEvidence(envelope),
     computed_facts: statisticEvidence(envelope).map(({ display, ...fact }) => fact),
+    computed_evidence_scope: 'all returned rows, including any subtotal/total rows; not a deduplicated business total',
   });
   if (Buffer.byteLength(serialized) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const messages = [
@@ -1047,8 +1173,11 @@ export async function runInternalResultAgent(options) {
         '默认只写一至两句完整的分析总结：概括主要变化和需要关注的点，句子必须完整收尾。仅当用户明确要求详细/深入分析时才展开。不要写标题、重复明细、口径或“可信数据”等栏目；宿主会统一按明细、图表、分析总结、数据口径的顺序排版。',
         '分析正文允许直接书写数字、日期、计算结果和新的估算值，不强制占位符，不使用数字白名单。结合 rows 和 computed_numeric_evidence 自行核对事实；推算、预测、原因假设和建议须明确标注，不能冒充已查询到的事实。',
         'facts、claims、calculations 和 computed_facts 的 reference 均为可选能力；需要精确计算时可以使用，不要求为了格式机械调用。',
+        '自动统计覆盖全部返回行，不能当作业务合计；明细与合计/小计混排时，请使用 claims.row_indices 明确选择同粒度明细行，或引用已有合计行，不重复累加。金额展示按用户要求设置 table_formats 的小数位和千分位，标识及日期列不要当作金额格式化。',
         '列表或明细结果请选择 table_columns；宿主只从原始 rows 渲染一次表格，analysis_markdown 不再重复明细表。',
         '分析内容和结论由你自由组织；不得修改明细、图表或文件中的原始数据，也不要新增用户未要求的文件或数据字段。',
+        '图表可选折线、柱状、面积、散点、饼图、环图及适用的系列列；按数据特征和用户要求选择，不必每次使用折线图。',
+        '文档和 PDF 由你自行撰写 title 和 content_markdown，可组织章节、推算与建议；表格使用 table_columns，由工具填入原始数据。',
         '数据口径由宿主根据可信 context 生成自然段；不得输出 SQL、身份凭据或本机路径。',
       ].join('\n'),
     },
@@ -1069,9 +1198,9 @@ export async function runInternalResultAgent(options) {
   try {
     modelResponse = await postModel(config, {
       model: config.model,
-      temperature: 0,
-      max_tokens: 2048,
-      chat_template_kwargs: { enable_thinking: false },
+      temperature: config.temperature,
+      max_tokens: config.maxTokens,
+      chat_template_kwargs: { enable_thinking: config.enableThinking },
       messages,
       tools,
       tool_choice: 'required',
@@ -1079,13 +1208,56 @@ export async function runInternalResultAgent(options) {
   } catch (error) {
     throw attachAudit(error, { ...baseAudit, ...(error?.modelTrace || {}) });
   }
+  const collectPlans = async (modelResponse, history = messages) => {
+  // Models may plan requested outputs across several tool-call turns. Do not
+  // execute any artifact plan until the whole requested set has been received.
+  const plans = new Map();
+  const planMessages = [...history];
+  let planningRounds = 0;
+  const initialPlanningRounds = modelResponse.trace.modelPlanningRounds || 0;
+  for (;;) {
+    const remaining = outputs.filter(output => !plans.has(output));
+    let batch;
+    try { batch = validatedToolCalls(modelResponse.message, remaining, false); }
+    catch (error) { throw attachAudit(error, { ...baseAudit, ...modelResponse.trace }); }
+    for (const call of batch) {
+      const raw = modelResponse.message.tool_calls.find(item => item.id === call.id);
+      plans.set(call.output, { ...raw, id: `plan_${plans.size}_${call.output}` });
+    }
+    if (plans.size === outputs.length) {
+      modelResponse.message = { content: null, tool_calls: [...plans.values()] };
+      modelResponse.trace.modelPlanningRounds = initialPlanningRounds + planningRounds;
+      break;
+    }
+    if (planningRounds >= outputs.length - 1) throw attachAudit(new Error('result_agent_tool_call_mismatch'), { ...baseAudit, ...modelResponse.trace });
+    const pending = outputs.filter(output => !plans.has(output));
+    planMessages.push({ ...modelResponse.message, role: 'assistant' }, ...batch.map(call => ({
+      role: 'tool', tool_call_id: call.id,
+      content: JSON.stringify({ status: 'plan_received_not_executed', remaining_outputs: pending,
+        instruction: '已收到此产物方案，尚未生成文件或投递。只调用剩余输出的工具，全部方案收齐后才统一执行。' }),
+    })));
+    let next;
+    try {
+      next = await postModel(config, { model: config.model, temperature: config.temperature,
+        max_tokens: config.maxTokens, chat_template_kwargs: { enable_thinking: config.enableThinking },
+        messages: planMessages, tools: tools.filter(tool => pending.includes(OUTPUT_BY_TOOL[tool.function.name])), tool_choice: 'required',
+      }, options.runtimeConfig, options.onTestExceptionUsed);
+    } catch (error) { throw attachAudit(error, { ...baseAudit, ...combinedModelTrace(modelResponse.trace, error?.modelTrace || {}, false) }); }
+    next.trace = combinedModelTrace(modelResponse.trace, next.trace, false);
+    modelResponse = next;
+    planningRounds += 1;
+  }
+    return modelResponse;
+  };
+  modelResponse = await collectPlans(modelResponse);
   for (let repairAttempt = 0; repairAttempt <= 2; repairAttempt += 1) {
     const artifacts = [];
-    let calls;
+    let calls; let failedCall;
     try {
       calls = validatedToolCalls(modelResponse.message, outputs);
       let analysis;
       for (const call of calls) {
+        failedCall = call;
         const artifact = executeTool(call, envelope, options.pluginHome, options.question);
         if (artifact.type === 'analysis') analysis = artifact;
         else artifacts.push(artifact);
@@ -1105,8 +1277,8 @@ export async function runInternalResultAgent(options) {
       for (const artifact of artifacts) {
         try { unlinkSync(artifact.path); } catch { /* best effort */ }
       }
-      const analysisCall = calls?.find(call => call.name === 'create_analysis');
-      if (!analysisCall || !repairableAnalysisError(error) || repairAttempt >= 2) {
+      const repairCall = failedCall || calls?.find(call => call.name === 'create_analysis');
+      if (!repairCall || !repairableAnalysisError(error) || repairAttempt >= 2) {
         throw attachAudit(error, { ...baseAudit, ...modelResponse.trace });
       }
       const repairMessages = [
@@ -1116,12 +1288,12 @@ export async function runInternalResultAgent(options) {
           content: modelResponse.message.content ?? null,
           tool_calls: modelResponse.message.tool_calls,
         },
-        {
+        ...calls.map(call => ({
           role: 'tool',
-          tool_call_id: analysisCall.id,
+          tool_call_id: call.id,
           content: JSON.stringify({
-            status: 'rejected',
-            error_code: error.message,
+            status: call.id === repairCall.id ? 'rejected' : 'rolled_back',
+            error_code: call.id === repairCall.id ? error.message : undefined,
             instruction: [
               '请重新调用所有 requested_outputs 对应工具。',
               '请根据 error_code 修正工具参数或无效引用；数字和估算可以直接写在 analysis_markdown 中，不必改为占位符。',
@@ -1129,15 +1301,15 @@ export async function runInternalResultAgent(options) {
               '实际观察、推算和假设要区分，保持一至两句完整总结；深入分析仅在用户要求时展开。',
             ].join(''),
           }),
-        },
+        })),
       ];
       let repaired;
       try {
         repaired = await postModel(config, {
           model: config.model,
-          temperature: 0,
-          max_tokens: 2048,
-          chat_template_kwargs: { enable_thinking: false },
+          temperature: config.temperature,
+          max_tokens: config.maxTokens,
+          chat_template_kwargs: { enable_thinking: config.enableThinking },
           messages: repairMessages,
           tools,
           tool_choice: 'required',
@@ -1149,7 +1321,7 @@ export async function runInternalResultAgent(options) {
         });
       }
       repaired.trace = combinedModelTrace(modelResponse.trace, repaired.trace);
-      modelResponse = repaired;
+      modelResponse = await collectPlans(repaired, repairMessages);
     }
   }
   throw attachAudit(new Error('result_agent_failed'), { ...baseAudit, ...modelResponse.trace });

@@ -62,12 +62,14 @@ When the user describes a metric, topic, or business object instead of a table:
    actually registered for this Bot:
    - when `deliver_query_result_for_user` is present, use it; rows, analysis,
      and files stay on the isolated result-Agent path. For analysis-only
-     output, the tool returns only the internal result model's safe final
-     markdown to the calling model; reply with that markdown once as the normal
-     final response. Do not split query scope and result into separate messages
-     and do not create a separate result-access card. When the handoff contains
-     attachments, send them directly to the original group/topic/private chat
-     with the same final reply, exactly as requested by the user;
+     output, the tool directly delivers the result and returns a metadata-only
+     receipt. After `delivered=true`, do not send a second result, summary,
+     table or attachment. Do not read the result with history, quoted, raw IM
+     APIs, cached files or other tools: this would put business data back in
+     the orchestration context. A successful receipt completes the delivery.
+     In protected mode, `host_status_required` means custody transfer, not
+     successful delivery: query `botmux_result_delivery_status` using its plugin
+     ID and delivery ID. Pending/unknown is not permission to resend;
    - when it is absent, this Bot is explicitly configured for single-model
      operation: use `run_query_for_user`; the calling model must create any
      requested file with its own artifact skill/tool. In this mode query rows
@@ -164,18 +166,22 @@ The plugin MCP server exposes:
 - `deliver_query_result_for_user`: executes one validated plan once, gives
   rows/schema/context to the internal result Agent, and delivers Agent-authored
   analysis and requested Excel/PDF/chart/document artifacts.
-  `response_mode=model_handoff` returns `final_markdown` authored by the internal
-  result model plus zero or more attachment paths. The calling model must send
-  the markdown once as its normal final reply and attach every returned file
-  directly to the original group/topic/private chat with `botmux send --files`.
-  Keep result and query scope together. Never replace the response with a
-  protected result-access or download-entry card.
+  The current protocol directly delivers the result, returning only status,
+  delivery/message IDs and artifact counts. The historical `model_handoff`,
+  `final_markdown` and local attachment-path handoff are retired. Never resend
+  a delivered result or inspect its body from the orchestration model. Never
+  replace the result with a protected result-access or download-entry card.
 - `continue_query_result_for_user`: use for an unambiguous follow-up about the
   current caller-bound result without querying again. Pass only the user's
   follow-up text and explicit `requested_outputs`. Never invent or pass a
   result id, user identity, app id, or session id. If it returns a fixed
   no-active-result status, treat the request as a new query. If the request is
   ambiguous, ask the user once and default to the new-query workflow.
+- `get_query_delivery_status_for_user`: no arguments; inspect only the current
+  caller/app/session/result-version bound delivery status, IDs and counts.
+  It does not query SQL or return the result body. Use this instead of
+  history/quoted/raw API readback. Pending/unknown/unavailable is not evidence
+  that nothing was sent and must not trigger an automatic resend or requery.
 
 `deliver_query_result_for_user` and `continue_query_result_for_user` are not
 registered at all in single-model mode. Tool availability, not model-authored
@@ -193,3 +199,13 @@ For scheduled data access, trusted identity and turn provenance must agree: `cal
 The plugin itself must not implement business SQL parsing beyond basic required
 argument checks. If the Data MCP service is unavailable or trusted identity is
 missing, fail closed.
+
+## Isolation assurance
+
+The instructions above are workflow rules, not a host security mechanism.
+Metadata-only MCP replies do not prove end-to-end isolation: unrestricted IM
+history/quoted/API reads, filesystem access, other credentials and forwarded
+messages can disclose results again. A deployment must independently enforce
+and test these ingress paths before claiming that business data cannot enter
+the orchestration model. Do not use business-card readback as acceptance
+evidence; inspect bodies and files only inside the approved trusted boundary.
