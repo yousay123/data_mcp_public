@@ -1,6 +1,6 @@
 ---
 name: data-mcp
-description: Use when a user asks to query data, locate a metric/table, inspect metadata, generate SQL, export query results, or reason about Data MCP access through Botmux. This private skill requires host-owned trusted identity from Botmux Gateway metadata.
+description: Use when a user asks to query data, locate a metric/table, inspect metadata, generate SQL, export query results, or reason about Data MCP access through Botmux. For an explicit DLC request with a fully qualified table, never call search_metadata_snapshot; go directly to validate_sql_for_user with datasource=dlc because live DLC validation supplies table, partition, engine, and permission checks. This private skill requires host-owned trusted identity from Botmux Gateway metadata.
 ---
 
 # Data MCP
@@ -32,58 +32,138 @@ per-turn identity.
 
 ## Default Data Workflow
 
+Choose the data source before metadata discovery or SQL generation:
+
+1. When the user explicitly names DLC, use `datasource=dlc`. When the user
+   explicitly names ClickHouse, CK, or TChouse-C, use `datasource=tchouse-c`.
+2. When the current user request does not name a data source, default to
+   `datasource=tchouse-c`. Treat each new query request as a fresh source choice:
+   a DLC choice from an earlier query or test must not leak into it. Only a
+   clearly worded continuation of the same query may inherit its confirmed
+   source.
+3. Never rely on the tool schema's default data source when more than one data
+   source is enabled. Select the source explicitly under rules 1-2, and never
+   silently retry or fall back to a different source.
+
 When the user describes a metric, topic, or business object instead of a table:
 
-1. Call `search_metadata_snapshot` first; never query the online metadata dictionary as an automatic fallback.
+1. For `tchouse-c`, call `search_metadata_snapshot` first; never query the
+   online metadata dictionary as an automatic fallback. Call
+   `search_dlc_tables_for_user` only when the current request explicitly names
+   DLC/WeData or is a clear continuation of an already confirmed DLC query.
+   A business phrase, table nickname, or earlier DLC test is not evidence that
+   the current request wants DLC. The CK snapshot is not a DLC discovery source.
 2. Identify candidate tables, fields, partitions, and metric definitions.
 3. Ask for clarification when the business scope, date range, region, or metric
    definition is ambiguous.
 4. Generate SQL only after the table and口径 are clear.
 5. Call `validate_sql_for_user` first.
-6. Execute only read-only queries through `run_query_for_user` after validation succeeds.
+6. Execute only read-only queries after validation succeeds. Follow the tools
+   actually registered for this Bot:
+   - when `deliver_query_result_for_user` is present, use it; rows, analysis,
+     and files stay on the isolated result-Agent path. For analysis-only
+     output, the tool directly delivers the result and returns a metadata-only
+     receipt. After `delivered=true`, do not send a second result, summary,
+     table or attachment. Do not read the result with history, quoted, raw IM
+     APIs, cached files or other tools: this would put business data back in
+     the orchestration context. A successful receipt completes the delivery.
+     In protected mode, `host_status_required` means custody transfer, not
+     successful delivery: query `botmux_result_delivery_status` using its plugin
+     ID and delivery ID. Pending/unknown is not permission to resend;
+   - when it is absent, this Bot is explicitly configured for single-model
+     operation: use `run_query_for_user`; the calling model must create any
+     requested file with its own artifact skill/tool. In this mode query rows
+     enter the calling model context by design.
 7. Pass the same byte-exact SQL string to validate and run. Use trimming only to
    reject blank input; do not normalize or reformat SQL between the two calls.
-8. Keep SQL validation, account mapping, execution, export limits, and audit on the Data MCP service side.
+8. Keep SQL validation, account mapping, query execution limits, and audit on
+   the Data MCP service side. Final artifact generation does not belong there.
 9. Use the default `execution_mode=single` for normal work. Use `compare` only
    for an explicit before/after comparison that needs the exact same validated
    SQL twice; never attempt a third run or ask for a caller-defined run count.
 
 When the user names a table directly:
 
-1. Inspect metadata and available fields through `search_metadata_snapshot` first.
-2. Check partitions and row scale before large reads.
-3. Apply explicit date, region, and business filters.
-4. Prefer small previews before exports.
+1. For `tchouse-c`, inspect metadata and available fields through
+   `search_metadata_snapshot` first.
+2. For `dlc` with a fully qualified table, do not call
+   `search_metadata_snapshot`. Generate read-only SQL from the confirmed table
+   and filters, then call `validate_sql_for_user` with `datasource=dlc`. Service
+   validation performs live DLC principal, table metadata, partition, engine,
+   and table-permission checks before any query executes.
+3. If the requested DLC partition cannot be expressed because its field is
+   unknown, ask for the partition field or use the validation issue to correct
+   the SQL. Do not guess a field and do not treat CK snapshot unavailability as
+   a DLC query failure.
+4. Check partitions and row scale before large reads.
+5. Apply explicit date, region, and business filters.
+6. Prefer small previews before exports.
 
-## Export
+## Result artifacts
 
-1. Export may proceed directly when the query is read-only, tied to the trusted
-   caller, and within the configured service-side export row limit.
-2. Do not add a separate confirmation step only because `row_count > 100`.
-3. If a result exceeds the configured export row limit, ask the user to narrow
-   the query or have an operator raise `DATA_MCP_EXPORT_MAX_ROWS` through the
-   controlled runtime configuration.
-4. Exported files must be scoped to the trusted caller. Do not expose files to
-   unrelated group members by default.
-5. Excel exports should contain header + data rows only, with readable column
-   widths and frozen header row.
-6. When the user explicitly asks for an Excel file, call
-   `export_query_to_excel_file`. The tool runs the validated query, generates
-   Excel in the local Data MCP outbox, and returns a local file path plus
-   `sha256`/`bytes` metadata for BotMux delivery. The same export directory also
-   contains an atomically published `receipt.json`; machine consumers must read
-   that sidecar from the outbox rather than trust JSON copied through an agent.
-   The receipt is tamper evidence for a read-only sandbox, not cross-identity
-   file confidentiality.
-7. When the user does not ask for a file/export/Excel attachment, do not call the
-   export tool. Normal query responses must not include a `file` key.
-8. Before sending an exported file, verify that the returned local file exists
-   and that its `sha256` and byte size match. Send it as a Feishu file message,
-   confirm the sent message contains an attached file resource, then delete the
-   local source file.
+1. Data MCP validates and executes the query once. It derives and query-plan-binds
+   canonical projection/time/filter/grouping/unit-status/timezone-status context
+   from validated SQL and the returned schema, then supplies it with rows to the internal
+   result Agent; it never generates a final Excel, PDF, chart, or document.
+   Decimal and 64-bit integer values must stay as exact strings across the
+   ClickHouse JSON, Python HTTP, MCP, and isolated-Agent boundaries.
+2. In dual-model mode, pass every requested output in `requested_outputs`. Never
+   supply result context as a tool argument. The isolated internal result Agent
+   must call `create_analysis`, `create_excel`, `create_pdf`, `create_chart`, or
+   `create_document` itself. A requested output with no matching tool call
+   fails closed.
+   Pass the user's analysis task and confirmed scope faithfully in `question`.
+   Preserve the user's purpose, requested depth, comparison periods and output
+   requirements. Do not replace an open analysis request with a self-selected
+   checklist of totals, averages or extremes, or add an "only report" restriction
+   that the user did not request. A request for a brief answer limits length,
+   not the analysis goal. For follow-ups, preserve the user's follow-up intent
+   and use the caller-bound result without querying again.
+   Preserve requested presentation as well: put the answer/conclusion first,
+   then evidence and findings with meaningful headings, short paragraphs,
+   bold key points and lists as appropriate. Choose comparisons from the
+   question and available dimensions, not a mandatory statistics checklist.
+   Do not impose "brief explanation only" when the user did not request it.
+   Simple single-value questions may stay short; multi-period/multi-dimension
+   questions may need several findings. Do not invent dimensions, causal
+   explanations, chart features or workbook sheets to imitate an example.
+3. If a result exceeds an artifact-tool limit, ask the user to narrow the query.
+4. Results are replied to the original trusted Feishu conversation. In a group
+   or topic, all members of that conversation can see the result and it remains
+   in chat history. A later model turn can read it through Botmux history or
+   quoted-message tools, so direct delivery is limited to synthetic test data
+   until host-side filtering or the protected result-page flow is restored.
+5. All artifacts from one request must bind values to the same protected rows
+   and schema. The result Agent writes the analysis narrative freely for the
+   user's question; it is not restricted to a fixed statistics template. It may
+   use the available exact aggregates and arithmetic, including changes and
+   ratios, when relevant to the requested analysis. Observed facts, estimates
+   and hypotheses must be distinguished; missing evidence for business causes
+   must be stated rather than invented. The Agent selects columns, chart type
+   and supported layout options, while tools bind table/chart/file data to the
+   protected rows and schema. Source-bound numeric claims use arbitrary-precision
+   decimal computation. Free narrative does not permit rewriting source values
+   or supplying unsupported artifact fields.
+6. When the user asks for one or more files, use `requested_outputs` in
+   dual-model mode. In single-model mode, use the calling model's own artifact
+   skill/tool after `run_query_for_user`.
+7. When the user does not ask for a file, request only `analysis` and do not
+   invoke artifact tools.
+8. The plugin must validate that the staged file is a regular non-symlink below
+   its own outbound directory, then delegate upload/routing to the exact bound
+   Botmux session. Direct delivery is not deduplicated across repeated tool
+   calls, so do not retry after an ambiguous receipt.
 9. Treat `expires_at` as best-effort local retention metadata. Data MCP cleans
-   expired export directories before later exports, but BotMux should still
-   delete the local file after confirmed delivery.
+   expired export directories before later exports, but the plugin still deletes
+   the staged local file after each delivery attempt.
+10. DLC failures use the controlled `wedata-tencent-workflow` troubleshooting
+    path. Validation returns bounded safe issue codes and suggested actions.
+    Execution failures are classified from the trusted DLC task state and safe
+    error evidence, then delivered as a deterministic failure card containing
+    the stage, safe error code, retryability, plan/query identifiers, matching
+    WeData case id when available, and the next diagnostic action. Never ask the
+    user to paste raw DLC responses or credentials, never expose the upstream
+    response body, and never retry an ambiguously completed plan.
 
 ## Safety Rules
 
@@ -101,8 +181,31 @@ The plugin MCP server exposes:
 - `data_mcp_identity_probe`: diagnostic only, returns the trusted identity source visible to the plugin (`gateway_meta` or `trusted_turn_fallback`) without trusting model arguments.
 - `data_mcp_query_plan`: plan-only helper; does not execute database access.
 - `validate_sql_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for read-only validation; `execution_mode` is limited to `single|compare`.
-- `run_query_for_user`: forwards explicit SQL and trusted identity to the Data MCP service for controlled execution.
-- `export_query_to_excel_file`: forwards explicit SQL and trusted identity to the Data MCP service, which exports the validated result to a local Excel file artifact.
+- `run_query_for_user`: returns the bounded result only in explicitly configured
+  single-model mode; in dual-model mode it is fail-closed.
+- `deliver_query_result_for_user`: executes one validated plan once, gives
+  rows/schema/context to the internal result Agent, and delivers Agent-authored
+  analysis and requested Excel/PDF/chart/document artifacts.
+  The current protocol directly delivers the result, returning only status,
+  delivery/message IDs and artifact counts. The historical `model_handoff`,
+  `final_markdown` and local attachment-path handoff are retired. Never resend
+  a delivered result or inspect its body from the orchestration model. Never
+  replace the result with a protected result-access or download-entry card.
+- `continue_query_result_for_user`: use for an unambiguous follow-up about the
+  current caller-bound result without querying again. Pass only the user's
+  follow-up text and explicit `requested_outputs`. Never invent or pass a
+  result id, user identity, app id, or session id. If it returns a fixed
+  no-active-result status, treat the request as a new query. If the request is
+  ambiguous, ask the user once and default to the new-query workflow.
+- `get_query_delivery_status_for_user`: no arguments; inspect only the current
+  caller/app/session/result-version bound delivery status, IDs and counts.
+  It does not query SQL or return the result body. Use this instead of
+  history/quoted/raw API readback. Pending/unknown/unavailable is not evidence
+  that nothing was sent and must not trigger an automatic resend or requery.
+
+`deliver_query_result_for_user` and `continue_query_result_for_user` are not
+registered at all in single-model mode. Tool availability, not model-authored
+arguments, is the authoritative mode signal.
 - `refresh_metadata_snapshot`: accepts no model arguments and forwards only a host-injected `schedule_creator` owner/task/app identity to refresh the fixed dictionary snapshot.
 - `search_metadata_snapshot`: searches the verified signed current snapshot for candidate tables, fields, partitions, and definitions; snapshot failures stop the workflow and never fall back online.
 - `inspect_ck_subjects_by_table`: returns bounded access holders for explicit tables from the caller's configured entry point.
@@ -116,3 +219,13 @@ For scheduled data access, trusted identity and turn provenance must agree: `cal
 The plugin itself must not implement business SQL parsing beyond basic required
 argument checks. If the Data MCP service is unavailable or trusted identity is
 missing, fail closed.
+
+## Isolation assurance
+
+The instructions above are workflow rules, not a host security mechanism.
+Metadata-only MCP replies do not prove end-to-end isolation: unrestricted IM
+history/quoted/API reads, filesystem access, other credentials and forwarded
+messages can disclose results again. A deployment must independently enforce
+and test these ingress paths before claiming that business data cannot enter
+the orchestration model. Do not use business-card readback as acceptance
+evidence; inspect bodies and files only inside the approved trusted boundary.
