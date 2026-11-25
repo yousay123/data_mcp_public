@@ -1908,7 +1908,10 @@ function toolSchemas() {
           sql: { type: 'string' },
           datasource: { type: 'string', enum: datasourceIds, default: defaultDatasource },
           query_plan_id: { type: 'string' },
-          question: { type: 'string', minLength: 1, maxLength: 4000 },
+          question: {
+            type: 'string', minLength: 1, maxLength: 4000,
+            description: 'Faithfully pass the user\'s analysis task, confirmed scope, requested depth and output requirements. Do not narrow an open analysis request into a self-selected statistics checklist or add restrictions the user did not request. Preserve requested conclusion-first structure, meaningful headings, emphasis and lists; match depth to the question and available dimensions. Brief means concise wording, not a narrower analysis goal.',
+          },
           requested_outputs: {
             type: 'array', minItems: 1, maxItems: 5, uniqueItems: true,
             items: { type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document'] },
@@ -1934,7 +1937,10 @@ function toolSchemas() {
       inputSchema: {
         type: 'object',
         properties: {
-          question: { type: 'string', minLength: 1, maxLength: 4000 },
+          question: {
+            type: 'string', minLength: 1, maxLength: 4000,
+            description: 'Faithfully pass the user\'s follow-up task and requested depth for the existing caller-bound result. Do not replace it with a narrower statistics checklist or add unrequested restrictions. Preserve requested structure, emphasis and comparisons. Brief means concise wording, not a narrower analysis goal; this tool does not re-query data.',
+          },
           requested_outputs: {
             type: 'array', minItems: 1, maxItems: 5, uniqueItems: true,
             items: { type: 'string', enum: ['analysis', 'excel', 'pdf', 'chart', 'document'] },

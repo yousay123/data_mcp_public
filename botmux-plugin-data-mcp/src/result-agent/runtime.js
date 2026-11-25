@@ -24,7 +24,7 @@ const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL_MAX_ATTEMPTS = 2;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 140_000;
-const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v7';
+const PROMPT_TEMPLATE_VERSION = 'result-agent-tool-contract-v8';
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -846,31 +846,58 @@ function detailTableLines(args, envelope, maxRows) {
 
 function conciseNarrative(lines) {
   const retained = [];
-  let skipSection = false;
+  let skipDepth = 0;
   let inlineScope = false;
   for (const line of lines) {
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*$/u);
+    if (heading) {
+      inlineScope = false;
+      const depth = heading[1].length;
+      // A renderer-owned section includes its nested headings. Resume only at
+      // its next sibling/ancestor so a nested scope cannot leak back as prose.
+      if (skipDepth && depth > skipDepth) continue;
+      skipDepth = 0;
+      const title = heading[2].replace(/\*\*/gu, '').replace(/[：:]$/u, '').trim();
+      if (/^(?:数据口径|统计口径|口径说明|数据明细|按日明细|趋势图)$/u.test(title)) {
+        skipDepth = depth;
+        continue;
+      }
+      if (title !== '查询结果') retained.push(line);
+      continue;
+    }
+    if (skipDepth) continue;
     // Model-authored scope can be a heading, a bold inline label, or plain
     // prose. The canonical context has one owner: the renderer below.
     if (/^\s*(?:[-*]\s+)?(?:\*\*)?(?:数据口径|统计口径|口径说明)(?:\*\*)?\s*[：:]/u.test(line)) {
-      skipSection = true;
       inlineScope = true;
       continue;
     }
-    if (inlineScope && !line.trim()) { skipSection = false; inlineScope = false; continue; }
-    const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*$/u);
-    if (heading) {
-      inlineScope = false;
-      skipSection = /^(?:数据口径|统计口径|口径说明|数据明细|按日明细|趋势图)$/u.test(heading[1].trim());
-      continue;
-    }
-    if (!skipSection) retained.push(line);
+    if (inlineScope && !line.trim()) { inlineScope = false; continue; }
+    if (!inlineScope) retained.push(line);
   }
   const seen = new Set();
-  return retained.join('\n').split(/\n\s*\n/u).map(part => part.trim()).filter(part => {
-    if (!part || seen.has(part)) return false;
-    seen.add(part);
+  const paragraphs = retained.join('\n').split(/\n\s*\n/u).map(part => part.trim()).filter(part => {
+    // Compare prose independently of headings, including a heading directly
+    // followed by its paragraph without a blank line.
+    const prose = part.split('\n').filter(line => !/^#{1,6}\s/u.test(line)).join('\n');
+    if (!prose) return Boolean(part);
+    if (seen.has(prose)) return false;
+    seen.add(prose);
     return true;
-  }).join('\n\n');
+  }).join('\n\n').split('\n');
+  return paragraphs.filter((line, index) => {
+    const heading = line.match(/^(#{1,6})\s/u);
+    if (!heading) return true;
+    // Drop empty headings left behind by duplicate prose/table removal, while
+    // preserving parent headings that have a populated child section.
+    for (const next of paragraphs.slice(index + 1)) {
+      if (!next.trim()) continue;
+      const child = next.match(/^(#{1,6})\s/u);
+      if (!child) return true;
+      if (child[1].length <= heading[1].length) return false;
+    }
+    return false;
+  }).join('\n').replace(/\n{3,}/gu, '\n\n').trim();
 }
 
 function composeResultCard(analysis, artifacts, envelope) {
@@ -880,9 +907,10 @@ function composeResultCard(analysis, artifacts, envelope) {
   const notice = scopeNotice(envelope.manifest);
   if (notice) context.push('', `数据范围说明：${notice}`);
   return [
-    analysis?.details,
-    ...charts,
     summary || null,
+    charts.length ? '## 图表' : null,
+    ...charts,
+    analysis?.details,
     !analysis && !charts.length ? '查询结果文件见附件。' : null,
     context.join('\n'),
   ].filter(Boolean).join('\n\n');
@@ -1016,7 +1044,7 @@ function toolDefinitions() {
   const analysisProperties = {
     analysis_markdown: {
       type: 'string', minLength: 1, maxLength: 8000,
-      description: 'Complete concise analysis, normally one or two sentences. No headings, tables, repeated scope, or repetition of every row. Numbers, calculations and estimates are allowed; distinguish observed facts from hypotheses. Fact/claim/calc/stat references are optional.',
+      description: 'Answer the user question with the main conclusion first. Choose relevant comparisons and findings from the available data; use meaningful Markdown headings, bold key points and lists when they aid reading. Match depth to the task: a single value may need only one sentence, while multi-period or multi-dimension analysis may need several sections. Do not repeat source tables or canonical scope. Numbers, calculations and estimates are allowed; distinguish observed facts from hypotheses. Fact/claim/calc/stat references are optional.',
     },
     facts: {
       type: 'array', maxItems: 50,
@@ -1159,6 +1187,7 @@ export async function runInternalResultAgent(options) {
     computed_numeric_evidence: numericEvidence(envelope),
     computed_facts: statisticEvidence(envelope).map(({ display, ...fact }) => fact),
     computed_evidence_scope: 'all returned rows, including any subtotal/total rows; not a deduplicated business total',
+    computed_evidence_usage: 'optional arithmetic references, not an analysis outline; select comparisons from the user question and actual data. Adjacent changes follow returned row order, which is not necessarily chronological or comparable across dimensions.',
   });
   if (Buffer.byteLength(serialized) > MAX_MODEL_PAYLOAD_BYTES) throw new Error('result_agent_payload_too_large');
   const messages = [
@@ -1170,7 +1199,9 @@ export async function runInternalResultAgent(options) {
         '只调用 requested_outputs 明确要求的工具，每种要求的输出类型恰好调用一次。',
         '工具中的列名必须来自 result_manifest.columns；表格、图表数据由工具从同一份 rows 读取，不要在参数里重写数据。',
         'create_analysis 的 Markdown 由你自由组织，不要套最大值、最小值、平均值等固定模板。围绕用户问题提炼现象、问题、风险或机会、业务影响和可执行建议。',
-        '默认只写一至两句完整的分析总结：概括主要变化和需要关注的点，句子必须完整收尾。仅当用户明确要求详细/深入分析时才展开。不要写标题、重复明细、口径或“可信数据”等栏目；宿主会统一按明细、图表、分析总结、数据口径的顺序排版。',
+        '先回答核心结论，再用有信息量的证据解释。按任务复杂度决定篇幅：单值查询可以一句话回答，多日或多维分析可分段展开，不统一限制句数。用有意义的 Markdown 标题、加粗重点和列表区分结论与发现，避免整段堆叠，也不要为简单问题硬套完整长模板。',
+        '分析角度由用户目标与实际数据决定：有可比的时段或业务维度时，选取能解释变化的对比、结构或贡献；缺少维度时说明限制，不编造拆分。不要机械罗列合计、均值、极值或周末/工作日。占比高不等于解释了趋势，识别因果、异常或周期需要相应证据和可比基准，不能只凭少数点下结论。',
+        '插件按分析、图表、明细、口径的顺序组装结果；分析中保留有效标题与重点。图表、明细表和数据口径由工具统一生成一次，不要重复撰写这些栏目。文件说明只陈述实际调用工具生成的内容，不声称存在未创建的 sheet、公式或图表。',
         '分析正文允许直接书写数字、日期、计算结果和新的估算值，不强制占位符，不使用数字白名单。结合 rows 和 computed_numeric_evidence 自行核对事实；推算、预测、原因假设和建议须明确标注，不能冒充已查询到的事实。',
         'facts、claims、calculations 和 computed_facts 的 reference 均为可选能力；需要精确计算时可以使用，不要求为了格式机械调用。',
         '自动统计覆盖全部返回行，不能当作业务合计；明细与合计/小计混排时，请使用 claims.row_indices 明确选择同粒度明细行，或引用已有合计行，不重复累加。金额展示按用户要求设置 table_formats 的小数位和千分位，标识及日期列不要当作金额格式化。',
@@ -1298,7 +1329,7 @@ export async function runInternalResultAgent(options) {
               '请重新调用所有 requested_outputs 对应工具。',
               '请根据 error_code 修正工具参数或无效引用；数字和估算可以直接写在 analysis_markdown 中，不必改为占位符。',
               '如果选择了 fact/claim/calc/stat 引用，编号及对应的列、操作必须有效；也可直接用自然语言写分析。',
-              '实际观察、推算和假设要区分，保持一至两句完整总结；深入分析仅在用户要求时展开。',
+              '实际观察、推算和假设要区分；保留与问题匹配的分析深度、有效标题、加粗与列表，结论优先，不要把修正后的分析压成固定句数或统计清单。',
             ].join(''),
           }),
         })),
