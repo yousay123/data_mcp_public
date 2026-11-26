@@ -229,3 +229,7 @@ messages can disclose results again. A deployment must independently enforce
 and test these ingress paths before claiming that business data cannot enter
 the orchestration model. Do not use business-card readback as acceptance
 evidence; inspect bodies and files only inside the approved trusted boundary.
+
+## Host-controlled model-mode switch
+
+The default is single-model mode. The administrator selects `DATA_MCP_MODEL_MODE=single|dual` in the MCP process environment; `dual` is an explicit test opt-in. Use registered tools as the authority, never infer the mode from previous turns, endpoint configuration, or model-written arguments. In single mode, validated new query rows intentionally enter the calling model for analysis and artifact creation. Do not access earlier protected dual-model messages, files, or cached results after a switch. In dual mode, retain the existing protection and never automatically fall back to raw result access on errors. Reload the idle session/MCP runtime before claiming the new tool set is active.

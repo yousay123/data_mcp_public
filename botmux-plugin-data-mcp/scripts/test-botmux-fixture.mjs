@@ -57,6 +57,7 @@ if (args[0] === 'observe') {
         ...process.env,
         PATH: `${bin}${delimiter}${process.env.PATH || ''}`,
         BOTMUX_SESSION_ID: 'session_synthetic',
+        DATA_MCP_MODEL_MODE: 'dual', // Delivery fixtures explicitly test the opt-in dual path.
         FAKE_BOTMUX_APP_ID: 'cli_synthetic',
         ...extra,
       };

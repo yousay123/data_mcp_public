@@ -1054,6 +1054,7 @@ try {
       timeout: 5000,
       env: {
         ...process.env,
+        DATA_MCP_MODEL_MODE: 'dual',
         BOTMUX_SESSION_ID: 'session_validate_probe',
         BOTMUX_PLUGIN_HOME: cleanRoot,
         KSHER_AGENT_DATA_MCP_ENV_FILE: probeHostEnv,
@@ -1331,6 +1332,7 @@ try {
       timeout: 5000,
       env: {
         ...process.env,
+        DATA_MCP_MODEL_MODE: 'dual',
         BOTMUX_SESSION_ID: '',
         BOTMUX_EXECUTION_ID: '',
         BOTMUX_TRUSTED_TURN_FILE: '',
@@ -1455,6 +1457,7 @@ try {
           timeout: 5000,
           env: {
             ...process.env,
+            DATA_MCP_MODEL_MODE: 'dual',
             KSHER_AGENT_DATA_MCP_ENV_FILE: socketHostEnvFile,
             DATA_MCP_INTERNAL_AUTH_TOKEN: 'plugin-process-env-canary',
           },
@@ -1554,6 +1557,7 @@ try {
         timeout: 5000,
         env: {
           ...process.env,
+          DATA_MCP_MODEL_MODE: 'dual',
           BOTMUX_SESSION_ID: 'session_socket_probe',
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
@@ -1613,6 +1617,7 @@ try {
         timeout: 5000,
         env: {
           ...process.env,
+          DATA_MCP_MODEL_MODE: 'dual',
           BOTMUX_SESSION_ID: '   ',
           BOTMUX_EXECUTION_ID: '  execution_socket_probe  ',
           BOTMUX_TRUSTED_TURN_FILE: '',
@@ -1655,6 +1660,7 @@ try {
         timeout: 5000,
         env: {
           ...process.env,
+          DATA_MCP_MODEL_MODE: 'dual',
           BOTMUX_SESSION_ID: '  session_precedence_probe  ',
           BOTMUX_EXECUTION_ID: 'execution_must_not_win',
           BOTMUX_TRUSTED_TURN_FILE: '',
@@ -1732,6 +1738,7 @@ try {
         timeout: 5000,
         env: {
           ...process.env,
+          DATA_MCP_MODEL_MODE: 'dual',
           BOTMUX_SESSION_ID: 'session_http_error_probe',
           BOTMUX_TRUSTED_TURN_FILE: '',
           SESSION_DATA_DIR: '',
@@ -1815,6 +1822,7 @@ try {
           timeout: 5000,
           env: {
             ...process.env,
+            DATA_MCP_MODEL_MODE: 'dual',
             HOME: fallbackHome,
             USERPROFILE: fallbackHome,
             SESSION_DATA_DIR: dataDir,
