@@ -131,10 +131,16 @@ Environment contract:
 - `DATA_MCP_INTERNAL_AUTH_TOKEN`
   - Required service-to-service token sent as `X-Internal-Auth` for both Unix-socket and URL/TCP transports.
   - Keep it in the host-only file selected by `KSHER_AGENT_DATA_MCP_ENV_FILE`; never export it into the plugin, runner, or Python API process environment, and never expose it to an agent sandbox or model-visible arguments.
-- Raw `run_query_for_user` responses are always disabled in dual-model mode,
-  and no model-visible Data MCP export tool is registered. Business results
-  must use `deliver_query_result_for_user`;
-  this fail-closed boundary cannot be disabled by environment configuration.
+- `DATA_MCP_MODEL_MODE=single|dual` is a host-controlled MCP process setting.
+  Default: `single`. Validated query rows enter the calling model in single mode;
+  that model analyzes and creates requested artifacts. Result model configuration
+  alone does not enable dual mode.
+  `dual` is an explicit test opt-in: raw execution is refused and the isolated
+  result model delivers results using the existing host protection contract.
+  Failure never automatically switches between modes.
+  Apply through per-bot `pluginRuntime.data-mcp.env.DATA_MCP_MODEL_MODE` and reload
+  the session's MCP runtime while idle. Chat/tool arguments cannot change mode.
+  Existing protected messages/caches are not exposed by this switch.
 - `DATA_MCP_RESULT_MODEL_ENDPOINT`
   - Full OpenAI-compatible internal chat-completions endpoint used only after query execution.
 - `DATA_MCP_RESULT_MODEL_ALLOWED_HOSTS`
@@ -279,7 +285,7 @@ write its prompts or responses to ordinary logs.
 | `data_mcp_identity_probe` | Trusted-identity diagnostics only; no query data | Fixed identity error |
 | `data_mcp_query_plan` | Planning guidance only; does not execute SQL | Fixed planning error |
 | `validate_sql_for_user` | Sanitized datasource, table/column names, normalized SQL, and plan id; never rows or sample values | Fixed validation code; database error details are removed |
-| `run_query_for_user` | Always `isolated_delivery_required`; raw execution is closed | Fixed isolated-operation error |
+| `run_query_for_user` | Default single mode returns validated query rows; dual mode refuses raw execution | Query result in single mode; isolated-operation error in dual mode |
 | `deliver_query_result_for_user` | Fixed direct-delivery status, byte/attachment counts, and truncation flag; the internal result Agent receives rows/schema/context, calls requested artifact tools, and the result is replied to the signed original Feishu message | Fixed isolated-operation or direct-delivery error |
 | `continue_query_result_for_user` | Fixed direct-delivery receipt; active-result handles are not arguments | Fixed deterministic state or direct-delivery error only |
 | `refresh_metadata_snapshot` | Refresh status; schedule-only and no SQL arguments | Policy/service status without query rows |

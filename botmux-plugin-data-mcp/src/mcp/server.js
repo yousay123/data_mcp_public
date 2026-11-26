@@ -298,7 +298,7 @@ function nonBlankProcessEnv(name) {
 }
 
 function dataMcpModelMode() {
-  const mode = nonBlankProcessEnv('DATA_MCP_MODEL_MODE') ?? 'dual';
+  const mode = nonBlankProcessEnv('DATA_MCP_MODEL_MODE') ?? 'single';
   if (mode !== 'single' && mode !== 'dual') {
     throw new Error('data_mcp_model_mode_invalid');
   }
@@ -1711,6 +1711,7 @@ async function handleToolCall(request) {
     ok(request.id, jsonTool({
       ok: true,
       trustedCaller: callerDiagnostic(caller),
+      modelMode: dataMcpModelMode(),
       pluginId: process.env.BOTMUX_PLUGIN_ID ?? null,
       sessionId: nonBlankProcessEnv('BOTMUX_SESSION_ID') ?? null,
       queryPlanContextSource: trustedQueryPlanContext()?.source ?? null,
@@ -1731,6 +1732,7 @@ async function handleToolCall(request) {
       ok: true,
       trustedCaller: callerDiagnostic(caller),
       status: 'plan_only',
+      modelMode: dataMcpModelMode(),
       nextSteps: [
         'resolve trusted caller to enterprise email / data account on Data MCP service side',
         'look up metadata dictionary for candidate tables and metric definitions on Data MCP service side',

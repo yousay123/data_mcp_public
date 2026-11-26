@@ -93,7 +93,7 @@ function start() {
   const child = spawn(process.execPath, ['--require', clockHook, serverEntry], {
     cwd: pluginRoot,
     env: {
-      ...process.env, PATH: `${bin}${delimiter}${process.env.PATH || ''}`,
+      ...process.env, DATA_MCP_MODEL_MODE: 'dual', PATH: `${bin}${delimiter}${process.env.PATH || ''}`,
       BOTMUX_SESSION_ID: identity.sessionId, BOTMUX_PLUGIN_HOME: pluginHome,
       KSHER_AGENT_DATA_MCP_ENV_FILE: hostEnvFile,
     },

@@ -170,6 +170,7 @@ function childEnvironment(extra = {}) {
   return {
     ...env,
     BOTMUX_SESSION_ID: 'signed-profile-session',
+    DATA_MCP_MODEL_MODE: 'dual',
     BOTMUX_PLUGIN_HOME: pluginHome,
     KSHER_AGENT_DATA_MCP_ENV_FILE: defaultEnvFile,
     FAKE_BOTMUX_APP_ID: selectedAppId,
